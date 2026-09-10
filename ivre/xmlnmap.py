@@ -1,8 +1,7 @@
 #! /usr/bin/env python
-# -*- coding: utf-8 -*-
 
 # This file is part of IVRE.
-# Copyright 2011 - 2021 Pierre LALET <pierre@droids-corp.org>
+# Copyright 2011 - 2026 Pierre LALET <pierre@droids-corp.org>
 #
 # IVRE is free software: you can redistribute it and/or modify it
 # under the terms of the GNU General Public License as published by
@@ -17,39 +16,34 @@
 # You should have received a copy of the GNU General Public License
 # along with IVRE. If not, see <http://www.gnu.org/licenses/>.
 
-"""This sub-module contains the parser for nmap's XML output files.
+# pylint: disable=consider-using-f-string
 
-"""
-
+"""This sub-module contains the parser for nmap's XML output files."""
 
 import datetime
 import hashlib
-import json
 import os
 import re
 import struct
-import sys
 from textwrap import wrap
-from typing import List, Optional, Tuple
-from urllib.parse import urlparse
-from xml.sax.handler import ContentHandler, EntityResolver
+from xml.sax.handler import ContentHandler
 
-
+from ivre import utils
 from ivre.active.cpe import cpe2dict
 from ivre.active.data import (
-    ALIASES_TABLE_ELEMS,
-    cleanup_synack_honeypot_host,
-    create_ssl_output,
+    add_cert_hostnames,
+    add_hostname,
+    create_ssl_cert,
+    handle_http_content,
     handle_http_headers,
 )
-from ivre.analyzer import dicom, ike
-from ivre.types import ParsedCertificate, NmapServiceMatch
-from ivre.types.active import NmapHostname, NmapScript
-from ivre import utils
-from ivre.data.windows import WINDOWS_VERSION_TO_BUILD
+from ivre.active.nmap import ALIASES_TABLE_ELEMS
+from ivre.analyzer import dicom, ike, ja3
+from ivre.config import MASSCAN_PROBES
+from ivre.data.microsoft.windows import WINDOWS_VERSION_TO_BUILD
+from ivre.tags import add_tags
 
-
-SCHEMA_VERSION = 19
+SCHEMA_VERSION = 22
 
 # Scripts that mix elem/table tags with and without key attributes,
 # which is not supported for now
@@ -57,20 +51,53 @@ IGNORE_TABLE_ELEMS = set(["xmpp-info", "sslv2", "sslv2-drown"])
 
 SCREENSHOT_PATTERN = re.compile("^ *Saved to (.*)$", re.MULTILINE)
 RTSP_SCREENSHOT_PATTERN = re.compile("^ *Saved [^ ]* to (.*)$", re.MULTILINE)
+SCREENSHOT_ALLOWED_EXT = {".jpg", ".jpeg", ".png", ".gif"}
 
 
-def screenshot_extract(script):
-    fname = (
-        RTSP_SCREENSHOT_PATTERN
-        if script["id"] == "rtsp-screenshot"
-        else SCREENSHOT_PATTERN
-    ).search(script["output"])
-    return None if fname is None else fname.groups()[0]
+def screenshot_extract(script) -> str | None:
+    """Extracts the screenshot filename written by a `*-screenshot`
+    NSE script from its output.
+
+    The returned value is always a bare basename (no directory
+    component) with an image extension from
+    `SCREENSHOT_ALLOWED_EXT`.
+
+    Returns `None` when no valid filename is found.
+
+    """
+    if (
+        mtch := (
+            RTSP_SCREENSHOT_PATTERN
+            if script["id"] == "rtsp-screenshot"
+            else SCREENSHOT_PATTERN
+        ).search(script["output"])
+    ) is None:
+        return None
+    fname = mtch.groups()[0].strip()
+    if not fname:
+        return None
+    if os.path.basename(fname) != fname:
+        utils.LOGGER.warning(
+            "Screenshot: rejecting unsafe filename %r from script %r",
+            fname,
+            script.get("id"),
+        )
+        return None
+    if os.path.splitext(fname)[1].lower() not in SCREENSHOT_ALLOWED_EXT:
+        utils.LOGGER.warning(
+            "Screenshot: rejecting filename with unexpected extension %r "
+            "from script %r",
+            fname,
+            script.get("id"),
+        )
+        return None
+    return fname
 
 
 SCREENSHOTS_SCRIPTS = {
     "http-screenshot": screenshot_extract,
     "mainframe-screenshot": screenshot_extract,
+    "rdp-screenshot": screenshot_extract,
     "rtsp-screenshot": screenshot_extract,
     "vnc-screenshot": screenshot_extract,
     "x11-screenshot": screenshot_extract,
@@ -107,7 +134,7 @@ def _parse_mongodb_databases_kv(
     if key == "$err":
         key = "errmsg"
     if prefix is not None:
-        key = "%s_%s" % (prefix, key)
+        key = f"{prefix}_{key}"
 
     if force_type is not None:
         value = force_type(value)
@@ -156,7 +183,14 @@ def add_mongodb_databases_data(script):
      'totalSizeMb': 123456}
     """
 
+    if (
+        script["output"]
+        .strip()
+        .startswith("errmsg = command listDatabases requires authentication")
+    ):
+        return None
     out = {}
+    cur_dict = {}  # not needed, just to make pylint happy
     # Global modes, see MODES[1]
     cur_key = None
     MODES = {
@@ -225,7 +259,7 @@ def add_mongodb_databases_data(script):
             continue
 
         else:
-            raise ValueError("Unable to parse %s" % line)
+            raise ValueError(f"Unable to parse {line}")
 
         # Handle a "key = value" line
         _parse_mongodb_databases_kv(line, cur_dict)
@@ -271,7 +305,7 @@ def add_smb_ls_data(script):
     cur_vol = None
     for line in script["output"].splitlines():
         line = line.lstrip()
-        if state == 0:  # outside a volume
+        if not state:  # outside a volume
             if line.startswith("Directory of "):
                 if cur_vol is not None:
                     utils.LOGGER.warning(
@@ -291,7 +325,7 @@ def add_smb_ls_data(script):
                     size = int(size)
                     result["total"]["bytes"] += size
                 cur_vol["files"].append(
-                    {"size": size, "filename": fname, "time": "%s %s" % (date, time)}
+                    {"size": size, "filename": fname, "time": f"{date} {time}"}
                 )
                 result["total"]["files"] += 1
         elif state == 2:  # total values
@@ -302,7 +336,7 @@ def add_smb_ls_data(script):
                 state = 0  # outside a volume
                 result["volumes"].append(cur_vol)
                 cur_vol = None
-    if state != 0:
+    if state:
         utils.LOGGER.warning("Expected state == 0, got %r", state)
     return result if result["volumes"] else None
 
@@ -322,7 +356,7 @@ def add_nfs_ls_data(script):
     cur_vol = None
     for line in script["output"].splitlines():
         line = line.lstrip()
-        if state == 0:  # outside a volume
+        if not state:  # outside a volume
             if line.startswith("NFS Export: "):
                 if cur_vol is not None:
                     utils.LOGGER.warning(
@@ -363,7 +397,7 @@ def add_nfs_ls_data(script):
         state = 0  # outside a volume
         result["volumes"].append(cur_vol)
         cur_vol = None
-    if state != 0:
+    if state:
         utils.LOGGER.warning("Expected state == 0, got %r", state)
     return result if result["volumes"] else None
 
@@ -382,16 +416,16 @@ def add_afp_ls_data(script):
     state = 0  # volumes / listings
     cur_vol = None
     for line in script["output"].splitlines():
-        if state == 0:
+        if not state:
             if line.startswith("    PERMISSION"):
                 pass
             elif line.startswith("    "):
                 if cur_vol is None:
                     utils.LOGGER.warning(
-                        "Skip file entry outside a " "volume [%r]", line[4:]
+                        "Skip file entry outside a volume [%r]", line[4:]
                     )
                 else:
-                    (permission, uid, gid, size, date, time, fname) = line[4:].split(
+                    permission, uid, gid, size, date, time, fname = line[4:].split(
                         None, 6
                     )
                     if size.isdigit():
@@ -404,7 +438,7 @@ def add_afp_ls_data(script):
                             "gid": gid,
                             "size": size,
                             "filename": fname,
-                            "time": "%s %s" % (date, time),
+                            "time": f"{date} {time}",
                         }
                     )
                     result["total"]["files"] += 1
@@ -444,7 +478,7 @@ def add_ftp_anon_data(script):
     # expressions that match lines, based on large data collection
     subexprs = {
         "user": (
-            "(?:[a-zA-Z0-9\\._-]+(?:\\s+[NLOPQS])?|\\\\x[0-9A-F]{2}|" "\\*|\\(\\?\\))"
+            "(?:[a-zA-Z0-9\\._-]+(?:\\s+[NLOPQS])?|\\\\x[0-9A-F]{2}|\\*|\\(\\?\\))"
         ),
         "fname": "[A-Za-z0-9%s]+" % re.escape(" ?._@[](){}~#'&$%!+\\-/,|`="),
         "perm": "[a-zA-Z\\?-]{10}",
@@ -454,7 +488,7 @@ def add_ftp_anon_data(script):
         "time": "[0-9]{1,2}\\:[0-9]{2}(?:\\:[0-9]{1,2})?",
         "windate": "[0-9]{2}-[0-9]{2}-[0-9]{2,4} +[0-9]{2}:[0-9]{2}(?:[AP]M)?",
         "vxworksdate": (
-            "[A-Z][a-z]{2}-[0-9]{2}-[0-9]{2,4}\\s+" "[0-9]{2}:[0-9]{2}:[0-9]{2}"
+            "[A-Z][a-z]{2}-[0-9]{2}-[0-9]{2,4}\\s+[0-9]{2}:[0-9]{2}:[0-9]{2}"
         ),
     }
     subexprs["date"] = "(?:%s)" % "|".join(
@@ -547,7 +581,7 @@ def _smb_enum_shares_fix_share_name(name):
         utils.LOGGER.warning("Incorrect share name [%r]", name)
         return name
     server, share = name[2:].split("\\", 1)
-    return "\\\\%s\\%s" % (server.replace("_", "."), share)
+    return f"\\\\{server.replace('_', '.')}\\{share}"
 
 
 def change_smb_enum_shares(table):
@@ -620,6 +654,8 @@ def change_ls_migrate(table):
 
     """
     for volume in table.get("volumes", []):
+        if not volume:
+            continue
         for fileentry in volume.get("files", []):
             if "size" in fileentry and fileentry["size"] == "<DIR>":
                 del fileentry["size"]
@@ -731,7 +767,7 @@ def change_http_git(table):
     for key, value in table.items():
         if isinstance(value.get("files-found"), dict):
             value["files-found"] = [
-                ".git%s" % k[4:] if k.startswith("_git") else k
+                f".git{k[4:]}" if k.startswith("_git") else k
                 for k, v in value["files-found"].items()
                 if v == "true"
             ]
@@ -755,6 +791,33 @@ def change_http_server_header(table):
     return table
 
 
+def change_http_default_accounts(table):
+    if isinstance(table, dict):
+        return [dict(value, name=key) for key, value in table.items()]
+    return table
+
+
+def change_fingerprint_strings(table):
+    """Adapt structured output generated by the "fingerprint-strings"
+    Nmap script. The structured output uses the name of whichever NSE
+    service-fingerprinting probe(s) matched (e.g. "GetRequest",
+    "HTTPOptions", "Kerberos"...) as keys, which varies from host to
+    host and is undesirable in the databases: distinct hosts can send
+    genuinely different key sets -- or, depending on whether nmap
+    happens to emit a `key` attribute on the script's first XML child
+    for that particular invocation, a dict vs. a list -- for the
+    exact same script id, which used to make
+    ports.scripts.fingerprint-strings mapping-drift prone when pushed
+    to a strictly-typed backend such as Elasticsearch (see issue
+    #1886). Mirrors the "avoid data in field names" convention
+    already used for e.g. "http-headers", "fcrdns", "vulns".
+
+    """
+    if isinstance(table, dict):
+        return [{"name": key, "value": value} for key, value in table.items()]
+    return table
+
+
 CHANGE_TABLE_ELEMS = {
     "smb-enum-shares": change_smb_enum_shares,
     "s7-info": change_s7_info_keys,
@@ -766,6 +829,8 @@ CHANGE_TABLE_ELEMS = {
     "ssh-hostkey": change_ssh_hostkey,
     "http-git": change_http_git,
     "http-server-header": change_http_server_header,
+    "http-default-accounts": change_http_default_accounts,
+    "fingerprint-strings": change_fingerprint_strings,
 }
 
 
@@ -871,7 +936,11 @@ def post_ntlm_info(script, port, host):
         if script["id"] in script:
             script["ntlm-info"] = script.pop(script["id"])
         proto = script["id"].rsplit("-", 2)[0]
-        if "ntlm-info" in script:
+        if script.get("ntlm-info"):
+            if len(script["ntlm-info"]) == 1 and "\\" in next(
+                iter(script["ntlm-info"])
+            ):
+                _, script["ntlm-info"] = script["ntlm-info"].popitem()
             script["ntlm-info"]["protocol"] = proto
         script["id"] = "ntlm-info"
     if "ntlm-info" not in script:
@@ -1006,6 +1075,7 @@ IGNORE_SCRIPTS = {
             "\n  ERROR: Not a Cisco ASA or unsupported version",
         ]
     ),
+    "http-trane-info": set(["Problem with XML parsing of /evox/about"]),
     "ndmp-fs-info": set(
         [
             "\n  ERROR: Failed to get filesystem information from server",
@@ -1127,6 +1197,7 @@ IGNORE_SCRIPTS_IDS = set(
     [
         "http-screenshot",
         "mainframe-screenshot",
+        "rdp-screenshot",
         "rtsp-screenshot",
         "vnc-screenshot",
         "x11-screenshot",
@@ -1248,6 +1319,7 @@ NMAP_S7_INDEXES = {
 
 MASSCAN_SERVICES_NMAP_SCRIPTS = {
     "http": "http-headers",
+    "http.server": "http-server-header",
     "title": "http-title",
     "html": "http-content",
     "ftp": "banner",
@@ -1275,6 +1347,9 @@ MASSCAN_NMAP_SCRIPT_NMAP_PROBES = {
 MASSCAN_SERVICES_NMAP_SERVICES = {
     "ftp": "ftp",
     "http": "http",
+    "http.server": "http",
+    "title": "http",
+    "html": "http",
     "ssh": "ssh",
     "vnc": "vnc",
     "imap": "imap",
@@ -1287,11 +1362,6 @@ MASSCAN_SERVICES_NMAP_SERVICES = {
 
 
 MASSCAN_ENCODING = re.compile(re.escape(b"\\x") + b"([0-9a-f]{2})")
-_HTTP_HEADER = re.compile(
-    b"^([!\\#\\$%\\&'\\*\\+\\-\\.\\^_`\\|\\~A-Z0-9]+):[ \\\t]*([^\\\r]*)"
-    b"[ \\\t\\\r]*$",
-    re.I,
-)
 
 
 def _masscan_decode_print(match):
@@ -1320,18 +1390,18 @@ def masscan_parse_s7info(data):
         curdata, data = data[4:length], data[length:]
         if len(curdata) < length - 4:
             utils.LOGGER.warning(
-                "Masscan s7-info: record too short [%r] length %d, should be " "%d",
+                "Masscan s7-info: record too short [%r] length %d, should be %d",
                 curdata,
                 len(curdata),
                 length - 4,
             )
         datatype = curdata[1:2]
-        if state == 0:  # Connect Confirm
+        if not state:  # Connect Confirm
             if datatype == b"\xd0":  # OK
                 state += 1
                 continue
             utils.LOGGER.warning(
-                "Masscan s7-info: invalid data type in Connect Confirm " "[%r]",
+                "Masscan s7-info: invalid data type in Connect Confirm [%r]",
                 curdata,
             )
             return None
@@ -1444,149 +1514,6 @@ def masscan_parse_s7info(data):
     return service_info, output_text, output_data
 
 
-def create_ssl_cert(
-    data: bytes, b64encoded: bool = True
-) -> Tuple[str, List[ParsedCertificate]]:
-    """Produces an output similar to Nmap script ssl-cert from Masscan
-    X509 "service" tag.
-
-    """
-    if b64encoded:
-        cert = utils.decode_b64(data)
-    else:
-        cert = data
-        data = utils.encode_b64(cert)
-    info = utils.get_cert_info(cert)
-    b64cert = data.decode()
-    pem = []
-    pem.append("-----BEGIN CERTIFICATE-----")
-    pem.extend(wrap(b64cert, 64))
-    pem.append("-----END CERTIFICATE-----")
-    pem.append("")
-    info["pem"] = "\n".join(pem)
-    return "\n".join(create_ssl_output(info)), [info]
-
-
-_EXPR_INDEX_OF = re.compile(
-    "<title[^>]*> *(?:index +of|directory +listing +(?:of|for))",
-    re.I,
-)
-_EXPR_FILES = [
-    re.compile(
-        '<a href="(?P<filename>[^"]+)">[^<]+</a></td><td[^>]*> *'
-        "(?P<time>[0-9]+-[a-z0-9]+-[0-9]+ [0-9]+:[0-9]+) *"
-        "</td><td[^>]*> *(?P<size>[^<]+)</td>",
-        re.I,
-    ),
-    re.compile(
-        '<a href="(?P<filename>[^"]+)">[^<]+</a> *'
-        "(?P<time>[0-9]+-[a-z0-9]+-[0-9]+ [0-9]+:[0-9]+) *"
-        "(?P<size>[^ \r\n]+)",
-        re.I,
-    ),
-    re.compile('<li><a href="(?P<filename>[^"]+)">(?P=filename)</a>'),
-]
-
-
-def create_http_ls(data: str, url: Optional[str] = None) -> NmapScript:
-    """Produces an http-ls script output (both structured and human
-    readable) from the content of an HTML page. Used for Zgrab and Masscan
-    results.
-
-    """
-    match = _EXPR_INDEX_OF.search(data)
-    if match is None:
-        return None
-    files = []
-    for pattern in _EXPR_FILES:
-        for match in pattern.finditer(data):
-            files.append(match.groupdict())
-    if not files:
-        return None
-    output = []
-    if url is None or "path" not in url:
-        volname = "???"
-    else:
-        volname = url["path"]
-    output.append("Volume %s" % volname)
-    title = ["size", "time", "filename"]
-    column_width = [len(t) for t in title[:-1]]
-    for fobj in files:
-        for i, t in enumerate(title[:-1]):
-            column_width[i] = max(column_width[i], len(fobj.get(t, "-")))
-    line_fmt = "%%(size)-%ds  %%(time)-%ds  %%(filename)s" % tuple(column_width)
-    output.append(line_fmt % dict((t, t.upper()) for t in title))
-    for fobj in files:
-        output.append(line_fmt % dict({"size": "-", "time": "-"}, **fobj))
-    output.append("")
-    return {
-        "id": "http-ls",
-        "output": "\n".join(output),
-        "ls": {"volumes": [{"volume": volname, "files": files}]},
-    }
-
-
-def create_elasticsearch_service(data: str) -> Optional[NmapServiceMatch]:
-    """Produces the service_* attributes from the (JSON) content of an
-    HTTP response. Used for Zgrab and Masscan results.
-
-    """
-    try:
-        data = json.loads(data)
-    except json.JSONDecodeError:
-        return None
-    if not isinstance(data, dict):
-        return None
-    if "tagline" not in data:
-        if "error" not in data:
-            return None
-        error = data["error"]
-        if isinstance(error, str):
-            if data.get("status") == 401 and error.startswith(
-                "AuthenticationException"
-            ):
-                return {
-                    "service_name": "http",
-                    "service_product": "Elasticsearch REST API",
-                    "service_extrainfo": "Authentication required",
-                    "cpe": ["cpe:/a:elasticsearch:elasticsearch"],
-                }
-            return None
-        if not isinstance(error, dict):
-            return None
-        if not (data.get("status") == 401 or error.get("status") == 401):
-            return None
-        if "root_cause" in error:
-            return {
-                "service_name": "http",
-                "service_product": "Elasticsearch REST API",
-                "service_extrainfo": "Authentication required",
-                "cpe": ["cpe:/a:elasticsearch:elasticsearch"],
-            }
-        return None
-    if data["tagline"] != "You Know, for Search":
-        return None
-    result = {"service_name": "http", "service_product": "Elasticsearch REST API"}
-    cpe = []
-    if "version" in data and "number" in data["version"]:
-        result["service_version"] = data["version"]["number"]
-        cpe.append("cpe:/a:elasticsearch:elasticsearch:%s" % data["version"]["number"])
-    extrainfo = []
-    if "name" in data:
-        extrainfo.append("name: %s" % data["name"])
-        result["service_hostname"] = data["name"]
-    if "cluster_name" in data:
-        extrainfo.append("cluster: %s" % data["cluster_name"])
-    if "version" in data and "lucene_version" in data["version"]:
-        extrainfo.append("Lucene %s" % data["version"]["lucene_version"])
-        cpe.append("cpe:/a:apache:lucene:%s" % data["version"]["lucene_version"])
-    if extrainfo:
-        result["service_extrainfo"] = "; ".join(extrainfo)
-    if cpe:
-        result["cpe"] = cpe
-    return result
-
-
 def ignore_script(script):
     """Predicate that decides whether an Nmap script should be ignored
     or not, based on IGNORE_* constants. Nmap scripts are ignored when
@@ -1614,35 +1541,10 @@ def ignore_script(script):
     return False
 
 
-# This is not a real hostname regexp, but a simple way to exclude
-# obviously wrong values. Underscores should not exist in (DNS)
-# hostnames, but since they happen to exist anyway, we allow them
-# here.
-_HOSTNAME = re.compile("^[a-z0-9_\\.\\*\\-]+$", re.I)
-
-
-def add_hostname(name: str, name_type: str, hostnames: List[NmapHostname]) -> None:
-    name = name.rstrip(".").lower()
-    if not _HOSTNAME.search(name):
-        return
-    # exclude IPv4 addresses
-    if utils.IPV4ADDR.search(name):
-        return
-    if any(hn["name"] == name and hn["type"] == name_type for hn in hostnames):
-        return
-    hostnames.append(
-        {
-            "type": name_type,
-            "name": name,
-            "domains": list(utils.get_domains(name)),
-        }
-    )
-
-
 def add_service_hostname(service_info, hostnames):
     if "service_hostname" not in service_info:
         return
-    name = service_info["service_hostname"]
+    name = service_info["service_hostname"].lower().strip()
     if "service_extrainfo" in service_info:
         for data in service_info["service_extrainfo"].lower().split(", "):
             if data.startswith("domain:"):
@@ -1651,42 +1553,7 @@ def add_service_hostname(service_info, hostnames):
     add_hostname(name, "service", hostnames)
 
 
-def add_cert_hostnames(cert: ParsedCertificate, hostnames: List[NmapHostname]) -> None:
-    if "commonName" in cert.get("subject", {}):
-        add_hostname(cert["subject"]["commonName"], "cert-subject-cn", hostnames)
-    for san in cert.get("san", []):
-        if san.startswith("DNS:"):
-            add_hostname(san[4:], "cert-san-dns", hostnames)
-            continue
-        if san.startswith("URI:"):
-            try:
-                netloc = urlparse(san[4:]).netloc
-            except Exception:
-                utils.LOGGER.warning("Invalid URL in SAN %r", san, exc_info=True)
-                continue
-            if not netloc:
-                continue
-            if netloc.startswith("["):
-                # IPv6
-                continue
-            if ":" in netloc:
-                netloc = netloc.split(":", 1)[0]
-            add_hostname(netloc, "cert-san-uri", hostnames)
-
-
-class NoExtResolver(EntityResolver):
-
-    """A simple EntityResolver that will prevent any external
-    resolution.
-
-    """
-
-    def resolveEntity(self, *_):
-        return "file://%s" % os.devnull
-
-
 class NmapHandler(ContentHandler):
-
     """The handler for Nmap's XML documents. An abstract class for
     database specific implementations.
 
@@ -1695,7 +1562,9 @@ class NmapHandler(ContentHandler):
     def __init__(
         self,
         fname,
-        filehash,
+        categories=None,
+        source=None,
+        tags=None,
         needports=False,
         needopenports=False,
         masscan_probes=None,
@@ -1704,7 +1573,6 @@ class NmapHandler(ContentHandler):
         ContentHandler.__init__(self)
         self._needports = needports
         self._needopenports = needopenports
-        self._curscan = None
         self._curscript = None
         self._curhost = None
         self._curextraports = None
@@ -1715,11 +1583,18 @@ class NmapHandler(ContentHandler):
         self._curtablepath = []
         self._curhostnames = None
         self._fname = fname
-        self._filehash = filehash
         self.scanner = "nmap"
-        self.scan_doc_saved = False
-        self.masscan_probes = [] if masscan_probes is None else masscan_probes
-        utils.LOGGER.debug("READING %r (%r)", fname, self._filehash)
+        self.masscan_probes = masscan_probes or []
+        if categories is None:
+            self.categories = []
+        else:
+            self.categories = sorted(set(categories))
+        if tags is None:
+            self.tags = []
+        else:
+            self.tags = tags
+        self.source = source
+        utils.LOGGER.debug("READING %r", fname)
 
     @staticmethod
     def _to_binary(data):
@@ -1745,50 +1620,23 @@ class NmapHandler(ContentHandler):
 
     def _addhost(self):
         """Subclasses may store self._curhost here."""
-
-    def _storescan(self):
-        """Subclasses may store self._curscan here."""
-
-    def _updatescan(self, _):
-        """Subclasses may update the scan record here, based on the first
-        argument (a dict object).
-
-        """
-
-    def _addscaninfo(self, _):
-        """Subclasses may add scan information (first argument) to
-        self._curscan here.
-
-        """
+        if self.categories:
+            self._curhost["categories"] = self.categories[:]
+        if self.tags:
+            add_tags(self._curhost, self.tags)
+        if self.source:
+            self._curhost["source"] = self.source
 
     def startElement(self, name, attrs):
         if name == "nmaprun":
-            if self._curscan is not None:
-                utils.LOGGER.warning(
-                    "self._curscan should be None at " "this point (got %r)",
-                    self._curscan,
-                )
-            self._curscan = dict(attrs)
-            self.scanner = self._curscan.get("scanner", self.scanner)
-            self._curscan["_id"] = self._filehash
-        elif name == "finished":
-            curscan_more = dict(attrs)
-            if "time" in curscan_more:
-                curscan_more["end"] = curscan_more.pop("time")
-            if "timestr" in curscan_more:
-                curscan_more["endstr"] = curscan_more.pop("timestr")
-            self._updatescan(curscan_more)
-        elif name == "scaninfo" and self._curscan is not None:
-            self._addscaninfo(dict(attrs))
+            self.scanner = attrs.get("scanner", self.scanner)
         elif name == "host":
             if self._curhost is not None:
                 utils.LOGGER.warning(
-                    "self._curhost should be None at " "this point (got %r)",
+                    "self._curhost should be None at this point (got %r)",
                     self._curhost,
                 )
             self._curhost = {"schema_version": SCHEMA_VERSION}
-            if self._curscan:
-                self._curhost["scanid"] = self._curscan["_id"]
             for attr in attrs.keys():
                 self._curhost[attr] = attrs[attr]
             for field in ["starttime", "endtime"]:
@@ -1813,7 +1661,7 @@ class NmapHandler(ContentHandler):
                 return
             if self._curhostnames is not None:
                 utils.LOGGER.warning(
-                    "self._curhostnames should be None at " "this point (got %r)",
+                    "self._curhostnames should be None at this point (got %r)",
                     self._curhostnames,
                 )
             self._curhostnames = []
@@ -1822,7 +1670,7 @@ class NmapHandler(ContentHandler):
                 return
             if self._curhostnames is None:
                 utils.LOGGER.warning(
-                    "self._curhostnames should NOT be " "None at this point"
+                    "self._curhostnames should NOT be None at this point"
                 )
                 self._curhostnames = []
             hostname = dict(attrs)
@@ -1838,7 +1686,7 @@ class NmapHandler(ContentHandler):
         elif name == "extraports":
             if self._curextraports is not None:
                 utils.LOGGER.warning(
-                    "self._curextraports should be None at " "this point (got %r)",
+                    "self._curextraports should be None at this point (got %r)",
                     self._curextraports,
                 )
             self._curextraports = {
@@ -1851,7 +1699,7 @@ class NmapHandler(ContentHandler):
         elif name == "port":
             if self._curport is not None:
                 utils.LOGGER.warning(
-                    "self._curport should be None at this " "point (got %r)",
+                    "self._curport should be None at this point (got %r)",
                     self._curport,
                 )
             self._curport = {
@@ -1903,9 +1751,11 @@ class NmapHandler(ContentHandler):
                     self._curport["service_name"] = (
                         "netbios-ssn"
                         if self._curport.get("port") == 139
-                        else "microsoft-ds"
-                        if self._curport.get("port") == 445
-                        else "smb"
+                        else (
+                            "microsoft-ds"
+                            if self._curport.get("port") == 445
+                            else "smb"
+                        )
                     )
                     raw_output = MASSCAN_ENCODING.sub(
                         _masscan_decode_raw, banner.encode()
@@ -1990,9 +1840,6 @@ class NmapHandler(ContentHandler):
                                 tzone = "%+03d%02d" % (tzone // 60, tzone % 60)
                             else:
                                 tzone = ""
-                            if not utils.STRPTIME_SUPPORTS_TZ:
-                                # %z is not supported with strptime()
-                                tzone = ""
                             if tstamp.startswith("1601-01-01 ") or tstamp.startswith(
                                 "60056-05-28 "
                             ):
@@ -2006,7 +1853,7 @@ class NmapHandler(ContentHandler):
                                 # data[key] = utils.all2datetime(tstamp)
                             except ValueError:
                                 utils.LOGGER.warning(
-                                    "Invalid timestamp from Masscan SMB " "result %r",
+                                    "Invalid timestamp from Masscan SMB result %r",
                                     tstamp,
                                     exc_info=True,
                                 )
@@ -2150,7 +1997,14 @@ class NmapHandler(ContentHandler):
                     self._curport["service_tunnel"] = "ssl"
                 self.masscan_post_script(script)
                 # attempt to use Nmap service fingerprints
-                probes = self.masscan_probes[:]
+                probe_port = MASSCAN_PROBES.get(self._curport["protocol"], {}).get(
+                    self._curport["port"]
+                )
+                if probe_port:
+                    probes = [probe_port]
+                else:
+                    probes = []
+                probes.extend(self.masscan_probes)
                 probes.extend(
                     MASSCAN_NMAP_SCRIPT_NMAP_PROBES.get(
                         self._curport["protocol"], {}
@@ -2210,9 +2064,21 @@ class NmapHandler(ContentHandler):
                         match,
                         self._curhost.setdefault("hostnames", []),
                     )
+                    if match.get("service_name") == "reverse-ssl":
+                        # Attempt to compute the JA3c & JA4c values
+                        scripts = ja3.banner2scripts(
+                            raw_output,
+                            self._curport.get("protocol"),
+                            self._curport.get("service_name"),
+                        )
+                        if scripts:
+                            self._curport.setdefault("scripts", []).extend(scripts)
                 return
             for attr in attrs.keys():
                 self._curport["service_%s" % attr] = attrs[attr]
+            if self._curport.get("service_name") == "https":
+                self._curport["service_name"] = "http"
+                self._curport["service_tunnel"] = "ssl"
             for field in [
                 "service_conf",
                 "service_rpcnum",
@@ -2227,10 +2093,10 @@ class NmapHandler(ContentHandler):
         elif name == "script":
             if self._curscript is not None:
                 utils.LOGGER.warning(
-                    "self._curscript should be None at this " "point (got %r)",
+                    "self._curscript should be None at this point (got %r)",
                     self._curscript,
                 )
-            self._curscript = dict([attr, attrs[attr]] for attr in attrs.keys())
+            self._curscript = {attr: attrs[attr] for attr in attrs.keys()}
         elif name in ["table", "elem"]:
             if self._curscript.get("id") in IGNORE_TABLE_ELEMS:
                 return
@@ -2238,7 +2104,7 @@ class NmapHandler(ContentHandler):
                 # start recording characters
                 if self._curdata is not None:
                     utils.LOGGER.warning(
-                        "self._curdata should be None at " "this point (got %r)",
+                        "self._curdata should be None at this point (got %r)",
                         self._curdata,
                     )
                 self._curdata = ""
@@ -2293,7 +2159,7 @@ class NmapHandler(ContentHandler):
         elif name == "trace":
             if self._curtrace is not None:
                 utils.LOGGER.warning(
-                    "self._curtrace should be None at this " "point (got %r)",
+                    "self._curtrace should be None at this point (got %r)",
                     self._curtrace,
                 )
             if "proto" not in attrs:
@@ -2324,9 +2190,7 @@ class NmapHandler(ContentHandler):
             self._curdata = ""
 
     def endElement(self, name):
-        if name == "nmaprun":
-            self._curscan = None
-        elif name == "host":
+        if name == "host":
             # masscan -oX output has no "state" tag
             if (
                 self._curhost.get("state", "up") == "up"
@@ -2342,7 +2206,6 @@ class NmapHandler(ContentHandler):
                     # hosts with an open port are marked as up by
                     # default (masscan)
                     self._curhost["state"] = "up"
-                cleanup_synack_honeypot_host(self._curhost)
                 self._pre_addhost()
                 self._addhost()
             self._curhost = None
@@ -2375,7 +2238,7 @@ class NmapHandler(ContentHandler):
                 self._curscript = None
                 if self._curtablepath:
                     utils.LOGGER.warning(
-                        "self._curtablepath should be empty, " "got [%r]",
+                        "self._curtablepath should be empty, got [%r]",
                         self._curtablepath,
                     )
                 self._curtable = {}
@@ -2383,44 +2246,85 @@ class NmapHandler(ContentHandler):
             if self._curscript["id"] in SCREENSHOTS_SCRIPTS:
                 fname = SCREENSHOTS_SCRIPTS[self._curscript["id"]](self._curscript)
                 if fname is not None:
-                    exceptions = []
-                    for full_fname in [
-                        fname,
-                        os.path.join(os.path.dirname(self._fname), fname),
+                    # `screenshot_extract()` already guarantees `fname`
+                    # is a bare basename with an allowed image
+                    # extension. We try two trusted resolution roots
+                    # in order, accepting the first existing file:
+                    #
+                    #   1. `os.path.dirname(self._fname)` -- the
+                    #      common case when the operator runs
+                    #      `ivre scan2db` against an XML file located
+                    #      next to its screenshots.
+                    #   2. `os.getcwd()` -- the historical fallback,
+                    #      used when the operator extracted the
+                    #      screenshots next to the directory from
+                    #      which they invoked `ivre scan2db` rather
+                    #      than next to the XML.
+                    #
+                    # Each candidate is resolved with `os.path.realpath`
+                    # and re-checked to be contained within its root,
+                    # so symlinks planted inside either directory
+                    # cannot be used to escape it.
+                    seen_full_fnames: set[str] = set()
+                    found_screenshot = False
+                    last_exc_full_fname: str | None = None
+                    last_exc: BaseException | None = None
+                    for base in [
+                        os.path.realpath(os.path.dirname(self._fname) or "."),
+                        os.path.realpath(os.getcwd()),
                     ]:
+                        full_fname = os.path.realpath(os.path.join(base, fname))
+                        if full_fname in seen_full_fnames:
+                            continue
+                        seen_full_fnames.add(full_fname)
+                        if full_fname != base and not full_fname.startswith(
+                            base + os.sep
+                        ):
+                            utils.LOGGER.warning(
+                                "Screenshot: rejecting path %r outside "
+                                "directory %r (scanfile %r, script %r)",
+                                full_fname,
+                                base,
+                                self._fname,
+                                self._curscript.get("id"),
+                            )
+                            continue
+                        if not os.path.exists(full_fname):
+                            continue
                         try:
                             with open(full_fname, "rb") as fdesc:
                                 data = fdesc.read()
-                                trim_result = utils.trim_image(data)
-                                if trim_result:
-                                    # When trim_result is False, the image no
-                                    # longer exists after trim
-                                    if trim_result is not True:
-                                        # Image has been trimmed
-                                        data = trim_result
-                                    current["screenshot"] = "field"
-                                    current["screendata"] = self._to_binary(data)
-                                    screenwords = utils.screenwords(data)
-                                    if screenwords is not None:
-                                        current["screenwords"] = screenwords
-                                else:
-                                    current["screenshot"] = "empty"
-                        except Exception:
-                            exceptions.append((sys.exc_info(), full_fname))
+                        except Exception as exc:
+                            last_exc_full_fname = full_fname
+                            last_exc = exc
+                            continue
+                        trim_result = utils.trim_image(data)
+                        if trim_result:
+                            # When trim_result is False, the image no
+                            # longer exists after trim
+                            if trim_result is not True:
+                                # Image has been trimmed
+                                data = trim_result
+                            current["screenshot"] = "field"
+                            current["screendata"] = self._to_binary(data)
+                            screenwords = utils.screenwords(data)
+                            if screenwords is not None:
+                                current["screenwords"] = screenwords
                         else:
-                            exceptions = []
-                            break
-                    for exc_info, full_fname in exceptions:
+                            current["screenshot"] = "empty"
+                        found_screenshot = True
+                        break
+                    if not found_screenshot and last_exc is not None:
                         utils.LOGGER.warning(
-                            "Screenshot: exception (scanfile %r, file %r)",
+                            "Screenshot: exception (scanfile %r, file %r): %s",
                             self._fname,
-                            full_fname,
-                            exc_info=exc_info,
+                            last_exc_full_fname,
+                            last_exc,
                         )
             if ignore_script(self._curscript):
                 if self._curtablepath:
                     utils.LOGGER.warning(
-                        "self._curtablepath should be empty," " got [%r]",
+                        "self._curtablepath should be empty, got [%r]",
                         self._curtablepath,
                     )
                 self._curtable = {}
@@ -2431,7 +2335,7 @@ class NmapHandler(ContentHandler):
             if self._curtable:
                 if self._curtablepath:
                     utils.LOGGER.warning(
-                        "self._curtablepath should be empty, " "got [%r]",
+                        "self._curtablepath should be empty, got [%r]",
                         self._curtablepath,
                     )
                 if infokey in CHANGE_TABLE_ELEMS:
@@ -2447,7 +2351,7 @@ class NmapHandler(ContentHandler):
                 self._curtable = {}
             elif infokey in ADD_TABLE_ELEMS:
                 infos = ADD_TABLE_ELEMS[infokey]
-                if isinstance(infos, utils.REGEXP_T):
+                if isinstance(infos, re.Pattern):
                     infos = infos.search(self._curscript.get("output", ""))
                     if infos is not None:
                         infosdict = infos.groupdict()
@@ -2458,9 +2362,17 @@ class NmapHandler(ContentHandler):
                             if infos:
                                 self._curscript[infokey] = infos
                 elif hasattr(infos, "__call__"):
-                    infos = infos(self._curscript)
-                    if infos is not None:
-                        self._curscript[infokey] = infos
+                    try:
+                        infos = infos(self._curscript)
+                    except Exception:
+                        utils.LOGGER.warning(
+                            "Cannot create structured output for %s",
+                            infokey,
+                            exc_info=True,
+                        )
+                    else:
+                        if infos is not None:
+                            self._curscript[infokey] = infos
             if infokey in POST_PROCESS:
                 POST_PROCESS[infokey](self._curscript, current, self._curhost)
             if infokey in SPLIT_SCRIPTS:
@@ -2507,6 +2419,7 @@ class NmapHandler(ContentHandler):
             function = {
                 "http-headers": self.masscan_post_http,
                 "http-content": self.masscan_post_http_content,
+                "http-server-header": self.masscan_post_http_server,
                 "s7-info": self.masscan_post_s7info,
                 "ssl-cert": self.masscan_post_x509,
                 "ssl-cacert": self.masscan_post_x509,
@@ -2541,7 +2454,7 @@ class NmapHandler(ContentHandler):
             data = data[4:]
             if len(data) < length:
                 utils.LOGGER.warning(
-                    "Incomplete SSH message [%r] expected " "length %d", data, length
+                    "Incomplete SSH message [%r] expected length %d", data, length
                 )
                 return
             curdata, data = data[:length], data[length:]
@@ -2551,7 +2464,7 @@ class NmapHandler(ContentHandler):
             padlen = struct.unpack("B", curdata[:1])[0]
             if len(curdata) < padlen + 1:
                 utils.LOGGER.warning(
-                    "Incomplete SSH message [%r] padding " "length %d", curdata, padlen
+                    "Incomplete SSH message [%r] padding length %d", curdata, padlen
                 )
                 continue
             curdata = curdata[1:-padlen]
@@ -2591,7 +2504,7 @@ class NmapHandler(ContentHandler):
         # cookie
         if len(data) < 16:
             utils.LOGGER.warning(
-                "SSH key exchange init message too " "short [%r] (len == %d < 16)",
+                "SSH key exchange init message too short [%r] (len == %d < 16)",
                 data,
                 len(data),
             )
@@ -2601,7 +2514,7 @@ class NmapHandler(ContentHandler):
         while data and keys:
             if len(data) < 4:
                 utils.LOGGER.warning(
-                    "Incomplete SSH key exchange init message" " part [%r]", data
+                    "Incomplete SSH key exchange init message part [%r]", data
                 )
                 return
             length = struct.unpack(">I", data[:4])[0]
@@ -2633,6 +2546,10 @@ class NmapHandler(ContentHandler):
                 for cpe in match.pop("cpe", []):
                     self._add_cpe_to_host(cpe=cpe)
                 self._curport.update(match)
+                add_service_hostname(
+                    match,
+                    self._curhost.setdefault("hostnames", []),
+                )
         # this requires a patched version of masscan
         for msgtype, msg in self._read_ssh_msgs(data[idx + 1 :]):
             if msgtype == 20:  # key exchange init
@@ -2744,7 +2661,6 @@ class NmapHandler(ContentHandler):
 
     def masscan_post_http(self, script):
         raw = self._from_binary(script["masscan"]["raw"])
-        self._curport["service_name"] = "http"
         match = utils.match_nmap_svc_fp(
             raw,
             proto="tcp",
@@ -2771,7 +2687,8 @@ class NmapHandler(ContentHandler):
             for hdrname, hdrval in (
                 m.groups()
                 for m in (
-                    _HTTP_HEADER.search(part.strip()) for part in raw.split(b"\n")
+                    utils.RAW_HTTP_HEADER.search(part.strip())
+                    for part in raw.split(b"\n")
                 )
                 if m
             )
@@ -2779,23 +2696,13 @@ class NmapHandler(ContentHandler):
         handle_http_headers(self._curhost, self._curport, script["http-headers"])
 
     def masscan_post_http_content(self, script):
-        self._curport["service_name"] = "http"
         raw = self._from_binary(script["masscan"]["raw"])
-        script_http_ls = create_http_ls(script["output"])
-        service_elasticsearch = create_elasticsearch_service(script["output"])
         script["output"] = utils.nmap_encode_data(raw)
-        if script_http_ls:
-            self._curport.setdefault("scripts", []).append(script_http_ls)
-        if service_elasticsearch:
-            if "hostname" in service_elasticsearch:
-                add_hostname(
-                    service_elasticsearch.pop("hostname"),
-                    "service",
-                    self._curhost.setdefault("hostnames", []),
-                )
-            for cpe in service_elasticsearch.pop("cpe", []):
-                self._add_cpe_to_host(cpe=cpe)
-            self._curport.update(service_elasticsearch)
+        handle_http_content(self._curhost, self._curport, raw)
+
+    @staticmethod
+    def masscan_post_http_server(script):
+        script["http-server-header"] = [script["output"]]
 
     def _add_cpe_to_host(self, cpe=None):
         """Adds the cpe (from `cpe` or from self._curdata) to the host-wide
@@ -2849,7 +2756,6 @@ class NmapHandler(ContentHandler):
 
 
 class Nmap2Txt(NmapHandler):
-
     """Simple "test" handler, outputs resulting JSON as text."""
 
     def __init__(self, fname, _, **kargs):
@@ -2867,39 +2773,23 @@ class Nmap2Txt(NmapHandler):
         return utils.decode_b64(data)
 
     def _addhost(self):
+        super()._addhost()
         self._db.append(self._curhost)
 
 
 class Nmap2DB(NmapHandler):
-
     """Specific handler for MongoDB backend."""
 
     def __init__(
         self,
         fname,
         db,
-        categories=None,
-        source=None,
         callback=None,
-        add_addr_infos=True,
         **kargs,
     ):
         self._db = db
-        if categories is None:
-            self.categories = []
-        else:
-            self.categories = categories
-        self._add_addr_infos = add_addr_infos
-        self.source = source
         self.callback = callback
-        NmapHandler.__init__(
-            self,
-            fname,
-            categories=categories,
-            source=source,
-            add_addr_infos=add_addr_infos,
-            **kargs,
-        )
+        super().__init__(fname, **kargs)
 
     def _to_binary(self, data):
         return self._db.nmap.to_binary(data)
@@ -2908,35 +2798,7 @@ class Nmap2DB(NmapHandler):
         return self._db.nmap.from_binary(data)
 
     def _addhost(self):
-        if self.categories:
-            self._curhost["categories"] = self.categories[:]
-        if self._add_addr_infos:
-            self._curhost["infos"] = {}
-            for func in [
-                self._db.data.country_byip,
-                self._db.data.as_byip,
-                self._db.data.location_byip,
-            ]:
-                self._curhost["infos"].update(func(self._curhost["addr"]) or {})
-        if self.source:
-            self._curhost["source"] = self.source
-        # We are about to insert data based on this file, so we want
-        # to save the scan document
-        if not self.scan_doc_saved:
-            self.scan_doc_saved = True
-            self._storescan()
+        super()._addhost()
         self._db.nmap.store_or_merge_host(self._curhost)
         if self.callback is not None:
             self.callback(self._curhost)
-
-    def _storescan(self):
-        ident = self._db.nmap.store_scan_doc(self._curscan)
-        return ident
-
-    def _updatescan(self, curscan_more):
-        self._db.nmap.update_scan_doc(self._filehash, curscan_more)
-
-    def _addscaninfo(self, i):
-        if "numservices" in i:
-            i["numservices"] = int(i["numservices"])
-        self._curscan.setdefault("scaninfos", []).append(i)

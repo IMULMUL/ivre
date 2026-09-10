@@ -1,8 +1,7 @@
 #! /usr/bin/env python
-# -*- coding: utf-8 -*-
 
 # This file is part of IVRE.
-# Copyright 2011 - 2021 Pierre LALET <pierre@droids-corp.org>
+# Copyright 2011 - 2025 Pierre LALET <pierre@droids-corp.org>
 #
 # IVRE is free software: you can redistribute it and/or modify it
 # under the terms of the GNU General Public License as published by
@@ -23,17 +22,17 @@ sub-module or script.
 
 """
 
+from __future__ import annotations  # needed for flake8
 
-import ast
 import argparse
-from bisect import bisect_left
+import ast
 import base64
 import bz2
 import datetime
 import functools
 import gzip
 import hashlib
-from io import BytesIO
+import ipaddress
 import logging
 import math
 import os
@@ -44,35 +43,51 @@ import struct
 import subprocess
 import sys
 import time
+import warnings
+from bisect import bisect_left
+from collections.abc import Callable, Generator, Iterable
+from io import BytesIO
 from types import TracebackType
-from typing import (
-    Any,
-    AnyStr,
-    BinaryIO,
-    Callable,
-    Dict,
-    Generator,
-    Iterable,
-    List,
-    Match,
-    Optional,
-    Pattern,
-    Set,
-    Tuple,
-    Type,
-    Union,
-    cast,
-)
+from typing import Any, AnyStr, BinaryIO, Type, TypeVar, cast
+from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
-
+from urllib.request import build_opener
 
 try:
-    from OpenSSL import crypto as osslc  # type: ignore
+    from cryptography import x509 as _x509
     from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+    from cryptography.utils import CryptographyDeprecationWarning
+    from OpenSSL import crypto as osslc
 except ImportError:
     USE_PYOPENSSL = False
 else:
     USE_PYOPENSSL = True
+    # ``X509.to_cryptography()`` (used in ``get_cert_info()`` below to
+    # look up the SubjectAlternativeName extension; see the comment
+    # there) re-parses the certificate through ``cryptography``'s own
+    # strict ASN.1 parser, which emits this warning for *any*
+    # certificate whose ``serialNumber`` is zero or negative -- a
+    # violation of RFC 5280 that OpenSSL/pyOpenSSL, and real-world
+    # (occasionally adversarial) certificates we must still be able to
+    # ingest, do not enforce. ``cryptography`` has announced turning
+    # this into a hard exception "in a future release" since its
+    # 36.0.0 changelog (2021), reiterated for a 43.0.0 target in the
+    # 42.0.0 changelog, without following through as of 49.0/50.0(dev):
+    # as things stand this is only ever a warning. Depending on the
+    # installed ``cryptography``/pyOpenSSL versions this warning can be
+    # attributed to either library's own frame rather than to a fixed
+    # module, so match on the message text only, and scope by
+    # category so unrelated ``cryptography`` deprecations still
+    # surface normally. If ``cryptography`` does turn this into an
+    # exception one day, ``get_cert_info()``'s ``_get_san_via_openssl_cli()``
+    # fallback keeps subjectAltName extraction correct; see
+    # ``test_get_cert_info_san_survives_non_positive_serial`` in
+    # ``tests/tests_no_backend.py``.
+    warnings.filterwarnings(
+        "ignore",
+        message="^Parsed a serial number which wasn't positive",
+        category=CryptographyDeprecationWarning,
+    )
 try:
     import PIL.Image  # type: ignore
     import PIL.ImageChops  # type: ignore
@@ -80,11 +95,17 @@ except ImportError:
     USE_PIL = False
 else:
     USE_PIL = True
+try:
+    import bson
+    from bson.regex import Regex as BsonRegex
+except ImportError:
+    USE_BSON = False
+else:
+    USE_BSON = True
 
 
-from ivre import config
+from ivre import VERSION, config
 from ivre.types import NmapProbe, NmapProbeRec, NmapServiceMatch, Record
-
 
 # (1)
 # http://docs.mongodb.org/manual/core/indexes/#index-behaviors-and-limitations
@@ -99,9 +120,10 @@ MAXVALLEN = 1000
 
 
 LOGGER = logging.getLogger("ivre")
-REGEXP_T = type(re.compile(""))
+LOGGER.setLevel(logging.DEBUG if config.DEBUG or config.DEBUG_DB else logging.INFO)
+
+
 HEX = re.compile("^[a-f0-9]+$", re.IGNORECASE)
-STRPTIME_SUPPORTS_TZ = sys.version_info >= (3, 7)
 
 
 # IP address regexp, based on
@@ -175,6 +197,12 @@ IPV4ADDR = re.compile(
     re.I,
 )
 MACADDR = re.compile("^(?:[0-9a-f]{1,2}:){5}[0-9a-f]{1,2}", re.I)
+TORCERT_SUBJECT = re.compile("^commonName=www\\.[a-z2-7]{8,20}\\.(net|com)$", flags=0)
+RAW_HTTP_HEADER = re.compile(
+    b"^([!\\#\\$%\\&'\\*\\+\\-\\.\\^_`\\|\\~A-Z0-9]+):[ \\\t]*([^\\\r]*)"
+    b"[ \\\t\\\r]*$",
+    re.I,
+)
 
 NMAP_FINGERPRINT_IVRE_KEY = {
     "d": "service_devicetype",
@@ -186,7 +214,46 @@ NMAP_FINGERPRINT_IVRE_KEY = {
     "cpe": "cpe",
 }
 
-logging.basicConfig()
+
+class InvalidIPAddress(ValueError):
+
+    def __init__(self, value: Any) -> None:
+        self.value = value
+
+
+class InvalidPort(ValueError):
+
+    def __init__(self, value: Any) -> None:
+        self.value = value
+
+
+def parse_port(value: Any) -> int:
+    try:
+        port = int(value)
+    except (TypeError, ValueError) as exc:
+        raise InvalidPort(value) from exc
+    if 0 <= port <= 65535:
+        return port
+    raise InvalidPort(value)
+
+
+def is_valid_ip(ipstr: AnyStr) -> bool:
+    """Return True iff `ipstr` is a valid IP address."""
+    if isinstance(ipstr, bytes):
+        data = ipstr.decode()
+    else:
+        data = ipstr
+    try:
+        socket.inet_aton(data)
+    except socket.error:
+        pass
+    else:
+        return True
+    try:
+        socket.inet_pton(socket.AF_INET6, data)
+    except socket.error:
+        return False
+    return True
 
 
 def ip2int(ipstr: AnyStr) -> int:
@@ -203,16 +270,20 @@ def ip2int(ipstr: AnyStr) -> int:
     try:
         return cast(int, struct.unpack("!I", socket.inet_aton(data))[0])
     except socket.error:
-        val1: int
-        val2: int
+        pass
+    val1: int
+    val2: int
+    try:
         val1, val2 = struct.unpack(
             "!QQ",
             socket.inet_pton(socket.AF_INET6, data),
         )
-        return (val1 << 64) + val2
+    except socket.error as exc:
+        raise InvalidIPAddress(data) from exc
+    return (val1 << 64) + val2
 
 
-def force_ip2int(ipstr: Union[AnyStr, int]) -> int:
+def force_ip2int(ipstr: AnyStr | int) -> int:
     """Same as ip2int(), but works when ipstr is already an int"""
     if isinstance(ipstr, (str, bytes)):
         return ip2int(ipstr)
@@ -246,14 +317,14 @@ def int2ip6(ipint: int) -> str:
     )
 
 
-def force_int2ip(ipint: Union[int, str]) -> str:
+def force_int2ip(ipint: int | str) -> str:
     """Same as int2ip(), but works when ipint is already a atring"""
     if isinstance(ipint, int):
         return int2ip(ipint)
     return ipint
 
 
-def ip2bin(ipval: Union[AnyStr, int]) -> bytes:
+def ip2bin(ipval: AnyStr | int) -> bytes:
     """Attempts to convert any IP address representation (both IPv4 and
     IPv6) to a 16-bytes binary blob.
 
@@ -271,8 +342,8 @@ def ip2bin(ipval: Union[AnyStr, int]) -> bytes:
             return b"\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xff\xff" + ipval
         try:
             data = ipval.decode()
-        except UnicodeDecodeError:
-            raise ValueError("Invalid IP address %r" % ipval)
+        except UnicodeDecodeError as exc:
+            raise InvalidIPAddress(ipval) from exc
     else:
         data = ipval
     try:
@@ -283,11 +354,11 @@ def ip2bin(ipval: Union[AnyStr, int]) -> bytes:
         pass
     try:
         return socket.inet_pton(socket.AF_INET6, data)
-    except socket.error:
-        raise ValueError("Invalid IP address %r" % ipval)
+    except socket.error as exc:
+        raise InvalidIPAddress(data) from exc
 
 
-def bin2ip(ipval: Union[AnyStr, int]) -> str:
+def bin2ip(ipval: AnyStr | int) -> str:
     """Converts a 16-bytes binary blob to an IPv4 or IPv6 standard
     representation. See ip2bin().
 
@@ -301,8 +372,8 @@ def bin2ip(ipval: Union[AnyStr, int]) -> str:
         try:
             socket.inet_pton(socket.AF_INET6, ipval)
             return ipval
-        except socket.error:
-            raise ValueError("Invalid IP address %r" % ipval)
+        except socket.error as exc:
+            raise InvalidIPAddress(ipval) from exc
     if isinstance(ipval, int):
         return int2ip(ipval)
     if ipval[:12] == b"\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xff\xff":
@@ -321,62 +392,32 @@ def int2mask(mask: int) -> int:
     return (0xFFFFFFFF00000000 >> mask) & 0xFFFFFFFF
 
 
-def int2mask6(mask: int) -> int:
-    """Converts the number of bits set to 1 in a mask (the 48 in
-    2001:db8:1234::/48) to the 128-bit integer corresponding to the IP address
-    of the mask (ip2int("ffff:ffff:ffff::") for 48)
-
-    """
-    return (
-        0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF00000000000000000000000000000000 >> mask
-    ) & 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF
-
-
-def net2range(network: AnyStr) -> Tuple[str, str]:
+def net2range(network: str) -> tuple[str, str]:
     """Converts a network to a (start, stop) tuple."""
-    if isinstance(network, bytes):
-        data = network.decode()
-    else:
-        data = network
-    addr, mask = data.split("/")
-    ipv6 = ":" in addr
-    addr_int = ip2int(addr)
-    if (not ipv6 and "." in mask) or (ipv6 and ":" in mask):
-        mask_int = ip2int(mask)
-    elif ipv6:
-        mask_int = int2mask6(int(mask))
-    else:
-        mask_int = int2mask(int(mask))
-    start = addr_int & mask_int
-    if ipv6:
-        return int2ip6(start), int2ip6(
-            start + 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF - mask_int
-        )
-    return int2ip(start), int2ip(start + 0xFFFFFFFF - mask_int)
+    try:
+        net = ipaddress.ip_interface(network).network
+    except ValueError as exc:
+        try:
+            base, mask = network.split("/", 1)
+        except ValueError as exc2:
+            raise exc2 from exc
+        if ":" in base:
+            raise
+        if base.count(".") > 2:
+            raise
+        if base.endswith("."):
+            base += "0"
+        base += ".0" * (3 - base.count("."))
+        net = ipaddress.ip_interface(f"{base}/{mask}").network
+    return str(net.network_address), str(net.broadcast_address)
 
 
-def range2nets(rng: Tuple[Union[AnyStr, int], Union[AnyStr, int]]) -> List[str]:
-    """Converts a (start, stop) tuple to a list of networks."""
-    start, stop = (force_ip2int(addr) for addr in rng)
-    if stop < start:
-        raise ValueError()
-    res = []
-    cur = start
-    maskint = 32
-    mask = int2mask(maskint)
-    while True:
-        while cur & mask == cur and cur | (~mask & 0xFFFFFFFF) <= stop:
-            maskint -= 1
-            if maskint < 0:
-                break
-            mask = int2mask(maskint)
-        res.append("%s/%d" % (int2ip(cur), maskint + 1))
-        mask = int2mask(maskint + 1)
-        if stop & mask == cur:
-            return res
-        cur = (cur | (~mask & 0xFFFFFFFF)) + 1
-        maskint = 32
-        mask = int2mask(maskint)
+def range2nets(rng: tuple[str | int, str | int]) -> Generator[str, None, None]:
+    """Converts a (start, stop) tuple to a generator of networks."""
+    for net in ipaddress.summarize_address_range(
+        ipaddress.ip_address(rng[0]), ipaddress.ip_address(rng[1])
+    ):
+        yield str(net)
 
 
 def get_domains(name: str) -> Generator[str, None, None]:
@@ -411,7 +452,7 @@ def _escape_first_slash(string: str) -> str:
     return string
 
 
-def str2regexp(string: str) -> Union[str, Pattern[str]]:
+def str2regexp(string: str) -> str | re.Pattern[str]:
     """This function takes a string and returns either this string or
     a python regexp object, when the string is using the syntax
     /regexp[/flags].
@@ -429,7 +470,7 @@ def str2regexp(string: str) -> Union[str, Pattern[str]]:
     return re.compile(_espace_slash(string), flags)
 
 
-def str2regexpnone(value: str) -> Union[str, Pattern[str], bool]:
+def str2regexpnone(value: str) -> str | re.Pattern[str] | bool:
     """Just like str2regexp, but handle special '-' value, which means
     False.
 
@@ -439,9 +480,7 @@ def str2regexpnone(value: str) -> Union[str, Pattern[str], bool]:
     return str2regexp(value)
 
 
-def regexp2pattern(
-    string: Union[Union[str, bytes], Pattern]
-) -> Tuple[Union[str, bytes], int]:
+def regexp2pattern(string: str | bytes | re.Pattern) -> tuple[str | bytes, int]:
     """This function takes a regexp or a string and returns a pattern and
     some flags, suitable for use with re.compile(), combined with
     another pattern before. Useful, for example, if you want to create
@@ -449,7 +488,7 @@ def regexp2pattern(
     value are regexp.
 
     """
-    if isinstance(string, REGEXP_T):
+    if isinstance(string, re.Pattern):
         flags = string.flags
         data = string.pattern
         patterns = ("^", "$", ".*") if isinstance(data, str) else (b"^", b"$", b".*")
@@ -475,7 +514,7 @@ def regexp2pattern(
     raise TypeError()
 
 
-def str2list(string: AnyStr) -> Union[AnyStr, List[AnyStr]]:
+def str2list(string: AnyStr) -> AnyStr | list[AnyStr]:
     """This function takes a string and returns either this string or
     a list of the coma-or-pipe separated elements from the string.
 
@@ -510,30 +549,34 @@ def ports2nmapspec(portlist: Iterable[int]) -> str:
     """
     # unique and sorted (http://stackoverflow.com/a/13605607/3223422)
     portlist = sorted(set(portlist))
-    result: List[str] = []
-    current: Tuple[Optional[int], Optional[int]] = (None, None)
+    result: list[str] = []
+    current: tuple[int | None, int | None] = (None, None)
     for port in portlist:
         if port - 1 == current[1]:
             current = (current[0], port)
         else:
             if current[0] is not None:
                 result.append(
-                    str(current[0]) if current[0] == current[1] else "%d-%d" % current  # type: ignore
+                    str(current[0])
+                    if current[0] == current[1]
+                    else f"{current[0]}-{current[1]}"
                 )
             current = (port, port)
     if current[0] is not None:
         result.append(
-            str(current[0]) if current[0] == current[1] else "%d-%d" % current  # type: ignore
+            str(current[0])
+            if current[0] == current[1]
+            else f"{current[0]}-{current[1]}"
         )
     return ",".join(result)
 
 
-def nmapspec2ports(string: str) -> Set[int]:
+def nmapspec2ports(string: str) -> set[int]:
     """This function takes a string suitable for use as argument for
     Nmap's -p option and returns the corresponding set of ports.
 
     """
-    result: Set[int] = set()
+    result: set[int] = set()
     for ports in string.split(","):
         if "-" in ports:
             port1, port2 = (int(port) for port in ports.split("-", 1))
@@ -543,7 +586,7 @@ def nmapspec2ports(string: str) -> Set[int]:
     return result
 
 
-def all2datetime(arg: Union[int, float, str, datetime.datetime]) -> datetime.datetime:
+def all2datetime(arg: int | float | str | datetime.datetime) -> datetime.datetime:
     """Return a datetime object from an int (timestamp) or an iso
     formatted string '%Y-%m-%d %H:%M:%S'.
 
@@ -561,10 +604,101 @@ def all2datetime(arg: Union[int, float, str, datetime.datetime]) -> datetime.dat
                 return datetime.datetime.strptime(arg, fmt)
             except ValueError:
                 pass
-        raise ValueError("time data %r does not match standard formats" % arg)
+        raise ValueError(f"time data {arg!r} does not match standard formats")
     if isinstance(arg, (int, float)):
         return datetime.datetime.fromtimestamp(arg)
-    raise TypeError("%s is of unknown type." % repr(arg))
+    raise TypeError(f"{arg!r} is of unknown type.")
+
+
+# Duration shorthand shared by ``ivre auditcli`` (``--since`` /
+# ``--until`` / ``--purge-older-than``) and the ``/cgi/audit/*`` web
+# API: ``Ns`` / ``Nm`` / ``Nh`` / ``Nd`` / ``Ny`` (seconds, minutes,
+# hours, days, Julian years) or a bare integer count of seconds.
+_DURATION_UNITS = {
+    "s": 1,
+    "m": 60,
+    "h": 3600,
+    "d": 86400,
+    "y": 31_557_600,
+}
+
+_DURATION_RE = re.compile(r"^(\d+)([smhdy])$")
+
+
+def parse_duration(raw: str) -> datetime.timedelta:
+    """Translate a duration shorthand into a :class:`datetime.timedelta`.
+
+    Accepts ``Ns`` / ``Nm`` / ``Nh`` / ``Nd`` / ``Ny`` (seconds,
+    minutes, hours, days, Julian years of 365.25 days) or a bare
+    integer count of seconds.
+
+    Raises :class:`ValueError` on a malformed value, or one too large
+    to fit in a :class:`datetime.timedelta` (which caps out around 2.7
+    million years), so that e.g. ``"999999999999y"`` surfaces as a
+    clean error rather than an :class:`OverflowError`.
+    """
+    match = _DURATION_RE.match(raw)
+    if match is None:
+        try:
+            return datetime.timedelta(seconds=int(raw))
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(
+                f"invalid duration {raw!r} (expected Ns / Nm / Nh / Nd / Ny "
+                "or a bare integer count of seconds, small enough to fit in "
+                "datetime.timedelta)"
+            ) from exc
+    try:
+        return datetime.timedelta(
+            seconds=int(match.group(1)) * _DURATION_UNITS[match.group(2)]
+        )
+    except OverflowError as exc:
+        raise ValueError(
+            f"invalid duration {raw!r} (too large to fit in datetime.timedelta)"
+        ) from exc
+
+
+def parse_when(raw: str | None) -> datetime.datetime | None:
+    """Parse a ``since`` / ``until``-style time bound into a
+    timezone-aware (UTC) :class:`datetime.datetime`.
+
+    Shared by ``ivre auditcli --since`` / ``--until`` and the
+    ``/cgi/audit/*`` web API ``since`` / ``until`` query parameters so
+    a bookmarked Explorer URL maps 1:1 to a CLI invocation. Accepted
+    forms:
+
+    * ``None`` / empty string -- returns ``None`` (no bound).
+    * Duration shorthand (``"30d"`` / ``"2h"`` / ...) -- interpreted
+      as that long *before now*, in UTC.
+    * Unix timestamp (``"1716595200"`` / ``"1716595200.0"``) -- UTC.
+    * ISO 8601 (``"2026-05-25T00:00:00Z"`` / ``"...+00:00"`` /
+      ``"2026-05-25"``) -- a naive value is interpreted as UTC.
+
+    A bare integer is a Unix timestamp here (e.g. ``"3600"`` is
+    1970-01-01T01:00Z), not a relative duration; use the explicit
+    ``Ns`` shorthand for "N seconds ago".
+
+    Raises :class:`ValueError` on a malformed value.
+    """
+    if not raw:
+        return None
+    if _DURATION_RE.match(raw) is not None:
+        return datetime.datetime.now(tz=datetime.timezone.utc) - parse_duration(raw)
+    try:
+        return datetime.datetime.fromtimestamp(float(raw), tz=datetime.timezone.utc)
+    except (TypeError, ValueError):
+        # Not numeric at all -- fall through to the ISO branch.
+        pass
+    except (OverflowError, OSError) as exc:
+        # Numeric, but the platform can't represent it; surface a clean
+        # error rather than falling into the ISO parser.
+        raise ValueError(f"invalid datetime {raw!r}: {exc}") from exc
+    try:
+        parsed = datetime.datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError(f"invalid datetime {raw!r}: {exc}") from exc
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=datetime.timezone.utc)
+    return parsed
 
 
 def makedirs(dirname: AnyStr) -> None:
@@ -594,17 +728,17 @@ def isfinal(elt: Any) -> bool:
     that does not contain other elements)
 
     """
-    return isinstance(elt, (str, int, float, datetime.datetime, REGEXP_T))
+    return isinstance(elt, (str, int, float, datetime.datetime, re.Pattern))
 
 
-def diff(doc1: Dict[str, Any], doc2: Dict[str, Any]) -> Dict[str, Any]:
+def diff(doc1: dict[str, Any], doc2: dict[str, Any]) -> dict[str, Any]:
     """NOT WORKING YET - WORK IN PROGRESS - Returns fields that differ
     between two scans.
 
     """
     keys1 = set(doc1)
     keys2 = set(doc2)
-    res: Dict[str, Any] = {}
+    res: dict[str, Any] = {}
     for key in keys1.symmetric_difference(keys2):
         res[key] = True
     for key in keys1.intersection(keys2):
@@ -616,7 +750,7 @@ def diff(doc1: Dict[str, Any], doc2: Dict[str, Any]) -> Dict[str, Any]:
         if key in ["categories"]:
             set1 = set(doc1[key])
             set2 = set(doc2[key])
-            res[key] = list(set1.symmetric_difference(set2))
+            res[key] = sorted(set1.symmetric_difference(set2))
             if not res[key]:
                 del res[key]
             continue
@@ -639,7 +773,7 @@ def diff(doc1: Dict[str, Any], doc2: Dict[str, Any]) -> Dict[str, Any]:
     return res
 
 
-def fields2csv_head(fields: Dict[str, Any], prefix: str = "") -> List[str]:
+def fields2csv_head(fields: dict[str, Any], prefix: str = "") -> list[str]:
     """Given an (ordered) dictionary `fields`, returns a list of the
     fields. NB: recursive function, hence the `prefix` parameter.
 
@@ -649,16 +783,16 @@ def fields2csv_head(fields: Dict[str, Any], prefix: str = "") -> List[str]:
         if subfields is True or callable(subfields):
             line.append(prefix + field)
         elif isinstance(subfields, dict):
-            line += fields2csv_head(subfields, prefix=prefix + field + ".")
+            line += fields2csv_head(subfields, prefix=f"{prefix}{field}.")
     return line
 
 
-def doc2csv(doc: Record, fields: Dict[str, Any], nastr: str = "NA") -> List[list]:
+def doc2csv(doc: Record, fields: dict[str, Any], nastr: str = "NA") -> list[list]:
     """Given a document and an (ordered) dictionary `fields`, returns
     a list of CSV lines. NB: recursive function.
 
     """
-    lines: List[list] = [[]]
+    lines: list[list] = [[]]
     for field, subfields in fields.items():
         if subfields is True:
             value = doc.get(field)
@@ -715,12 +849,12 @@ class FileOpener(BinaryIO):
 
     """
 
-    FILE_OPENERS_MAGIC: Dict[bytes, Callable] = {
+    FILE_OPENERS_MAGIC: dict[bytes, Callable] = {
         b"\x1f\x8b": gzip.open,
         b"BZ": bz2.BZ2File,
     }
 
-    def __init__(self, fname: Union[str, BinaryIO]) -> None:
+    def __init__(self, fname: str | BinaryIO) -> None:
         if not isinstance(fname, str):
             self.fdesc = fname
             self.needsclose = False
@@ -751,19 +885,19 @@ class FileOpener(BinaryIO):
         # even when self.close is False.
         self.fdesc.close()
 
-    def __enter__(self) -> "FileOpener":
+    def __enter__(self) -> FileOpener:
         return self
 
     def __exit__(
         self,
-        exc_type: Optional[Type[BaseException]],
-        exc_val: Optional[BaseException],
-        exc_tb: Optional[TracebackType],
+        exc_type: Type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: TracebackType | None,
     ) -> None:
         if self.needsclose:
             self.fdesc.close()
 
-    def __iter__(self) -> "FileOpener":
+    def __iter__(self) -> FileOpener:
         return self
 
     def __next__(self) -> bytes:
@@ -792,28 +926,28 @@ class FileOpener(BinaryIO):
     def readable(self) -> bool:
         return self.fdesc.readable()
 
-    def readlines(self, hint: int = -1) -> List[bytes]:
+    def readlines(self, hint: int = -1) -> list[bytes]:
         return self.fdesc.readlines(hint)
 
     def seekable(self) -> bool:
         return self.fdesc.seekable()
 
     def seek(self, offset: int, whence: int = 0) -> int:
-        return self.fdesc.seek(offset, whence=whence)
+        return self.fdesc.seek(offset, whence)
 
     def tell(self) -> int:
         return self.fdesc.tell()
 
-    def truncate(self, size: Optional[int] = None) -> int:
-        return self.fdesc.truncate(size=size)
+    def truncate(self, size: int | None = None) -> int:
+        return self.fdesc.truncate(size)
 
     def writable(self) -> bool:
         return self.fdesc.writable()
 
-    def write(self, s: bytes) -> int:
+    def write(self, s: bytes) -> int:  # type: ignore[override]
         return self.fdesc.write(s)
 
-    def writelines(self, lines: Iterable[bytes]) -> None:
+    def writelines(self, lines: Iterable[bytes]) -> None:  # type: ignore[override]
         self.fdesc.writelines(lines)
 
 
@@ -821,60 +955,82 @@ def open_file(fname: str) -> FileOpener:
     return FileOpener(fname)
 
 
-def hash_file(fname: str, hashtype: str = "sha1") -> bytes:
-    """Compute a hash of data from a given file"""
-    with open_file(fname) as fdesc:
-        result = hashlib.new(hashtype)
-        for data in iter(lambda: fdesc.read(1048576), b""):
-            result.update(data)
-        return result.hexdigest().encode()
+def recursive_filelisting(
+    base_directories: Iterable[str], error: list[bool] | None = None
+) -> Generator[str, None, None]:
+    """Iterator on filenames in base_directories. Ugly hack: error is a
+    one-element list that will be set to True if one of the directories in
+    base_directories does not exist.
+
+    """
+
+    for base_directory in base_directories:
+        if not os.path.exists(base_directory):
+            LOGGER.warning("directory %r does not exist", base_directory)
+            if error:
+                error[0] = True
+            continue
+        if not os.path.isdir(base_directory):
+            yield base_directory
+            continue
+        for root, _, files in os.walk(base_directory):
+            for leaffile in files:
+                yield os.path.join(root, leaffile)
 
 
-def serialize(obj: Any) -> str:
+def serialize(obj: Any) -> Any:
     """Return a JSON-compatible representation for `obj`"""
-    if isinstance(obj, REGEXP_T):
-        return "/%s/%s" % (
-            obj.pattern,
-            "".join(x.lower() for x in "ILMSXU" if getattr(re, x) & obj.flags),
-        )
+    regexp_types = (re.Pattern, BsonRegex) if USE_BSON else re.Pattern
+    if isinstance(obj, regexp_types):
+        return f"/{obj.pattern}/{''.join((x.lower() for x in 'ILMSXU' if getattr(re, x) & obj.flags))}"
     if isinstance(obj, datetime.datetime):
         return str(obj)
     if isinstance(obj, bytes):
         return obj.decode()
-    raise TypeError("Don't know what to do with %r (%r)" % (obj, type(obj)))
+    if USE_BSON and isinstance(obj, bson.Decimal128):
+        # JSON has no decimal type. Render small values (<= the JS
+        # safe integer range) as a plain int so JS clients get a
+        # native ``number``; render larger values (e.g. IPv6 range
+        # sizes wider than /74) as a string to avoid the silent
+        # precision loss that ``Number(JSON.parse(...))`` would
+        # introduce. The web RIR section uses this for the ``size``
+        # field on inet[6]num records.
+        as_int = int(obj.to_decimal())
+        if -(2**53 - 1) <= as_int <= 2**53 - 1:
+            return as_int
+        return str(as_int)
+    raise TypeError(f"Don't know what to do with {obj!r} ({type(obj)!r})")
 
 
-class LogFilter(logging.Filter):
-    """A logging filter that prevents duplicate warnings and only reports
-    messages with level lower than INFO when config.DEBUG (or
-    config.DEBUG_DB) is True.
+def merge_dns_results(
+    target: dict[tuple[str, str], dict[str, Any]],
+    source: dict[tuple[str, str], dict[str, Any]],
+) -> None:
+    """Merge a second ``(name, addr) → {types, sources, firstseen,
+    lastseen, count}`` mapping into ``target`` in place.
 
+    The merged keys union their ``types`` and ``sources`` sets,
+    extend the ``firstseen`` / ``lastseen`` interval, and sum the
+    ``count``. Used by both ``ivre.tools.iphost`` (CLI) and the
+    ``/cgi/dns`` web endpoint to combine the per-backend
+    ``iter_dns`` outputs into a single deduplicated view.
     """
-
-    MAX_WARNINGS_STORED = 100
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.warnings: Set[str] = set()
-
-    def filter(self, record: logging.LogRecord) -> bool:
-        """Decides whether we should log a record"""
-        if record.levelno < logging.INFO:
-            if record.msg.startswith("DB:"):
-                return config.DEBUG_DB
-            return config.DEBUG
-        if record.levelno != logging.WARNING:
-            return True
-        if record.msg in self.warnings:
-            return False
-        if len(self.warnings) > self.MAX_WARNINGS_STORED:
-            self.warnings = set()
-        self.warnings.add(record.msg)
-        return True
-
-
-LOGGER.addFilter(LogFilter())
-LOGGER.setLevel(1 if config.DEBUG or config.DEBUG_DB else 20)
+    for key, value in source.items():
+        cur_res = target.setdefault(
+            key,
+            {
+                "types": set(),
+                "sources": set(),
+                "firstseen": value["firstseen"],
+                "lastseen": value["lastseen"],
+                "count": 0,
+            },
+        )
+        cur_res["types"].update(value.get("types", ()))
+        cur_res["sources"].update(value.get("sources", ()))
+        cur_res["firstseen"] = min(cur_res["firstseen"], value["firstseen"])
+        cur_res["lastseen"] = max(cur_res["lastseen"], value["lastseen"])
+        cur_res["count"] += value.get("count", 0)
 
 
 CLI_ARGPARSER = argparse.ArgumentParser(add_help=False)
@@ -888,18 +1044,18 @@ CLI_ARGPARSER.add_argument(
 CLI_ARGPARSER.add_argument(
     "--ensure-indexes",
     action="store_true",
-    help="Create missing indexes (will lock the " "database).",
+    help="Create missing indexes (will lock the database).",
 )
 CLI_ARGPARSER.add_argument(
     "--update-schema",
     action="store_true",
-    help="update (host) schema. Use with --version to " "specify your current version",
+    help="update (host) schema. Use with --version to specify your current version",
 )
 # Actions / display modes
 CLI_ARGPARSER.add_argument(
     "--delete",
     action="store_true",
-    help="DELETE the matched results instead of " "displaying them.",
+    help="DELETE the matched results instead of displaying them.",
 )
 CLI_ARGPARSER.add_argument(
     "--short", action="store_true", help="Output only IP addresses, one per line."
@@ -913,7 +1069,7 @@ CLI_ARGPARSER.add_argument(
 CLI_ARGPARSER.add_argument(
     "--distinct",
     metavar="FIELD",
-    help="Output only unique FIELD part of the " "results, one per line.",
+    help="Output only unique FIELD part of the results, one per line.",
 )
 CLI_ARGPARSER.add_argument(
     "--json", action="store_true", help="Output results as JSON documents."
@@ -924,10 +1080,30 @@ CLI_ARGPARSER.add_argument(
     help="Output results as HTTP URLs, one per line.",
 )
 CLI_ARGPARSER.add_argument(
+    "--http-urls-names",
+    action="store_true",
+    help="Output results as HTTP URLs, one per line.",
+)
+CLI_ARGPARSER.add_argument(
+    "--http-urls-full",
+    action="store_true",
+    help="Output results as HTTP URLs, one per line.",
+)
+CLI_ARGPARSER.add_argument(
+    "--from-db",
+    metavar="DB_URL",
+    help="Get data from the provided URL instead of using IVRE's configuration.",
+)
+CLI_ARGPARSER.add_argument(
+    "--to-db",
+    metavar="DB_URL",
+    help="Store data to the provided URL instead of displaying them.",
+)
+CLI_ARGPARSER.add_argument(
     "--sort",
     metavar="FIELD / ~FIELD",
     nargs="+",
-    help="Sort results according to FIELD; use " "~FIELD to reverse sort order.",
+    help="Sort results according to FIELD; use ~FIELD to reverse sort order.",
 )
 CLI_ARGPARSER.add_argument("--limit", type=int, help="Output at most LIMIT results.")
 CLI_ARGPARSER.add_argument("--skip", type=int, help="Skip first SKIP results.")
@@ -936,7 +1112,7 @@ CLI_ARGPARSER.add_argument("--skip", type=int, help="Skip first SKIP results.")
 # Country aliases:
 #   - UK: GB
 #   - EU: 27 EU member states, + EU itself, for historical reasons
-COUNTRY_ALIASES: Dict[str, Union[str, List[str]]] = {
+COUNTRY_ALIASES: dict[str, str | list[str]] = {
     "UK": "GB",
     "EU": [
         "AT",
@@ -971,7 +1147,7 @@ COUNTRY_ALIASES: Dict[str, Union[str, List[str]]] = {
 }
 
 
-def country_unalias(country: Union[str, Iterable[str]]) -> Union[str, List[str]]:
+def country_unalias(country: str | Iterable[str]) -> str | list[str]:
     """Takes either a country code (or an iterator of country codes)
     and returns either a country code or a list of country codes.
 
@@ -988,7 +1164,7 @@ def country_unalias(country: Union[str, Iterable[str]]) -> Union[str, List[str]]
     if isinstance(country, str):
         return COUNTRY_ALIASES.get(country, country)
     if hasattr(country, "__iter__"):
-        empty: List[str] = []
+        empty: list[str] = []
         return functools.reduce(
             lambda x, y: x + (y if isinstance(y, list) else [y]),
             (country_unalias(country_elt) for country_elt in country),
@@ -1000,7 +1176,7 @@ def country_unalias(country: Union[str, Iterable[str]]) -> Union[str, List[str]]
 _WORDS = re.compile(b"\\w+")
 
 
-def screenwords(imgdata: bytes) -> Optional[List[str]]:
+def screenwords(imgdata: bytes) -> list[str] | None:
     """Takes an image and returns a list of the words seen by the OCR"""
     if config.TESSERACT_CMD is not None:
         # pylint: disable=consider-using-with
@@ -1017,7 +1193,7 @@ def screenwords(imgdata: bytes) -> Optional[List[str]]:
         result = []
         size = MAXVALLEN
         for line in proc.stdout:
-            if size == 0:
+            if not size:
                 break
             for word_match in _WORDS.finditer(line):
                 word_bytes = word_match.group()
@@ -1045,13 +1221,11 @@ def screenwords(imgdata: bytes) -> Optional[List[str]]:
 
 if USE_PIL:
 
-    def _img_size(bbox: Tuple[int, int, int, int]) -> int:
+    def _img_size(bbox: tuple[int, int, int, int]) -> int:
         """Returns the size of a given `bbox`"""
         return (bbox[2] - bbox[0]) * (bbox[3] - bbox[1])
 
-    def _trim_image(
-        img: PIL.Image, tolerance: int
-    ) -> Optional[Tuple[int, int, int, int]]:
+    def _trim_image(img: PIL.Image, tolerance: int) -> tuple[int, int, int, int] | None:
         """Returns the tiniest `bbox` to trim `img`"""
         result = None
         for pixel in [
@@ -1083,13 +1257,17 @@ if USE_PIL:
 
     def trim_image(
         imgdata: bytes, tolerance: int = 1, minborder: int = 10
-    ) -> Union[bytes, bool]:
+    ) -> bytes | bool:
         """Trims the image, `tolerance` is an integer from 0 (not
         tolerant, trims region with the exact same color) to 255
         (too tolerant, will trim the whole image).
 
         """
         img = PIL.Image.open(BytesIO(imgdata))
+        if img.mode == "RGBA":
+            new_img = PIL.Image.new("RGB", img.size, (255, 255, 255))
+            new_img.paste(img, mask=img.split()[3])
+            img = new_img
         bbox = _trim_image(img, tolerance)
         if bbox:
             newbbox = (
@@ -1108,18 +1286,17 @@ if USE_PIL:
         # Image no longer exists after trim
         return False
 
-
 else:
 
     def trim_image(
         imgdata: bytes, tolerance: int = 1, minborder: int = 10
-    ) -> Union[bytes, bool]:
+    ) -> bytes | bool:
         """Stub function used when PIL cannot be found"""
         LOGGER.warning("Python PIL not found, screenshots will not be trimmed")
         return imgdata
 
 
-_PORTS: Dict[str, Dict[int, float]] = {}
+_PORTS: dict[str, dict[int, float]] = {}
 _PORTS_POPULATED = False
 
 
@@ -1130,14 +1307,16 @@ def _set_ports() -> None:
         This function is called on module load.
 
     """
-    global _PORTS, _PORTS_POPULATED
+    global _PORTS_POPULATED
     try:
         # pylint: disable=consider-using-with
         assert config.NMAP_SHARE_PATH is not None
-        fdesc = open(os.path.join(config.NMAP_SHARE_PATH, "nmap-services"))
+        fdesc = open(
+            os.path.join(config.NMAP_SHARE_PATH, "nmap-services"), encoding="utf8"
+        )
     except (IOError, AttributeError, AssertionError):
         try:
-            with open("/etc/services") as fdesc:
+            with open("/etc/services", encoding="utf8") as fdesc:
                 for line in fdesc:
                     try:
                         _, port_s = line.split("#", 1)[0].split(None, 2)
@@ -1175,18 +1354,18 @@ def guess_srv_port(port1: int, port2: int, proto: str = "tcp") -> int:
     ports = _PORTS.get(proto, {})
     val1, val2 = ports.get(port1, 0), ports.get(port2, 0)
     cmpval = (val1 > val2) - (val1 < val2)
-    if cmpval == 0:
+    if not cmpval:
         return (port2 > port1) - (port2 < port1)
     return cmpval
 
 
-_NMAP_PROBES: Dict[
+_NMAP_PROBES: dict[
     str,
-    Dict[str, NmapProbeRec],
+    dict[str, NmapProbeRec],
 ] = {}
 _NMAP_PROBES_POPULATED = False
-_NMAP_CUR_PROBE: Optional[NmapProbe] = None
-_NMAP_CUR_FALLBACK: Optional[List[str]] = None
+_NMAP_CUR_PROBE: NmapProbe | None = None
+_NMAP_CUR_FALLBACK: list[str] | None = None
 
 
 def _read_nmap_probes() -> None:
@@ -1195,7 +1374,7 @@ def _read_nmap_probes() -> None:
     _NMAP_CUR_FALLBACK = None
 
     def parse_line(line: bytes) -> None:
-        global _NMAP_PROBES, _NMAP_CUR_PROBE, _NMAP_CUR_FALLBACK
+        global _NMAP_CUR_PROBE, _NMAP_CUR_FALLBACK
         if line.startswith(b"match "):
             line = line[6:]
             soft = False
@@ -1209,11 +1388,21 @@ def _read_nmap_probes() -> None:
         elif line.startswith(b"Probe "):
             _NMAP_CUR_PROBE = []
             _NMAP_CUR_FALLBACK = []
+            probe: bytes | None
             proto, name, probe = line[6:].split(b" ", 2)
-            if not (len(probe) >= 3 and probe[:2] == b"q|" and probe[-1:] == b"|"):
+            if not (len(probe) >= 3 and probe[:2] == b"q|"):
                 LOGGER.warning("Invalid nmap probe %r", probe)
-            else:
-                probe = nmap_decode_data(probe[2:-1].decode(), arbitrary_escapes=True)
+                return
+            while not probe[-1:] == b"|":
+                try:
+                    probe = probe.rsplit(b" ", 1)[-2]
+                except IndexError:
+                    LOGGER.warning("Invalid nmap probe %r", probe)
+                    probe = None
+                    break
+            if probe is None:
+                return
+            probe = nmap_decode_data(probe[2:-1].decode(), arbitrary_escapes=True)
             assert _NMAP_CUR_PROBE is not None
             assert _NMAP_CUR_FALLBACK is not None
             _NMAP_PROBES.setdefault(proto.lower().decode(), {})[name.decode()] = {
@@ -1225,7 +1414,7 @@ def _read_nmap_probes() -> None:
         else:
             return
         service, data = line.split(b" ", 1)
-        info: Dict[str, Any] = {"soft": soft}
+        info: dict[str, Any] = {"soft": soft}
         while data:
             if data.startswith(b"cpe:"):
                 key = "cpe"
@@ -1237,7 +1426,7 @@ def _read_nmap_probes() -> None:
             data = data[1:]
             index = data.index(sep)
             value = data[:index]
-            value_out: Union[Pattern[bytes], str]
+            value_out: re.Pattern[bytes] | str
             data = data[index + 1 :]
             flag = b""
             if data:
@@ -1287,13 +1476,12 @@ def _read_nmap_probes() -> None:
 
 
 def get_nmap_svc_fp(proto: str = "tcp", probe: str = "NULL") -> NmapProbeRec:
-    global _NMAP_PROBES, _NMAP_PROBES_POPULATED
     if not _NMAP_PROBES_POPULATED:
         _read_nmap_probes()
     return _NMAP_PROBES[proto][probe]
 
 
-def get_nmap_probes(proto: str) -> Dict[bytes, str]:
+def get_nmap_probes(proto: str) -> dict[bytes, str]:
     if not _NMAP_PROBES_POPULATED:
         _read_nmap_probes()
     return {value["probe"]: name for name, value in _NMAP_PROBES[proto].items()}
@@ -1339,7 +1527,7 @@ def match_nmap_svc_fp(
                     if elt in fingerprint:
                         if elt == "cpe":
                             data_cpe = [
-                                "cpe:/%s" % nmap_svc_fp_format_data(value, match)
+                                f"cpe:/{nmap_svc_fp_format_data(value, match)}"
                                 for value in fingerprint[elt]
                             ]
                             if data_cpe:
@@ -1364,7 +1552,7 @@ def match_nmap_svc_fp(
                 # exceptions so far are DNSStatusRequestTCP (fallback
                 # DNSStatusRequest) and DNSVersionBindReqTCP (fallback
                 # DNSVersionBindReq)
-                if proto == "tcp" and fallback + "TCP" == probe:
+                if proto == "tcp" and f"{fallback}TCP" == probe:
                     fallback_result = match_nmap_svc_fp(
                         output, proto="udp", probe=fallback, soft=soft
                     )
@@ -1381,7 +1569,7 @@ def match_nmap_svc_fp(
     return softmatch
 
 
-_NMAP_PAYLOADS = {}
+_NMAP_PAYLOADS: dict[bytes, str] = {}
 _NMAP_PAYLOADS_POPULATED = False
 
 
@@ -1391,7 +1579,7 @@ def _read_nmap_payloads() -> None:
     def _parse_line(line: str) -> Generator[str, None, None]:
         status = 0
         for c in line:
-            if status == 0:
+            if not status:
                 if c in {"#", "\r", "\n"}:
                     return
                 yield c
@@ -1409,7 +1597,9 @@ def _read_nmap_payloads() -> None:
         cur_probe = None
         cur_line = []
         assert config.NMAP_SHARE_PATH is not None
-        with open(os.path.join(config.NMAP_SHARE_PATH, "nmap-payloads"), "r") as fdesc:
+        with open(
+            os.path.join(config.NMAP_SHARE_PATH, "nmap-payloads"), "r", encoding="utf8"
+        ) as fdesc:
             for line in fdesc:
                 line = "".join(_parse_line(line.strip()))
                 if not line.strip():
@@ -1434,18 +1624,22 @@ def _read_nmap_payloads() -> None:
                     cur_line.append(line)
         if cur_probe is not None:
             _NMAP_PAYLOADS[nmap_decode_data("".join(cur_line))] = cur_probe
+    except FileNotFoundError:
+        # This file has been removed from Nmap in 7.94 and is now
+        # obsolete.
+        pass
     except (AttributeError, AssertionError, TypeError, IOError):
         LOGGER.warning("Cannot read Nmap service fingerprint file.", exc_info=True)
     _NMAP_PAYLOADS_POPULATED = True
 
 
-def get_nmap_udp_payloads() -> Dict[bytes, str]:
+def get_nmap_udp_payloads() -> dict[bytes, str]:
     if not _NMAP_PAYLOADS_POPULATED:
         _read_nmap_payloads()
     return _NMAP_PAYLOADS
 
 
-_IKESCAN_VENDOR_IDS: List[Tuple[bytes, Pattern[bytes]]]
+_IKESCAN_VENDOR_IDS: list[tuple[bytes, re.Pattern[bytes]]]
 _IKESCAN_VENDOR_IDS_POPULATED = False
 
 
@@ -1471,14 +1665,13 @@ def _read_ikescan_vendor_ids() -> None:
     _IKESCAN_VENDOR_IDS_POPULATED = True
 
 
-def get_ikescan_vendor_ids() -> List[Tuple[bytes, Pattern[bytes]]]:
-    global _IKESCAN_VENDOR_IDS, _IKESCAN_VENDOR_IDS_POPULATED
+def get_ikescan_vendor_ids() -> list[tuple[bytes, re.Pattern[bytes]]]:
     if not _IKESCAN_VENDOR_IDS_POPULATED:
         _read_ikescan_vendor_ids()
     return _IKESCAN_VENDOR_IDS
 
 
-def find_ike_vendor_id(vendorid: bytes) -> Optional[bytes]:
+def find_ike_vendor_id(vendorid: bytes) -> bytes | None:
     vid = encode_hex(vendorid)
     for name, sig in get_ikescan_vendor_ids():
         if sig.search(vid):
@@ -1486,9 +1679,9 @@ def find_ike_vendor_id(vendorid: bytes) -> Optional[bytes]:
     return None
 
 
-_WIRESHARK_MANUF_DB_LAST_ADDR: List[int] = []
-_WIRESHARK_MANUF_DB_VALUES: List[Optional[Tuple[str, Optional[str]]]] = []
-_WIRESHARK_MANUF_DB_POPULATED = False
+_MANUF_DB_LAST_ADDR: list[int] = []
+_MANUF_DB_VALUES: list[tuple[str, str | None] | None] = []
+_MANUF_DB_POPULATED = False
 
 
 def _mac2int(value: str) -> int:
@@ -1507,9 +1700,11 @@ def _int2macmask(mask: int) -> int:
 
 
 def _read_wireshark_manuf_db() -> None:
-    global _WIRESHARK_MANUF_DB_LAST_ADDR, _WIRESHARK_MANUF_DB_VALUES, _WIRESHARK_MANUF_DB_POPULATED
+    global _MANUF_DB_POPULATED
 
-    if config.WIRESHARK_SHARE_PATH is None:
+    sep = re.compile("\t+")
+
+    if config.DATA_PATH is None:
         return
 
     def parse_line(line: str) -> None:
@@ -1519,15 +1714,15 @@ def _read_wireshark_manuf_db() -> None:
         line = line.strip()
         if not line:
             return
-        comment: Optional[str]
+        comment: str | None
         try:
-            addr, manuf, comment = line.split("\t", 2)
+            addr, manuf, comment = sep.split(line, 2)
         except ValueError:
             try:
-                addr, manuf = line.split("\t", 1)
+                addr, manuf = sep.split(line, 1)
             except ValueError:
                 LOGGER.warning(
-                    "Cannot parse a line from Wireshark " "manufacturer database [%r].",
+                    "Cannot parse a line from Wireshark manufacturer database [%r].",
                     line,
                     exc_info=True,
                 )
@@ -1543,46 +1738,42 @@ def _read_wireshark_manuf_db() -> None:
             addr_int = _mac2int(addr)
         except ValueError:
             LOGGER.warning(
-                "Cannot parse a line from Wireshark " "manufacturer database [%r].",
+                "Cannot parse a line from Wireshark manufacturer database [%r].",
                 line,
             )
             return
-        if (
-            _WIRESHARK_MANUF_DB_LAST_ADDR
-            and _WIRESHARK_MANUF_DB_LAST_ADDR[-1] != addr_int - 1
-        ):
-            _WIRESHARK_MANUF_DB_LAST_ADDR.append(addr_int - 1)
-            _WIRESHARK_MANUF_DB_VALUES.append(None)
-        elif _WIRESHARK_MANUF_DB_VALUES and _WIRESHARK_MANUF_DB_VALUES[-1] == (
+        if _MANUF_DB_LAST_ADDR and _MANUF_DB_LAST_ADDR[-1] != addr_int - 1:
+            _MANUF_DB_LAST_ADDR.append(addr_int - 1)
+            _MANUF_DB_VALUES.append(None)
+        elif _MANUF_DB_VALUES and _MANUF_DB_VALUES[-1] == (
             manuf,
             comment,
         ):
-            _WIRESHARK_MANUF_DB_LAST_ADDR.pop()
-            _WIRESHARK_MANUF_DB_VALUES.pop()
-        _WIRESHARK_MANUF_DB_LAST_ADDR.append(
+            _MANUF_DB_LAST_ADDR.pop()
+            _MANUF_DB_VALUES.pop()
+        _MANUF_DB_LAST_ADDR.append(
             (addr_int & _int2macmask(mask)) + 2 ** (48 - mask) - 1
         )
-        _WIRESHARK_MANUF_DB_VALUES.append((manuf, comment))
+        _MANUF_DB_VALUES.append((manuf, comment))
 
     try:
-        with open(os.path.join(config.WIRESHARK_SHARE_PATH, "manuf"), "r") as fdesc:
+        with open(
+            os.path.join(config.DATA_PATH, "manuf"), "r", encoding="utf8"
+        ) as fdesc:
             for line in fdesc:
                 parse_line(line[:-1])
     except (AttributeError, TypeError, IOError):
         LOGGER.warning("Cannot read Wireshark manufacturer database.", exc_info=True)
-    _WIRESHARK_MANUF_DB_POPULATED = True
+    _MANUF_DB_POPULATED = True
 
 
-def get_wireshark_manuf_db() -> Tuple[
-    List[int], List[Optional[Tuple[str, Optional[str]]]]
-]:
-    global _WIRESHARK_MANUF_DB_LAST_ADDR, _WIRESHARK_MANUF_DB_VALUES, _WIRESHARK_MANUF_DB_POPULATED
-    if not _WIRESHARK_MANUF_DB_POPULATED:
+def get_wireshark_manuf_db() -> tuple[list[int], list[tuple[str, str | None] | None]]:
+    if not _MANUF_DB_POPULATED:
         _read_wireshark_manuf_db()
-    return _WIRESHARK_MANUF_DB_LAST_ADDR, _WIRESHARK_MANUF_DB_VALUES
+    return _MANUF_DB_LAST_ADDR, _MANUF_DB_VALUES
 
 
-def mac2manuf(mac: str) -> Optional[Tuple[str, Optional[str]]]:
+def mac2manuf(mac: str) -> tuple[str, str | None] | None:
     last_addr, values = get_wireshark_manuf_db()
     try:
         return values[bisect_left(last_addr, _mac2int(mac))]
@@ -1601,7 +1792,7 @@ _RAWS = {"r": b"\r", "n": b"\n", "t": b"\t", "\\": b"\\", "0": b"\x00", '"': b'"
 def nmap_encode_data(data: bytes) -> str:
     """Encode binary data (bytes) to a string (str) as Nmap would encode it."""
     return "".join(
-        _REPRS[d] if d in _REPRS else chr(d) if 32 <= d <= 126 else "\\x%02x" % d
+        _REPRS[d] if d in _REPRS else chr(d) if 32 <= d <= 126 else f"\\x{d:02x}"
         for d in data
     )
 
@@ -1609,12 +1800,7 @@ def nmap_encode_data(data: bytes) -> str:
 def zeek_encode_data(data: bytes) -> str:
     """Encode binary data (bytes) to a string (str) as Zeek would encode it."""
     return "".join(
-        "\\\\"
-        if d == b"\\"
-        else d.decode()
-        if b" " <= d <= b"~"
-        else "\\x%02x" % ord(d)
-        for d in (data[i : i + 1] for i in range(len(data)))
+        "\\\\" if d == 92 else chr(d) if 32 <= d <= 126 else f"\\x{d:02x}" for d in data
     )
 
 
@@ -1624,7 +1810,7 @@ def _nmap_decode_data(
     status = 0
     first_byte = -1
     for char in data:
-        if status == 0:
+        if not status:
             # not in an escape sequence
             if char == "\\":
                 status = 1
@@ -1666,9 +1852,9 @@ def _nmap_decode_data(
                 value = bytes([first_byte * 16 + int(char, 16)])
             except ValueError:
                 LOGGER.warning(
-                    "nmap_decode_data: cannot decode %r", "\\x%x%s" % (first_byte, char)
+                    "nmap_decode_data: cannot decode %r", f"\\x{first_byte:x}{char}"
                 )
-                yield ("\\x%x%s" % (first_byte, char)).encode()
+                yield (f"\\x{first_byte:x}{char}").encode()
                 status = 0
                 continue
             yield value
@@ -1683,43 +1869,43 @@ def nmap_decode_data(data: str, arbitrary_escapes: bool = False) -> bytes:
     return b"".join(_nmap_decode_data(data, arbitrary_escapes=arbitrary_escapes))
 
 
-def _nmap_command_match_subst(match_num: int) -> Pattern[str]:
-    return re.compile('\\$SUBST\\(%d,"([^"]*)","([^"]*)"\\)' % match_num)
+def _nmap_command_match_subst(match_num: int) -> re.Pattern[str]:
+    return re.compile(f'\\$SUBST\\({match_num},"([^"]*)","([^"]*)"\\)')
 
 
-def _nmap_command_match_i(match_num: int) -> Pattern[str]:
-    return re.compile('\\$I\\(%d,"([<>])"\\)' % match_num)
+def _nmap_command_match_i(match_num: int) -> re.Pattern[str]:
+    return re.compile(f'\\$I\\({match_num},"([<>])"\\)')
 
 
-def nmap_svc_fp_format_data(data: str, match: Match) -> Optional[str]:
+def nmap_svc_fp_format_data(data: str, match: re.Match) -> str | None:
     for i, value in enumerate(match.groups()):
         if value is None:
             if (
-                "$%d" % (i + 1) in data
-                or "$P(%d)" % (i + 1) in data
-                or "$I(%d," % (i + 1) in data
-                or "$SUBST(%d," % (i + 1) in data
+                f"${i + 1}" in data
+                or f"$P({i + 1})" in data
+                or f"$I({i + 1}," in data
+                or f"$SUBST({i + 1}," in data
             ):
                 return None
             continue
-        data = data.replace("$%d" % (i + 1), nmap_encode_data(value))
-        data = data.replace("$P(%d)" % (i + 1), nmap_encode_data(only_printable(value)))
+        data = data.replace(f"${i + 1}", nmap_encode_data(value))
+        data = data.replace(f"$P({i + 1})", nmap_encode_data(only_printable(value)))
         # pylint: disable=cell-var-from-loop
         data = _nmap_command_match_subst(i + 1).sub(
-            # we know m.groups() is a Tuple[str, str]
+            # we know m.groups() is a tuple[str, str]
             lambda m: nmap_encode_data(value).replace(*m.groups()),  # type: ignore
             data,
         )
         if len(value) == 2:
             # $I(x,"<") or $I(x,">") may exist
             data = _nmap_command_match_i(i + 1).sub(
-                lambda m: str(struct.unpack("%sH" % m.groups()[0], value)[0]),
+                lambda m: str(struct.unpack(f"{m.groups()[0]}H", value)[0]),
                 data,
             )
     return data
 
 
-def normalize_props(props: Union[list, dict]) -> dict:
+def normalize_props(props: list | dict) -> dict:
     """Returns a normalized property list/dict so that (roughly):
     - a list [k] gives {k: str(k)}
     - a dict {k: v} gives {k: str(k) if v is None else str(v)}
@@ -1735,7 +1921,7 @@ def normalize_props(props: Union[list, dict]) -> dict:
     return props
 
 
-def tz_offset(timestamp: Optional[Union[int, float]] = None) -> int:
+def tz_offset(timestamp: int | float | None = None) -> int:
     """
     Returns the offset between UTC and local time at "timestamp".
     """
@@ -1761,18 +1947,18 @@ _UNITS = [""]
 _UNITS.extend("kMGTPEZY")
 
 
-def num2readable(value: Union[int, float]) -> str:
+def num2readable(value: int | float) -> str:
     idx = int(math.log(value, 1000))
     try:
         unit = _UNITS[idx]
     except IndexError:
         unit = "Y"
-        idx = 1000 ** 8
+        idx = 1000**8
     else:
-        idx = 1000 ** idx
+        idx = 1000**idx
     if isinstance(value, float):
-        return "%.3f%s" % (value / float(idx), unit)
-    return "%d%s" % (value / float(idx), unit)
+        return f"{value / float(idx):.3f}{unit}"
+    return f"{int(value / float(idx))}{unit}"
 
 
 def decode_hex(value: AnyStr) -> bytes:
@@ -1805,6 +1991,11 @@ def only_printable(string: AnyStr) -> AnyStr:
     return "".join(c for c in string if " " <= c <= "~")
 
 
+SSH_KEYS = {
+    "ecdsa-sha2-nistp256": "ECDSA",
+}
+
+
 def _parse_ssh_key(data: bytes) -> Generator[bytes, None, None]:
     """Generates SSH key elements"""
     while data:
@@ -1813,8 +2004,8 @@ def _parse_ssh_key(data: bytes) -> Generator[bytes, None, None]:
         data = data[4 + length :]
 
 
-def parse_ssh_key(data: bytes) -> Dict[str, Any]:
-    info: Dict[str, Any] = {
+def parse_ssh_key(data: bytes) -> dict[str, Any]:
+    info: dict[str, Any] = {
         hashtype: hashlib.new(hashtype, data).hexdigest()
         for hashtype in ["md5", "sha1", "sha256"]
     }
@@ -1838,7 +2029,15 @@ def parse_ssh_key(data: bytes) -> Dict[str, Any]:
             # convert integer to strings to prevent overflow errors
             # (e.g., "MongoDB can only handle up to 8-byte ints")
             for val in ["exponent", "modulus"]:
-                info[val] = str(info[val])
+                try:
+                    # with large SSH keys, it could lead to an exception
+                    info[val] = str(info[val])
+                except ValueError as exc:
+                    try:
+                        sys.set_int_max_str_digits(0)
+                    except AttributeError:
+                        raise exc from exc
+                    info[val] = str(info[val])
     elif keytype == "ssh-dss":
         info["bits"] = int(math.ceil(math.log(int(encode_hex(next(parsed)), 16), 2)))
     elif keytype == "ecdsa-sha2-nistp256":
@@ -1960,14 +2159,14 @@ _ADDR_TYPES_LAST_IP = [
 ]
 
 
-def get_addr_type(addr: str) -> Optional[str]:
+def get_addr_type(addr: str) -> str | None:
     """Returns the type (Private, Loopback, etc.) of an IPv4 address, or
     None if it is a "normal", usable address.
 
     """
 
     if ":" not in addr:
-        addr = "::ffff:" + addr
+        addr = f"::ffff:{addr}"
     try:
         data = ip2int(addr)
     except (TypeError, socket.error):
@@ -2052,137 +2251,448 @@ PUBKEY_TYPES = {
     "dhpublicnumber": "dh",
 }
 
-PUBKEY_REV_TYPES = dict((val, key) for key, val in PUBKEY_TYPES.items())
+PUBKEY_REV_TYPES = {val: key for key, val in PUBKEY_TYPES.items()}
 
 
-def _parse_cert_subject(subject: str) -> Generator[Tuple[str, str], None, None]:
+def _parse_datetime(value: bytes) -> datetime.datetime | None:
+    try:
+        return datetime.datetime.strptime(value.decode(), "%Y%m%d%H%M%S%z")
+    except ValueError:
+        return datetime.datetime.strptime(value.decode()[:14], "%Y%m%d%H%M%S")
+    except Exception:
+        LOGGER.warning("Cannot parse datetime value %r", value, exc_info=True)
+        return None
+
+
+def parse_cert_subject_string(subject: str) -> Generator[tuple[str, str], None, None]:
     status = 0
+    status_space_before_key = -1
+    status_key = 0
+    status_equal = 1
+    status_space_after_equal = 2
+    status_value_wo_quotes = 3
+    status_value_wo_quotes_protected = 4
+    status_value_w_quotes = 5
+    status_value_w_quotes_protected = 6
     curkey = []
     curvalue = []
     for char in subject:
-        if status == -1:
+        if status == status_space_before_key:
             # reading space before the key
             if char == " ":
                 continue
             curkey.append(char)
-            status += 1
-        elif status == 0:
+            status = status_key
+        elif status == status_key:
             # reading key
             if char == " ":
-                status += 1
+                status = status_equal
                 continue
             if char == "=":
-                status += 2
+                status = status_space_after_equal
                 continue
             curkey.append(char)
-        elif status == 1:
+        elif status == status_equal:
             # reading '='
             if char != "=":
                 return
-            status += 1
-        elif status == 2:
+            status = status_space_after_equal
+        elif status == status_space_after_equal:
             # reading space after '='
             if char == " ":
                 continue
             # reading beginning of value
             if char == '"':
-                status += 2
+                status = status_value_w_quotes
                 continue
             curvalue.append(char)
-            status += 1
-        elif status == 3:
+            status = status_value_wo_quotes
+        elif status == status_value_wo_quotes:
             # reading value without quotes
             if char == ",":
                 yield "".join(curkey), "".join(curvalue)
                 curkey = []
                 curvalue = []
-                status = -1
-                continue
-            curvalue.append(char)
-        elif status == 4:
-            # reading value with quotes
-            if char == '"':
-                status -= 1
+                status = status_space_before_key
                 continue
             if char == "\\":
-                status += 1
+                status = status_value_wo_quotes_protected
                 continue
             curvalue.append(char)
-        elif status == 5:
+        elif status == status_value_wo_quotes_protected:
             curvalue.append(char)
-            status -= 1
+            status = status_value_wo_quotes
+        elif status == status_value_w_quotes:
+            # reading value with quotes
+            if char == '"':
+                status = status_value_wo_quotes
+                continue
+            if char == "\\":
+                status = status_value_w_quotes_protected
+                continue
+            curvalue.append(char)
+        elif status == status_value_w_quotes_protected:
+            curvalue.append(char)
+            status = status_value_w_quotes
     yield "".join(curkey), "".join(curvalue)
 
 
-def _parse_subject(subject: osslc.X509Name) -> Tuple[str, Dict[str, str]]:
-    """Parses an X509Name object (from pyOpenSSL module) and returns a
-    text and a dict suitable for use by get_cert_info().
+def _get_san_via_openssl_cli(cert: bytes) -> list[str] | None:
+    """Fallback subjectAltName extraction for a DER certificate, using the
+    ``openssl`` CLI's own text renderer instead of ``cryptography``'s
+    strict ASN.1 parser.
+
+    The pyOpenSSL-based ``get_cert_info()`` normally gets typed SAN
+    entries through ``X509.to_cryptography()``, which re-parses the
+    certificate with ``cryptography``'s stricter parser and can reject
+    certificates that OpenSSL -- and the ``openssl`` CLI, which links
+    the same C library -- tolerate (see the comment on that call);
+    rendering the parsed entries (``_format_san_general_name()``) can
+    also fail on an exotic ``GeneralName``. In both cases, this
+    function reuses the ``_CERTINFOS_EXT_SAN`` regexp (already used by
+    the openssl-CLI-only implementation of ``get_cert_info()`` below,
+    for when pyOpenSSL is not installed at all) against the CLI's own
+    rendering of the certificate, so neither a stricter
+    ``cryptography`` parser nor a rendering failure silently degrades
+    subjectAltName extraction. Returns an empty list if the CLI parses
+    the certificate but reports no SAN extension, and ``None`` if the
+    CLI cannot make sense of the certificate either -- the caller uses
+    the difference to pick the log severity.
 
     """
-    components = []
-    for k, v in subject.get_components():
-        k = printable(k).decode()
-        v = printable(v).decode()
-        k = _CERTKEYS.get(k, k)
-        components.append((k, v))
-    return "/".join("%s=%s" % kv for kv in components), dict(components)
+    try:
+        with subprocess.Popen(
+            [config.OPENSSL_CMD, "x509", "-noout", "-text", "-inform", "DER"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+        ) as proc:
+            assert proc.stdin is not None
+            assert proc.stdout is not None
+            proc.stdin.write(cert)
+            proc.stdin.close()
+            text = proc.stdout.read()
+    except Exception:
+        LOGGER.info(
+            "Cannot run %r to fall back on subjectAltName parsing",
+            config.OPENSSL_CMD,
+            exc_info=True,
+        )
+        return None
+    if proc.returncode:
+        return None
+    match = _CERTINFOS_EXT_SAN.search(text)
+    if match is None:
+        return []
+    try:
+        return match.group("san").decode().split(", ")
+    except Exception:
+        LOGGER.info(
+            "Cannot decode subjectAltName from %r output",
+            config.OPENSSL_CMD,
+            exc_info=True,
+        )
+        return None
 
 
-if STRPTIME_SUPPORTS_TZ:
+_PUBKEY_RSA_INFOS = re.compile(
+    # Unlike ``_CERTINFOS`` (matched against ``openssl x509 -text``
+    # output, which always has preceding Issuer/Subject/... lines),
+    # this is matched against ``openssl pkey -pubin -text`` output,
+    # where ``Public-Key:`` is the very first line -- hence ``^``
+    # rather than a leading ``\n``.
+    b"^ *"
+    b"(?:RSA )?Public-Key: \\([0-9]+ bit\\)"
+    b"\n *"
+    b"Modulus: *\n(?P<modulus>[\\ 0-9a-f:\n]+)"
+    b"\n *"
+    b"Exponent: (?P<exponent>[0-9]+) .*"
+    b"(?:\n|$)"
+)
 
-    def _parse_datetime(value: bytes) -> Optional[datetime.datetime]:
-        try:
-            return datetime.datetime.strptime(value.decode(), "%Y%m%d%H%M%S%z")
-        except ValueError:
-            return datetime.datetime.strptime(value.decode()[:14], "%Y%m%d%H%M%S")
-        except Exception:
-            LOGGER.warning("Cannot parse datetime value %r", value, exc_info=True)
-            return None
+
+def _get_pubkey_pem_via_openssl_cli(cert: bytes) -> bytes | None:
+    """Fetch a certificate's public key as a PEM-encoded
+    SubjectPublicKeyInfo block, using the ``openssl`` CLI, bypassing
+    ``PKey.to_cryptography_key()`` (and, transitively,
+    ``cryptography``'s key-loading code) entirely.
+
+    ``get_cert_info()`` normally gets the raw public key bytes (used
+    for ``pubkey["raw"]`` and the ``pubkey["md5"/"sha1"/"sha256"]``
+    hashes, for every key type) and, for RSA keys, the
+    ``pubkey["exponent"/"modulus"]`` numbers, through
+    ``PKey.to_cryptography_key()``. That bridge re-serializes the key
+    pyOpenSSL already parsed back to DER, then re-parses *that* DER
+    through ``cryptography``'s own key-loading code -- a second,
+    independent parser that can reject an encoding OpenSSL itself
+    tolerates (``cryptography`` has, for example, announced rejecting
+    non-canonical ``BIT STRING`` unused-bits encodings in a future
+    release, having silently accepted them before). When that bridge
+    fails, this function re-derives the same SubjectPublicKeyInfo PEM
+    block directly via ``openssl x509 -pubkey``, which never touches
+    ``cryptography``; ``_get_pubkey_der_from_pem()`` and
+    ``_get_rsa_numbers_via_openssl_cli()`` below turn that PEM block
+    into the same shapes ``PKey.to_cryptography_key()`` would have
+    produced. Returns ``None`` if the CLI cannot make sense of the
+    certificate.
+
+    """
+    try:
+        with subprocess.Popen(
+            [config.OPENSSL_CMD, "x509", "-noout", "-pubkey", "-inform", "DER"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+        ) as proc:
+            assert proc.stdin is not None
+            assert proc.stdout is not None
+            proc.stdin.write(cert)
+            proc.stdin.close()
+            # typeshed types ``Popen.stdout`` as ``IO[Any]``; pin the
+            # payload type so the ``return pem`` below is not ``Any``.
+            pem: bytes = proc.stdout.read()
+    except Exception:
+        LOGGER.info(
+            "Cannot run %r to fall back on public key extraction",
+            config.OPENSSL_CMD,
+            exc_info=True,
+        )
+        return None
+    if not pem.startswith(b"-----BEGIN PUBLIC KEY-----"):
+        LOGGER.info("Unexpected public key output from %r: %r", config.OPENSSL_CMD, pem)
+        return None
+    return pem
 
 
-else:
+def _get_pubkey_der_from_pem(pubkey_pem: bytes) -> bytes | None:
+    """Decode a PEM-encoded public key block (as produced by
+    ``_get_pubkey_pem_via_openssl_cli()``) to raw DER bytes, without
+    involving ``cryptography`` in any way. Returns ``None`` if the PEM
+    block cannot be decoded.
 
-    def _parse_datetime(value: bytes) -> Optional[datetime.datetime]:
-        try:
-            return datetime.datetime.strptime(value.decode()[:14], "%Y%m%d%H%M%S")
-        except Exception:
-            LOGGER.warning("Cannot parse datetime value %r", value, exc_info=True)
-            return None
+    """
+    lines = pubkey_pem.splitlines()
+    if len(lines) < 3:
+        return None
+    try:
+        return decode_b64(b"".join(lines[1:-1]))
+    except Exception:
+        LOGGER.info("Cannot decode public key PEM block %r", pubkey_pem, exc_info=True)
+        return None
+
+
+def _get_rsa_numbers_via_openssl_cli(pubkey_pem: bytes) -> tuple[int, int] | None:
+    """Extract the ``(exponent, modulus)`` pair of a PEM-encoded RSA
+    public key (as produced by ``_get_pubkey_pem_via_openssl_cli()``)
+    using the ``openssl`` CLI, bypassing
+    ``PKey.to_cryptography_key().public_numbers()`` (and,
+    transitively, ``cryptography``'s key-loading code) entirely; see
+    ``_get_pubkey_pem_via_openssl_cli()`` for why that bridge can
+    fail. Returns ``None`` if the CLI cannot make sense of the key,
+    or if it is not an RSA key (its ``-text`` rendering then has no
+    ``Modulus``/``Exponent`` fields, e.g. for EC keys).
+
+    """
+    try:
+        with subprocess.Popen(
+            [config.OPENSSL_CMD, "pkey", "-pubin", "-noout", "-text"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+        ) as proc:
+            assert proc.stdin is not None
+            assert proc.stdout is not None
+            proc.stdin.write(pubkey_pem)
+            proc.stdin.close()
+            text = proc.stdout.read()
+    except Exception:
+        LOGGER.info(
+            "Cannot run %r to fall back on RSA key numbers extraction",
+            config.OPENSSL_CMD,
+            exc_info=True,
+        )
+        return None
+    match = _PUBKEY_RSA_INFOS.search(text)
+    if match is None:
+        return None
+    try:
+        exponent = int(match.group("exponent").decode())
+        modulus = int(
+            match.group("modulus")
+            .decode()
+            .replace(" ", "")
+            .replace(":", "")
+            .replace("\n", ""),
+            16,
+        )
+    except Exception:
+        LOGGER.info(
+            "Cannot parse RSA key numbers from %r output",
+            config.OPENSSL_CMD,
+            exc_info=True,
+        )
+        return None
+    return exponent, modulus
 
 
 if USE_PYOPENSSL:
 
-    def get_cert_info(cert: bytes) -> Dict[str, Any]:
+    def _parse_subject(subject: osslc.X509Name) -> tuple[str, dict[str, str]]:
+        """Parses an X509Name object (from pyOpenSSL module) and returns a
+        text and a dict suitable for use by get_cert_info().
+
+        """
+        components = []
+        for k, v in subject.get_components():
+            k = printable(k).decode()
+            v = printable(v).decode()
+            k = _CERTKEYS.get(k, k)
+            components.append((k, v))
+        return "/".join(f"{kv[0]}={kv[1]}" for kv in components), dict(components)
+
+    def _format_san_general_name(name: "_x509.GeneralName") -> str:
+        """Format a single ``cryptography.x509`` ``GeneralName`` (one
+        entry of a ``SubjectAlternativeName`` extension) the same way
+        ``str(<pyOpenSSL X509Extension>)`` used to render it -- the
+        OpenSSL CLI ``v2i_GENERAL_NAME`` form, e.g. ``DNS:...``,
+        ``IP Address:...``, ``email:...``, ``URI:...``.
+
+        Pinned by ``CertExtensionFormatTests`` in
+        ``tests/tests_no_backend.py``. Mirrors RFC 5280 4.2.1.6
+        ``GeneralName`` choices.
+        """
+        if isinstance(name, _x509.DNSName):
+            return f"DNS:{name.value}"
+        if isinstance(name, _x509.IPAddress):
+            return f"IP Address:{name.value}"
+        if isinstance(name, _x509.RFC822Name):
+            return f"email:{name.value}"
+        if isinstance(name, _x509.UniformResourceIdentifier):
+            return f"URI:{name.value}"
+        if isinstance(name, _x509.DirectoryName):
+            return f"DirName:{name.value.rfc4514_string()}"
+        if isinstance(name, _x509.RegisteredID):
+            return f"Registered ID:{name.value.dotted_string}"
+        if isinstance(name, _x509.OtherName):
+            return f"othername:{name.type_id.dotted_string}"
+        return str(name)
+
+    def _modulus_to_str(modulus: int) -> str:
+        """Render an RSA modulus as a decimal string, raising the
+        interpreter's int<->str conversion digit limit (a CPython
+        3.11+ DoS mitigation, see ``sys.set_int_max_str_digits()``) on
+        demand for keys long enough to hit it.
+        """
+        try:
+            return str(modulus)
+        except ValueError as exc:
+            try:
+                sys.set_int_max_str_digits(0)
+            except AttributeError:
+                raise exc from exc
+            return str(modulus)
+
+    def get_cert_info(cert: bytes) -> dict[str, Any]:
         """Extract info from a certificate (hash values, issuer, subject,
             algorithm) in an handy-to-index-and-query form.
 
         This version relies on the pyOpenSSL module.
 
         """
-        result: Dict[str, Any] = {
+        result: dict[str, Any] = {
             hashtype: hashlib.new(hashtype, cert).hexdigest()
             for hashtype in ["md5", "sha1", "sha256"]
         }
-        data = osslc.load_certificate(osslc.FILETYPE_ASN1, cert)
+        try:
+            data = osslc.load_certificate(osslc.FILETYPE_ASN1, cert)
+        except osslc.Error:
+            LOGGER.warning("Cannot load certificate", exc_info=True)
+            return result
         result["subject_text"], result["subject"] = _parse_subject(data.get_subject())
         result["issuer_text"], result["issuer"] = _parse_subject(data.get_issuer())
-        for i in range(data.get_extension_count()):
-            ext = data.get_extension(i)
-            if ext.get_short_name() == b"subjectAltName":
-                try:
-                    # XXX str() / encoding
-                    result["san"] = [x.strip() for x in str(ext).split(", ")]
-                except Exception:
-                    LOGGER.warning(
-                        "Cannot decode subjectAltName %r for %r",
-                        ext,
-                        result["subject_text"],
-                        exc_info=True,
-                    )
-                break
+        # ``X509.get_extension(i)`` was deprecated in pyOpenSSL 23.3
+        # and removed in pyOpenSSL 26.x; route the lookup through
+        # ``cryptography`` instead via the ``X509.to_cryptography``
+        # bridge (available since pyOpenSSL 17.1). The bridge re-parses
+        # the DER through ``cryptography``'s strict ASN.1 parser, which
+        # rejects malformed (but real-world-observed) certificates that
+        # pyOpenSSL's looser parser used to tolerate -- e.g.
+        # ``InvalidVersion: 3 is not a valid X509 version``,
+        # ``ValueError: error parsing asn1 value: ParseError ...
+        # Time::UtcTime``, ``BasicConstraints::ca`` ``EncodedDefault``,
+        # ``DuplicateExtension``, and (today only a suppressed
+        # deprecation warning -- see the ``warnings.filterwarnings()``
+        # call above) a non-positive serial number. Catch broadly
+        # here: a failure of SAN extraction must not skip the pubkey /
+        # serial / dates block below (downstream consumers, notably
+        # ``ivre getmoduli``, rely on ``result["pubkey"]["exponent"]``
+        # being populated even for not-quite-spec-compliant certs), and
+        # fall back to ``_get_san_via_openssl_cli()`` so that a
+        # stricter future ``cryptography`` release does not silently
+        # drop SAN extraction for these certificates (pinned by
+        # ``test_get_cert_info_san_survives_non_positive_serial`` and
+        # ``test_get_cert_info_falls_back_to_openssl_cli_for_san`` in
+        # ``tests/tests_no_backend.py``).
+        san_ext = None
+        try:
+            san_ext = data.to_cryptography().extensions.get_extension_for_class(
+                _x509.SubjectAlternativeName
+            )
+        except _x509.ExtensionNotFound:
+            pass
+        except Exception as exc:
+            # This is an expected, handled condition on real-world
+            # (occasionally adversarial) certificates: run the CLI
+            # fallback first, then log a single line stating the
+            # outcome (the recovered subjectAltName value, an empty
+            # list meaning the certificate has none) -- reserving
+            # WARNING and the traceback for the case where the
+            # ``openssl`` CLI could not parse the certificate either.
+            san = _get_san_via_openssl_cli(cert)
+            if san is None:
+                LOGGER.warning(
+                    "Cannot parse certificate via cryptography for SAN "
+                    "lookup: %r, and the openssl CLI fallback failed too",
+                    result["subject_text"],
+                    exc_info=True,
+                )
+            else:
+                LOGGER.info(
+                    "Cannot parse certificate via cryptography for SAN "
+                    "lookup: %r (%s: %s); subjectAltName via the "
+                    "openssl CLI: %r",
+                    result["subject_text"],
+                    type(exc).__name__,
+                    exc,
+                    san,
+                )
+                if san:
+                    result["san"] = san
+        if san_ext is not None:
+            try:
+                result["san"] = [_format_san_general_name(gn) for gn in san_ext.value]
+            except Exception:
+                LOGGER.warning(
+                    "Cannot decode subjectAltName %r for %r",
+                    san_ext,
+                    result["subject_text"],
+                    exc_info=True,
+                )
+                # Rendering the entries ``cryptography`` parsed can
+                # fail independently of the parse itself; the CLI
+                # fallback renders the extension with ``openssl``'s
+                # own code, so try it here too (pinned by
+                # ``test_get_cert_info_falls_back_to_openssl_cli_when_san_rendering_fails``
+                # in ``tests/tests_no_backend.py``).
+                san = _get_san_via_openssl_cli(cert)
+                if san:
+                    result["san"] = san
         result["self_signed"] = result["issuer_text"] == result["subject_text"]
-        not_before = _parse_datetime(data.get_notBefore())
-        not_after = _parse_datetime(data.get_notAfter())
+        try:
+            not_before = _parse_datetime(data.get_notBefore())
+        except ValueError:
+            not_before = None
+        try:
+            not_after = _parse_datetime(data.get_notAfter())
+        except ValueError:
+            not_after = None
         if not_before is not None:
             result["not_before"] = not_before
             if not_after is not None:
@@ -2191,29 +2701,86 @@ if USE_PYOPENSSL:
                 result["lifetime"] = int(lifetime.total_seconds())
         elif not_after is not None:
             result["not_after"] = not_after
+        result["serial_number"] = str(data.get_serial_number())
+        result["version"] = data.get_version()
+        result["signature_algorithm"] = data.get_signature_algorithm().decode()
         result["pubkey"] = {}
         pubkey = data.get_pubkey()
         pubkeytype = pubkey.type()
         result["pubkey"]["type"] = _CERTKEYTYPES.get(pubkeytype, pubkeytype)
         result["pubkey"]["bits"] = pubkey.bits()
+        # ``PKey.to_cryptography_key()`` (both call sites below) has
+        # the exact same "two independent parsers can diverge" issue
+        # as ``X509.to_cryptography()`` above: it re-serializes the
+        # key pyOpenSSL already parsed back to DER, then re-parses
+        # that DER through ``cryptography``'s own key-loading code,
+        # which can reject an encoding OpenSSL tolerates. Fall back to
+        # ``openssl pkey``/``openssl x509 -pubkey`` (never touching
+        # ``cryptography``) so ``result["pubkey"]`` -- notably
+        # ``exponent``/``modulus``, which ``ivre getmoduli`` requires,
+        # and the ``md5``/``sha1``/``sha256`` hashes used by
+        # ``searchcert()``'s pubkey-hash filters -- stays populated
+        # instead of aborting the whole function (see
+        # ``test_get_cert_info_pubkey_survives_to_cryptography_key_failure``
+        # in ``tests/tests_no_backend.py``).
+        pubkey_pem_via_cli: bytes | None = None
+        pubkey_pem_via_cli_fetched = False
         if pubkeytype == 6:
             # RSA
-            numbers = pubkey.to_cryptography_key().public_numbers()
-            result["pubkey"]["exponent"] = numbers.e
-            result["pubkey"]["modulus"] = str(numbers.n)
-        pubkey = pubkey.to_cryptography_key().public_bytes(
-            Encoding.DER,
-            PublicFormat.SubjectPublicKeyInfo,
-        )
-        for hashtype in ["md5", "sha1", "sha256"]:
-            result["pubkey"][hashtype] = hashlib.new(hashtype, pubkey).hexdigest()
-        result["pubkey"]["raw"] = encode_b64(pubkey).decode()
+            try:
+                numbers = pubkey.to_cryptography_key().public_numbers()
+                exponent: int | None = numbers.e
+                modulus: int | None = numbers.n
+            except Exception:
+                LOGGER.info(
+                    "Cannot parse RSA key numbers via cryptography for %r",
+                    result["subject_text"],
+                    exc_info=True,
+                )
+                pubkey_pem_via_cli = _get_pubkey_pem_via_openssl_cli(cert)
+                pubkey_pem_via_cli_fetched = True
+                rsa_numbers = (
+                    None
+                    if pubkey_pem_via_cli is None
+                    else _get_rsa_numbers_via_openssl_cli(pubkey_pem_via_cli)
+                )
+                if rsa_numbers is None:
+                    exponent = modulus = None
+                else:
+                    exponent, modulus = rsa_numbers
+            if exponent is not None:
+                result["pubkey"]["exponent"] = exponent
+            if modulus is not None:
+                result["pubkey"]["modulus"] = _modulus_to_str(modulus)
+        try:
+            pubkey_der: bytes | None = pubkey.to_cryptography_key().public_bytes(
+                Encoding.DER,
+                PublicFormat.SubjectPublicKeyInfo,
+            )
+        except Exception:
+            LOGGER.info(
+                "Cannot re-encode public key via cryptography for %r",
+                result["subject_text"],
+                exc_info=True,
+            )
+            if not pubkey_pem_via_cli_fetched:
+                pubkey_pem_via_cli = _get_pubkey_pem_via_openssl_cli(cert)
+            pubkey_der = (
+                None
+                if pubkey_pem_via_cli is None
+                else _get_pubkey_der_from_pem(pubkey_pem_via_cli)
+            )
+        if pubkey_der is not None:
+            for hashtype in ["md5", "sha1", "sha256"]:
+                result["pubkey"][hashtype] = hashlib.new(
+                    hashtype, pubkey_der
+                ).hexdigest()
+            result["pubkey"]["raw"] = encode_b64(pubkey_der).decode()
         return result
-
 
 else:
 
-    def get_cert_info(cert: bytes) -> Dict[str, Any]:
+    def get_cert_info(cert: bytes) -> dict[str, Any]:
         """Extract info from a certificate (hash values, issuer, subject,
             algorithm) in an handy-to-index-and-query form.
 
@@ -2221,7 +2788,7 @@ else:
         and is a fallback when pyOpenSSL cannot be imported.
 
         """
-        result: Dict[str, Any] = {
+        result: dict[str, Any] = {
             hashtype: hashlib.new(hashtype, cert).hexdigest()
             for hashtype in ["md5", "sha1", "sha256"]
         }
@@ -2249,7 +2816,7 @@ else:
                 break
         else:
             LOGGER.info(
-                "Cannot parse certificate %r - " "no matching expression in %r",
+                "Cannot parse certificate %r - no matching expression in %r",
                 cert,
                 data,
             )
@@ -2260,14 +2827,14 @@ else:
                 if field in ["issuer", "subject"]:
                     flddata = [
                         (_CERTKEYS.get(key, key), value)
-                        for key, value in _parse_cert_subject(fdata_str)
+                        for key, value in parse_cert_subject_string(fdata_str)
                     ]
                     # replace '.' by '_' in keys to produce valid JSON
-                    result[field] = dict(
-                        (key.replace(".", "_"), value) for key, value in flddata
-                    )
-                    result["%s_text" % field] = "/".join(
-                        "%s=%s" % item for item in flddata
+                    result[field] = {
+                        key.replace(".", "_"): value for key, value in flddata
+                    }
+                    result[f"{field}_text"] = "/".join(
+                        f"{item[0]}={item[1]}" for item in flddata
                     )
                 elif field in ["bits", "exponent"]:
                     result[field] = int(fdata_str)
@@ -2281,20 +2848,14 @@ else:
                         )
                     )
                 elif field in ["not_before", "not_after"]:
-                    if STRPTIME_SUPPORTS_TZ:
-                        try:
-                            result[field] = datetime.datetime.strptime(
-                                fdata_str,
-                                "%b %d %H:%M:%S %Y %Z",
-                            )
-                        except ValueError:
-                            result[field] = datetime.datetime.strptime(
-                                fdata_str[:-4],
-                                "%b %d %H:%M:%S %Y",
-                            )
-                    else:
+                    try:
                         result[field] = datetime.datetime.strptime(
-                            fdata_str[:-4],
+                            fdata_str,
+                            "%b %d %H:%M:%S %Y %Z",
+                        )
+                    except ValueError:
+                        result[field] = datetime.datetime.strptime(
+                            " ".join(fdata_str.split(None, 4)[:4]),
                             "%b %d %H:%M:%S %Y",
                         )
                 else:
@@ -2329,7 +2890,7 @@ else:
         pubkey = decode_b64(b"".join(pubkey.splitlines()[1:-1]))
         for hashtype in ["md5", "sha1", "sha256"]:
             result["pubkey"][hashtype] = hashlib.new(hashtype, pubkey).hexdigest()
-        result["pubkey"]["raw"] = encode_b64(pubkey)
+        result["pubkey"]["raw"] = encode_b64(pubkey).decode()
         return result
 
 
@@ -2346,7 +2907,7 @@ class MinValue:
 MIN_VALUE = MinValue()
 
 
-def key_sort_none(value: Optional[Any]) -> Any:
+def key_sort_none(value: Any | None) -> Any:
     """This function can be used as `key=` argument for sorted() and
     .sort(), in order to sort values that can be of a certain type (e.g.,
     str), or None, so that None is always lower.
@@ -2360,7 +2921,7 @@ def key_sort_none(value: Optional[Any]) -> Any:
     return value
 
 
-def ptr2addr(ptr: str) -> Optional[str]:
+def ptr2addr(ptr: str) -> str | None:
     """
     Returns the IP address (v4 or v6) represented by the given PTR,
     None if the string does not seem to be a PTR
@@ -2395,9 +2956,7 @@ def deep_sort_dict_list(elt: dict) -> None:
 _SCHEMES_PORTS = {"ftp": 21, "http": 80, "https": 443}
 
 
-def url2hostport(url: str) -> Tuple[str, int]:
-    url_p = urlparse(url)
-    host = url_p.netloc
+def parse_hostport(host: str, default_port: int | None = None) -> tuple[str, int]:
     if host.startswith("["):
         try:
             mark = host.index("]")
@@ -2406,10 +2965,9 @@ def url2hostport(url: str) -> Tuple[str, int]:
         port = host[mark + 1 :]
         host = host[1:mark]
         if not port:
-            try:
-                return host, _SCHEMES_PORTS[url_p.scheme]
-            except KeyError as exc:
-                raise ValueError("Bad scheme in URL") from exc
+            if default_port is None:
+                raise ValueError("Bad scheme in URL")
+            return host, default_port
         if not port.startswith(":"):
             raise ValueError("Bad netloc in URL")
         try:
@@ -2422,7 +2980,142 @@ def url2hostport(url: str) -> Tuple[str, int]:
             return host, int(port)
         except ValueError as exc:
             raise ValueError("Bad netloc in URL") from exc
+    if default_port is None:
+        raise ValueError("Bad scheme in URL")
+    return host, default_port
+
+
+def url2hostport(url: str) -> tuple[str, int]:
+    url_p = urlparse(url)
+    return parse_hostport(url_p.netloc, default_port=_SCHEMES_PORTS.get(url_p.scheme))
+
+
+def key_sort_dom(domain: str) -> list[str]:
+    """Takes a host / domain name and returns the list of the labels,
+    reversed, so that it can be used by sorted() / .sort()
+
+    """
+    return domain.strip().split(".")[::-1]
+
+
+def key_sort_dom_addr(value: str) -> list[str]:
+    """Takes a host / domain name or an IP address and returns the list of
+    the labels, reversed, for a name and a list containing the IP
+    address as an hex string for an address so that it can be used by
+    sorted() / .sort()
+
+    """
+    value = value.strip()
+    if IPADDR.search(value):
+        if ":" in value:
+            return [encode_hex(ip2bin(value)).decode()]
+        # IPv4 addresses before IPv6
+        return [f"00000000000000000000000000000000{ip2int(value):08x}"]
+    if NETADDR.search(value):
+        addr, mask = value.split("/", 1)
+        if ":" in addr:
+            return [encode_hex(ip2bin(addr)).decode(), mask]
+        # IPv4 addresses before IPv6
+        return [f"00000000000000000000000000000000{ip2int(addr):08x}", mask]
+    return value.strip().split(".")[::-1]
+
+
+def download_if_newer(
+    url: str,
+    outfile: str,
+    processor: Callable[[BinaryIO, BinaryIO], None] | None = None,
+) -> bool:
+    """Fetches `url` to `outfile`, if the source is newer than `outfile`,
+    using an If-Modified-Since: header.
+
+    Return True if the file has been downloaded, False otherwise.
+
+    """
+    if processor is None:
+        processor = shutil.copyfileobj
+    assert processor is not None
+    opener = build_opener()
+    opener.addheaders = [("User-Agent", f"IVRE/{VERSION} +https://ivre.rocks/")]
     try:
-        return host, _SCHEMES_PORTS[url_p.scheme]
-    except KeyError as exc:
-        raise ValueError("Bad scheme in URL") from exc
+        outstat = os.stat(outfile)
+    except FileNotFoundError:
+        pass
+    else:
+        opener.addheaders.append(
+            (
+                "If-Modified-Since",
+                time.strftime(
+                    "%a, %d %b %Y %H:%M:%S GMT", time.gmtime(outstat.st_mtime)
+                ),
+            )
+        )
+    file_opened = False
+    try:
+        # attempt to remove the file only if it has been open()ed by
+        # us
+        with opener.open(url) as udesc:
+            # make sure opener.open(url) works before opening the file
+            with open(outfile, "wb") as wdesc:
+                file_opened = True
+                processor(udesc, wdesc)
+    except HTTPError as exc:
+        if exc.status == 304:
+            LOGGER.debug("Won't download %s: our copy is up-to-date", url)
+            return False
+        LOGGER.error("Cannot download %s [%s]", url, exc)
+    except URLError as exc:
+        LOGGER.error("Cannot download %s [%s]", url, exc)
+    except Exception as exc:
+        LOGGER.error("Error processing %s [%s]", url, exc)
+        if file_opened:
+            try:
+                os.unlink(outfile)
+            except FileNotFoundError:
+                pass
+        raise
+    return True
+
+
+def generic_ipaddr_extractor(fdesc: BinaryIO) -> Generator[str, None, None]:
+    expr = re.compile(f"(?:^|\\W){IPADDR.pattern[1:-1]}(?:$|\\W)")
+    for line in fdesc:
+        for m in expr.finditer(line.decode()):
+            yield from m.groups()
+
+
+def generic_processor(
+    extractor: Callable[[BinaryIO], Generator[str, None, None]],
+    infd: BinaryIO,
+    outfd: BinaryIO,
+) -> None:
+    outfd.writelines(
+        f"{addr}\n".encode() for addr in sorted(extractor(infd), key=key_sort_dom_addr)
+    )
+
+
+T = TypeVar("T")
+
+
+def _fix_range(start: str, stop: str, label: T) -> tuple[int, int, T]:
+    return (
+        ip2int(start) if ":" in start else ip2int(f"::ffff:{start}"),
+        ip2int(stop) if ":" in stop else ip2int(f"::ffff:{stop}"),
+        label,
+    )
+
+
+def make_range_tables(
+    ranges: Iterable[tuple[str, str, T]],
+) -> list[tuple[int, T | None]]:
+    ranges_sorted: list[tuple[int, int, T]] = sorted(
+        (_fix_range(start, stop, label) for start, stop, label in ranges), reverse=True
+    )
+    result: list[tuple[int, T | None]] = []
+    prev = 0
+    while ranges_sorted:
+        start, stop, label = ranges_sorted.pop()
+        if start > prev:
+            result.append((start - 1, None))
+        result.append((stop, label))
+        prev = stop
+    return result

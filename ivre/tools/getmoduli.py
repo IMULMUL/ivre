@@ -1,7 +1,7 @@
 #! /usr/bin/env python
 
 # This file is part of IVRE.
-# Copyright 2011 - 2021 Pierre LALET <pierre@droids-corp.org>
+# Copyright 2011 - 2024 Pierre LALET <pierre@droids-corp.org>
 #
 # IVRE is free software: you can redistribute it and/or modify it
 # under the terms of the GNU General Public License as published by
@@ -25,11 +25,9 @@ Widespread Weak Keys in Network Devices"
 To do so, you need to strip the output from the information after the
 moduli. A simple sed with 's# .*##' will do the trick."""
 
-
 import getopt
 import sys
-from typing import Dict, Set, Tuple, Type, Union
-
+from typing import Type
 
 import ivre.db
 import ivre.keys
@@ -39,7 +37,7 @@ import ivre.utils
 def main() -> None:
     # FIXME: this will not work if .nmap and .passive have different
     # backends
-    bases: Set[Type[Union[ivre.keys.PassiveKey, ivre.keys.NmapKey]]] = set()
+    bases: set[Type[ivre.keys.PassiveKey | ivre.keys.NmapKey]] = set()
     try:
         opts, _ = getopt.getopt(
             sys.argv[1:],
@@ -47,7 +45,7 @@ def main() -> None:
             ["passive-ssl", "active-ssl", "passive-ssh", "active-ssh", "help"],
         )
     except getopt.GetoptError as err:
-        sys.stderr.write(str(err) + "\n")
+        sys.stderr.write(f"{err!s}\n")
         sys.exit(-1)
     for o, a in opts:
         if o == "--passive-ssl":
@@ -60,18 +58,15 @@ def main() -> None:
             bases.add(ivre.keys.SSHRsaNmapKey)
         elif o in ["-h", "--help"]:
             sys.stdout.write(
-                "usage: %s [-h] [--passive-ssl] [--active-ssl] "
-                "[--passive-ssh] [--active-ssh]\n\n" % sys.argv[0]
+                f"usage: {sys.argv[0]} [-h] [--passive-ssl] [--active-ssl] [--passive-ssh] [--active-ssh]\n\n"
             )
             sys.stdout.write(__doc__)
             sys.stdout.write("\n\n")
             sys.exit(0)
         else:
-            sys.stderr.write(
-                "%r %r not understood (this is probably a bug).\n" % (o, a)
-            )
+            sys.stderr.write(f"{o!r} {a!r} not understood (this is probably a bug).\n")
             sys.exit(-1)
-    moduli: Dict[int, Set[Tuple[str, int, str]]] = {}
+    moduli: dict[int, set[tuple[str, int, str]]] = {}
     if not bases:
         bases = {
             ivre.keys.SSLRsaPassiveKey,
@@ -86,10 +81,5 @@ def main() -> None:
             )
     for mod, used in moduli.items():
         sys.stdout.write(
-            "%x %d %s\n"
-            % (
-                mod,
-                len(used),
-                ",".join("%s:%d" % (rec[0], rec[1]) for rec in used),
-            )
+            f"{mod:x} {len(used)} {','.join(f'{rec[0]}:{rec[1]}' for rec in used)}\n"
         )

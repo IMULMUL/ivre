@@ -1,7 +1,7 @@
 #! /usr/bin/env python
 
 # This file is part of IVRE.
-# Copyright 2011 - 2021 Pierre LALET <pierre@droids-corp.org>
+# Copyright 2011 - 2024 Pierre LALET <pierre@droids-corp.org>
 #
 # IVRE is free software: you can redistribute it and/or modify it
 # under the terms of the GNU General Public License as published by
@@ -22,13 +22,10 @@ Access and query the flows database.
 See doc/FLOW.md for more information.
 """
 
-
-from argparse import ArgumentParser
 import datetime
 import os
 import sys
-from typing import Dict, Tuple
-
+from argparse import ArgumentParser
 
 try:
     import matplotlib  # type: ignore
@@ -37,10 +34,9 @@ except ImportError:
     plt = None
 
 
-from ivre.db import db
-from ivre import utils, config
 import ivre.flow
-
+from ivre import config, utils
+from ivre.db import db
 
 addr_fields = {
     "src": {"type": "edges", "field": "src.addr"},
@@ -49,33 +45,34 @@ addr_fields = {
 }
 
 
-def get_addr_argument(field: str, value: str) -> Tuple[str, str]:
+def get_addr_argument(field: str, value: str) -> tuple[str, str]:
     addr_field = addr_fields[field]
     # Detect CIDR
     op = "="
     if "/" in value:
         op = "=~"
-    return (addr_field["type"], "%s %s %s" % (addr_field["field"], op, value))
+    return (addr_field["type"], f"{addr_field['field']} {op} {value}")
 
 
 def print_fields() -> None:
     equals = "=" * 7
     title = "General"
-    sys.stdout.write("{0} {1:^10} {0}\n".format(equals, title))
+    sys.stdout.write(f"{equals} {title:^10} {equals}\n")
     sys.stdout.writelines(
-        ("%-12s: %s\n" % (field, name) for field, name in ivre.flow.FIELDS.items())
+        (f"{field:12}: {name}\n" for field, name in ivre.flow.FIELDS.items())
     )
     for proto, configs in ivre.flow.META_DESC.items():
-        sys.stdout.write("{0} {1:^10} {0}\n".format(equals, proto))
+        sys.stdout.write(f"{equals} {proto:^10} {equals}\n")
         sys.stdout.writelines(
-            ("meta.%s.%s (list)\n" % (proto, name) for name in configs["keys"])
+            (f"meta.{proto}.{name} (list)\n" for name in configs["keys"])
         )
         sys.stdout.writelines(
-            ("meta.%s.%s\n" % (proto, name) for name in configs.get("counters", []))
+            (f"meta.{proto}.{name}\n" for name in configs.get("counters", []))
         )
 
 
-def main() -> None:
+def build_parser() -> ArgumentParser:
+    """Build the argument parser for this tool."""
     parser = ArgumentParser(description=__doc__)
     parser.add_argument(
         "--init",
@@ -86,7 +83,7 @@ def main() -> None:
     parser.add_argument(
         "--ensure-indexes",
         action="store_true",
-        help="Create missing indexes (will lock the " "database).",
+        help="Create missing indexes (will lock the database).",
     )
     parser.add_argument(
         "--node-filters",
@@ -134,14 +131,14 @@ def main() -> None:
         "--collect",
         "-C",
         nargs="+",
-        help="When using --top, also collect these " "properties.",
+        help="When using --top, also collect these properties.",
         default=[],
     )
     parser.add_argument(
         "--sum",
         "-S",
         nargs="+",
-        help="When using --top, sum on these properties to " "order the result.",
+        help="When using --top, sum on these properties to order the result.",
         default=[],
     )
     parser.add_argument(
@@ -162,9 +159,7 @@ def main() -> None:
     parser.add_argument(
         "--flow-daily",
         action="store_true",
-        help="Flow count per times of the day. If --precision "
-        "is absent, it will be based on FLOW_TIME_PRECISION "
-        "(%d)" % config.FLOW_TIME_PRECISION,
+        help=f"Flow count per times of the day. If --precision is absent, it will be based on FLOW_TIME_PRECISION ({config.FLOW_TIME_PRECISION})",
     )
     parser.add_argument(
         "--plot",
@@ -225,33 +220,37 @@ def main() -> None:
         "--host",
         type=str,
         metavar="HOST",
-        help="Filter on " "source OR destination IP. Accepts IP address or " "CIDR.",
+        help="Filter on source OR destination IP. Accepts IP address or CIDR.",
     )
     parser.add_argument(
         "--src",
         type=str,
         metavar="SRC",
-        help="Filter on " "source IP. Accepts IP address or CIDR.",
+        help="Filter on source IP. Accepts IP address or CIDR.",
     )
     parser.add_argument(
         "--dst",
         type=str,
         metavar="DST",
-        help="Filter on " "destination IP. Accepts IP address or CIDR.",
+        help="Filter on destination IP. Accepts IP address or CIDR.",
     )
     parser.add_argument(
-        "--proto", type=str, metavar="PROTO", help="Filter on " "transport protocol."
+        "--proto", type=str, metavar="PROTO", help="Filter on transport protocol."
     )
-    parser.add_argument("--tcp", action="store_true", help="Alias to " "--proto tcp")
-    parser.add_argument("--udp", action="store_true", help="Alias to " "--proto udp")
-    parser.add_argument("--port", type=int, metavar="PORT", help="Alias to " "--dport")
+    parser.add_argument("--tcp", action="store_true", help="Alias to --proto tcp")
+    parser.add_argument("--udp", action="store_true", help="Alias to --proto udp")
+    parser.add_argument("--port", type=int, metavar="PORT", help="Alias to --dport")
     parser.add_argument(
-        "--dport", type=int, metavar="DPORT", help="Filter on " "destination port."
+        "--dport", type=int, metavar="DPORT", help="Filter on destination port."
     )
     parser.add_argument(
-        "--sport", type=int, metavar="SPORT", help="Filter on " "source port."
+        "--sport", type=int, metavar="SPORT", help="Filter on source port."
     )
-    args = parser.parse_args()
+    return parser
+
+
+def main() -> None:
+    args = build_parser().parse_args()
 
     out = sys.stdout
 
@@ -262,7 +261,7 @@ def main() -> None:
     if args.init:
         if os.isatty(sys.stdin.fileno()):
             out.write(
-                "This will remove any flow result in your database. " "Process ? [y/N] "
+                "This will remove any flow result in your database. Process ? [y/N] "
             )
             ans = input()
             if ans.lower() != "y":
@@ -272,7 +271,7 @@ def main() -> None:
 
     if args.ensure_indexes:
         if os.isatty(sys.stdin.fileno()):
-            out.write("This will lock your database. " "Process ? [y/N] ")
+            out.write("This will lock your database. Process ? [y/N] ")
             ans = input()
             if ans.lower() != "y":
                 sys.exit(-1)
@@ -288,9 +287,10 @@ def main() -> None:
         for field in args.fields:
             ivre.flow.validate_field(field)
 
+    # pylint: disable=use-implicit-booleaness-not-comparison-to-zero
     if args.precision == 0:
         # Get precisions list
-        out.writelines("%d\n" % precision for precision in db.flow.list_precisions())
+        out.writelines(f"{int(precision)}\n" for precision in db.flow.list_precisions())
         sys.exit(0)
 
     filters = {"nodes": args.node_filters or [], "edges": args.flow_filters or []}
@@ -303,17 +303,17 @@ def main() -> None:
             filters[flt_t].append(flt_v)
 
     if args.proto is not None:
-        filters["edges"].append("proto = %s" % args.proto)
+        filters["edges"].append(f"proto = {args.proto}")
     for key in ["tcp", "udp"]:
         if args_dict[key]:
-            filters["edges"].append("proto = %s" % key)
+            filters["edges"].append(f"proto = {key}")
 
     for key in ["port", "dport"]:
         if args_dict[key] is not None:
-            filters["edges"].append("dport = %d" % args_dict[key])
+            filters["edges"].append(f"dport = {args_dict[key]}")
 
     if args.sport is not None:
-        filters["edges"].append("ANY sports = %d" % args.sport)
+        filters["edges"].append(f"ANY sports = {args.sport}")
 
     time_args = ["before", "after"]
     time_values = {}
@@ -361,7 +361,7 @@ def main() -> None:
     if args.count:
         count = db.flow.count(query)
         out.write(
-            "%(clients)d clients\n%(servers)d servers\n" "%(flows)d flows\n" % count
+            f"{int(count['clients'])} clients\n{int(count['servers'])} servers\n{int(count['flows'])} flows\n"
         )
 
     elif args.top:
@@ -376,26 +376,14 @@ def main() -> None:
         )
         for rec in top:
             sys.stdout.write(
-                "%s%s%s%s%s\n"
-                % (
-                    "(" + coma2.join(str(val) for val in rec["fields"]) + ")",
-                    sep,
-                    rec["count"],
-                    sep,
-                    coma.join(
-                        str("(" + coma2.join(str(val) for val in collected) + ")")
-                        for collected in rec["collected"]
-                    )
-                    if rec["collected"]
-                    else "",
-                )
+                f"{f"({coma2.join((str(val) for val in rec['fields']))})"}{sep}{rec['count']}{sep}{coma.join((str(f"({coma2.join((str(val) for val in collected))})") for collected in rec['collected'])) if rec['collected'] else ''}\n"
             )
 
     elif args.flow_daily:
         precision = (
             args.precision if args.precision is not None else config.FLOW_TIME_PRECISION
         )
-        plot_data: Dict[str, Dict[datetime.datetime, int]] = {}
+        plot_data: dict[str, dict[datetime.datetime, int]] = {}
         for rec in db.flow.flow_daily(
             precision, query, after=time_values["after"], before=time_values["before"]
         ):
@@ -403,9 +391,7 @@ def main() -> None:
                 sep.join(
                     [
                         rec["time_in_day"].strftime("%T.%f"),
-                        " ; ".join(
-                            ["(" + x[0] + ", " + str(x[1]) + ")" for x in rec["flows"]]
-                        ),
+                        " ; ".join([f"({x[0]}, {x[1]!s})" for x in rec["flows"]]),
                     ]
                 )
             )
@@ -438,7 +424,7 @@ def main() -> None:
             plt.show()
 
     else:
-        fmt = "%%s%s%%s%s%%s" % (sep, sep)
+        fmt = f"%s{sep}%s{sep}%s"
         node_width = len("XXXX:XXXX:XXXX:XXXX:XXXX:XXXX")
         flow_width = len("tcp/XXXXX")
         for res in db.flow.to_iter(
@@ -450,31 +436,20 @@ def main() -> None:
             timeline=args.timeline,
         ):
             if args.json:
-                out.write("%s\n" % res)
+                out.write(f"{res}\n")
             else:
                 elts = {}
                 for elt in ["src", "flow", "dst"]:
                     elts[elt] = res[elt]["label"]
                     if args.fields:
-                        elts[elt] = "%s%s%s" % (
-                            elts[elt],
-                            coma,
-                            coma.join(
-                                str(res[elt]["data"].get(field, ""))
-                                for field in args.fields
-                            ),
+                        elts[elt] = (
+                            f"{elts[elt]}{coma}{coma.join((str(res[elt]['data'].get(field, '')) for field in args.fields))}"
                         )
                 src, flow, dst = elts["src"], elts["flow"], elts["dst"]
                 node_width = max(node_width, len(src), len(dst))
                 flow_width = max(flow_width, len(flow))
                 if not args.separator:
-                    fmt = "%%-%ds%s%%-%ds%s%%-%ds" % (
-                        node_width,
-                        sep,
-                        flow_width,
-                        sep,
-                        node_width,
-                    )
+                    fmt = f"%-{node_width}s{sep}%-{flow_width}s{sep}%-{node_width}s"
                 out.write(fmt % (src, flow, dst))
                 if args.timeline:
                     out.write(sep)

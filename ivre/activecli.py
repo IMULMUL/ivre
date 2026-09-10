@@ -1,7 +1,7 @@
 #! /usr/bin/env python
 
 # This file is part of IVRE.
-# Copyright 2011 - 2021 Pierre LALET <pierre@droids-corp.org>
+# Copyright 2011 - 2026 Pierre LALET <pierre@droids-corp.org>
 #
 # IVRE is free software: you can redistribute it and/or modify it
 # under the terms of the GNU General Public License as published by
@@ -17,34 +17,20 @@
 # along with IVRE. If not, see <http://www.gnu.org/licenses/>.
 
 
-from collections import OrderedDict
 import json
 import os
 import sys
-from typing import (
-    Any,
-    Callable,
-    Dict,
-    Iterable,
-    List,
-    Optional,
-    Set,
-    TextIO,
-    Tuple,
-    Union,
-    cast,
-)
+from collections import OrderedDict
+from collections.abc import Callable, Iterable
+from typing import Any, TextIO, cast
 from xml.sax import saxutils
 
-
-from ivre.active.data import ALIASES_TABLE_ELEMS
+from ivre import graphroute, utils
+from ivre.active.nmap import ALIASES_TABLE_ELEMS
 from ivre.config import HONEYD_IVRE_SCRIPTS_PATH
 from ivre.db import db
-from ivre import graphroute
 from ivre.types import DB, Filter, Record
 from ivre.types.active import NmapHost, NmapPort, NmapScript
-from ivre import utils
-
 
 HONEYD_ACTION_FROM_NMAP_STATE = {
     "resets": "reset",
@@ -56,17 +42,15 @@ HONEYD_SSL_CMD = "honeydssl --cert-subject %(subject)s -- %(command)s"
 
 
 def _display_honeyd_preamble(out: TextIO = sys.stdout) -> None:
-    out.write(
-        """create default
+    out.write("""create default
 set default default tcp action block
 set default default udp action block
 set default default icmp action block
 
-"""
-    )
+""")
 
 
-def _getscript(port: NmapPort, sname: str) -> Optional[NmapScript]:
+def _getscript(port: NmapPort, sname: str) -> NmapScript | None:
     for s in port.get("scripts", []):
         if s["id"] == sname:
             return s
@@ -91,25 +75,13 @@ def _nmap_port2honeyd_action(port: NmapPort) -> str:
             if s is not None:
                 banner = s["output"]
             else:
-                banner = "SSH-%s-%s" % (
-                    port.get("service_version", "2.0"),
-                    "_".join(
-                        [
-                            k
-                            for k in port.get("service_product", "OpenSSH").split()
-                            if k != "SSH"
-                        ]
-                    ),
-                )
-            return '''"%s %s"''' % (
-                os.path.join(HONEYD_IVRE_SCRIPTS_PATH, "sshd"),
-                banner,
-            )
+                banner = f"SSH-{port.get('service_version', '2.0')}-{'_'.join(k for k in port.get('service_product', 'OpenSSH').split() if k != 'SSH')}"
+            return f'"{os.path.join(HONEYD_IVRE_SCRIPTS_PATH, "sshd")} {banner}"'
     return "open"
 
 
-HoneydRoutes = Dict[Tuple[str, str], Dict[str, Any]]
-HoneydNodes = Set[str]
+HoneydRoutes = dict[tuple[str, str], dict[str, Any]]
+HoneydNodes = set[str]
 
 
 def _display_honeyd_conf(
@@ -117,10 +89,10 @@ def _display_honeyd_conf(
     honeyd_routes: HoneydRoutes,
     honeyd_entries: HoneydNodes,
     out: TextIO = sys.stdout,
-) -> Tuple[HoneydRoutes, HoneydNodes]:
+) -> tuple[HoneydRoutes, HoneydNodes]:
     addr = host["addr"]
-    hname = "host_%s" % addr.replace(".", "_").replace(":", "_")
-    out.write("create %s\n" % hname)
+    hname = f"host_{addr.replace('.', '_').replace(':', '_')}"
+    out.write(f"create {hname}\n")
     defaction = HONEYD_DEFAULT_ACTION
     if "extraports" in host:
         extra = host["extraports"]
@@ -128,23 +100,17 @@ def _display_honeyd_conf(
             max(
                 extra.values(), key=lambda state: cast(int, cast(dict, state)["total"])
             )["reasons"].items(),
-            key=lambda reason: cast(Tuple[str, int], reason)[1],
+            key=lambda reason: cast(tuple[str, int], reason)[1],
         )[0]
         try:
             defaction = HONEYD_ACTION_FROM_NMAP_STATE[defaction]
         except KeyError:
             pass
-    out.write("set %s default tcp action %s\n" % (hname, defaction))
+    out.write(f"set {hname} default tcp action {defaction}\n")
     for p in host.get("ports", []):
         try:
             out.write(
-                "add %s %s port %d %s\n"
-                % (
-                    hname,
-                    p["protocol"],
-                    p["port"],
-                    _nmap_port2honeyd_action(p),
-                )
+                f"add {hname} {p['protocol']} port {int(p['port'])} {_nmap_port2honeyd_action(p)}\n"
             )
         except KeyError:
             # let's skip pseudo-port records that are only containers for host
@@ -179,7 +145,7 @@ def _display_honeyd_conf(
                         "targets": route["targets"],
                     }
                 curhop = t
-    out.write("bind %s %s\n\n" % (addr, hname))
+    out.write(f"bind {addr} {hname}\n\n")
     return honeyd_routes, honeyd_entries
 
 
@@ -187,20 +153,14 @@ def _display_honeyd_epilogue(
     honeyd_routes: HoneydRoutes, honeyd_entries: HoneydNodes, out: TextIO = sys.stdout
 ) -> None:
     for node in honeyd_entries:
-        out.write("route entry %s\n" % node)
-        out.write("route %s link %s/32\n" % (node, node))
+        out.write(f"route entry {node}\n")
+        out.write(f"route {node} link {node}/32\n")
     out.write("\n")
     for src, dst in honeyd_routes:
-        out.write("route %s link %s/32\n" % (src, dst))
+        out.write(f"route {src} link {dst}/32\n")
         for target in honeyd_routes[(src, dst)]["targets"]:
             out.write(
-                "route %s add net %s/32 %s latency %dms\n"
-                % (
-                    src,
-                    target,
-                    dst,
-                    int(round(honeyd_routes[(src, dst)]["mean"])),
-                )
+                f"route {src} add net {target}/32 {dst} latency {round(honeyd_routes[src, dst]['mean'])}ms\n"
             )
 
 
@@ -213,10 +173,10 @@ def _display_xml_preamble(out: TextIO = sys.stdout) -> None:
     )
 
 
-def _display_xml_scan(scan: Dict[str, Any], out: TextIO = sys.stdout) -> None:
+def _display_xml_scan(scan: dict[str, Any], out: TextIO = sys.stdout) -> None:
     if "scaninfos" in scan and scan["scaninfos"]:
         for k in scan["scaninfos"][0]:
-            scan["scaninfo.%s" % k] = scan["scaninfos"][0][k]
+            scan[f"scaninfo.{k}"] = scan["scaninfos"][0][k]
         del scan["scaninfos"]
     for k in [
         "version",
@@ -235,65 +195,43 @@ def _display_xml_scan(scan: Dict[str, Any], out: TextIO = sys.stdout) -> None:
         elif isinstance(scan[k], str):
             scan[k] = scan[k].replace('"', "&quot;").replace("--", "-&#45;")
     out.write(
-        "<!DOCTYPE nmaprun PUBLIC "
-        '"-//IDN nmap.org//DTD Nmap XML 1.04//EN" '
-        '"https://svn.nmap.org/nmap/docs/nmap.dtd">\n'
-        "<?xml-stylesheet "
-        'href="file:///usr/local/bin/../share/nmap/nmap.xsl" '
-        'type="text/xsl"?>\n'
-        "<!-- %(scanner)s %(version)s scan initiated %(startstr)s "
-        "as: %(args)s -->\n"
-        '<nmaprun scanner="%(scanner)s" args="%(args)s" '
-        'start="%(start)s" startstr="%(startstr)s" '
-        'version="%(version)s" '
-        'xmloutputversion="%(xmloutputversion)s">\n'
-        '<scaninfo type="%(scaninfo.type)s" '
-        'protocol="%(scaninfo.protocol)s" '
-        'numservices="%(scaninfo.numservices)s" '
-        'services="%(scaninfo.services)s"/>\n' % scan
+        f"<!DOCTYPE nmaprun PUBLIC \"-//IDN nmap.org//DTD Nmap XML 1.04//EN\" \"https://svn.nmap.org/nmap/docs/nmap.dtd\">\n<?xml-stylesheet href=\"file:///usr/local/bin/../share/nmap/nmap.xsl\" type=\"text/xsl\"?>\n<!-- {scan['scanner']} {scan['version']} scan initiated {scan['startstr']} as: {scan['args']} -->\n<nmaprun scanner=\"{scan['scanner']}\" args=\"{scan['args']}\" start=\"{scan['start']}\" startstr=\"{scan['startstr']}\" version=\"{scan['version']}\" xmloutputversion=\"{scan['xmloutputversion']}\">\n<scaninfo type=\"{scan['scaninfo.type']}\" protocol=\"{scan['scaninfo.protocol']}\" numservices=\"{scan['scaninfo.numservices']}\" services=\"{scan['scaninfo.services']}\"/>\n"
     )
 
 
 def _display_xml_table_elem(
     doc: NmapHost,
     first: bool = False,
-    name: Optional[str] = None,
+    name: str | None = None,
     out: TextIO = sys.stdout,
 ) -> None:
     if first:
         assert name is None
-    name = "" if name is None else " key=%s" % saxutils.quoteattr(name)
+    name = "" if name is None else f" key={saxutils.quoteattr(name)}"
     if isinstance(doc, list):
         if not first:
-            out.write("<table%s>\n" % name)
+            out.write(f"<table{name}>\n")
         for subdoc in doc:
             _display_xml_table_elem(subdoc, out=out)
         if not first:
             out.write("</table>\n")
     elif isinstance(doc, dict):
         if not first:
-            out.write("<table%s>\n" % name)
+            out.write(f"<table{name}>\n")
         for key, subdoc in doc.items():
             _display_xml_table_elem(subdoc, name=key, out=out)
         if not first:
             out.write("</table>\n")
     else:
         out.write(
-            "<elem%s>%s</elem>\n"
-            % (
-                name,
-                saxutils.escape(
-                    str(doc),
-                    entities={"\n": "&#10;"},
-                ),
-            )
+            f"<elem{name}>{saxutils.escape(str(doc), entities={'\n': '&#10;'})}</elem>\n"
         )
 
 
 def _display_xml_script(script: NmapScript, out: TextIO = sys.stdout) -> None:
-    out.write("<script id=%s" % saxutils.quoteattr(script["id"]))
+    out.write(f"<script id={saxutils.quoteattr(script['id'])}")
     if "output" in script:
-        out.write(" output=%s" % saxutils.quoteattr(script["output"]))
+        out.write(f" output={saxutils.quoteattr(script['output'])}")
     key = ALIASES_TABLE_ELEMS.get(script["id"], script["id"])
     if key in script:
         out.write(">")
@@ -307,26 +245,22 @@ def _display_xml_host(host: NmapHost, out: TextIO = sys.stdout) -> None:
     out.write("<host")
     for k in ["timedout", "timeoutcounter"]:
         if k in host:
-            out.write(" %s=%s" % (k, saxutils.quoteattr(host[k])))
+            out.write(f" {k}={saxutils.quoteattr(host[k])}")
     for k in ["starttime", "endtime"]:
         if k in host:
-            out.write(" %s=%s" % (k, saxutils.quoteattr(host[k].strftime("%s"))))
+            out.write(f" {k}={saxutils.quoteattr(host[k].strftime('%s'))}")
     out.write(">")
     if "state" in host:
-        out.write('<status state="%s"' % host["state"])
+        out.write(f"<status state=\"{host['state']}\"")
         for k in ["reason", "reason_ttl"]:
-            kk = "state_%s" % k
+            kk = f"state_{k}"
             if kk in host:
-                out.write(' %s="%s"' % (k, host[kk]))
+                out.write(f' {k}="{host[kk]}"')
         out.write("/>")
     out.write("\n")
     if "addr" in host:
         out.write(
-            '<address addr="%s" addrtype="ipv%d"/>\n'
-            % (
-                host["addr"],
-                6 if ":" in host["addr"] else 4,
-            )
+            f"<address addr=\"{host['addr']}\" addrtype=\"ipv{int(6 if ':' in host['addr'] else 4)}\"/>\n"
         )
     for atype, addrs in host.get("addresses", {}).items():
         for addr in addrs:
@@ -340,41 +274,41 @@ def _display_xml_host(host: NmapHost, out: TextIO = sys.stdout) -> None:
                 #         manuf = manuf[0]
                 #     extra = ' vendor=%s' % saxutils.quoteattr(manuf[0])
                 if manuf and manuf[0]:
-                    extra = " vendor=%s" % saxutils.quoteattr(manuf[0])
-            out.write('<address addr="%s" addrtype="%s"%s/>\n' % (addr, atype, extra))
+                    extra = f" vendor={saxutils.quoteattr(manuf[0])}"
+            out.write(f'<address addr="{addr}" addrtype="{atype}"{extra}/>\n')
     if "hostnames" in host:
         out.write("<hostnames>\n")
         for hostname in host["hostnames"]:
             out.write("<hostname")
             for k in ["name", "type"]:
                 if k in hostname:
-                    out.write(' %s="%s"' % (k, hostname[k]))
+                    out.write(f' {k}="{hostname[k]}"')
             out.write("/>\n")
         out.write("</hostnames>\n")
     out.write("<ports>")
     for state, counts in host.get("extraports", {}).items():
-        out.write('<extraports state="%s" count="%d">\n' % (state, counts["total"]))
+        out.write(f"<extraports state=\"{state}\" count=\"{counts['total']}\">\n")
         for reason, count in counts["reasons"].items():
-            out.write('<extrareasons reason="%s" count="%d"/>\n' % (reason, count))
+            out.write(f'<extrareasons reason="{reason}" count="{count}"/>\n')
         out.write("</extraports>\n")
-    hostscripts: List[NmapScript] = []
+    hostscripts: list[NmapScript] = []
     for p in host.get("ports", []):
         if p.get("port") == -1:
             hostscripts = p["scripts"]
             continue
         out.write("<port")
         if "protocol" in p:
-            out.write(' protocol="%s"' % p["protocol"])
+            out.write(f" protocol=\"{p['protocol']}\"")
         if "port" in p:
-            out.write(' portid="%s"' % p["port"])
+            out.write(f" portid=\"{p['port']}\"")
         out.write("><state")
         for k in ["state", "reason", "reason_ttl"]:
-            kk = "state_%s" % k
+            kk = f"state_{k}"
             if kk in p:
-                out.write(" %s=%s" % (k, saxutils.quoteattr(str(p[kk]))))
+                out.write(f" {k}={saxutils.quoteattr(str(p[kk]))}")
         out.write("/>")
         if "service_name" in p:
-            out.write('<service name="%s"' % p["service_name"])
+            out.write(f"<service name=\"{p['service_name']}\"")
             for k in [
                 "servicefp",
                 "product",
@@ -384,12 +318,12 @@ def _display_xml_host(host: NmapHost, out: TextIO = sys.stdout) -> None:
                 "method",
                 "conf",
             ]:
-                kk = "service_%s" % k
+                kk = f"service_{k}"
                 if kk in p:
                     if isinstance(p[kk], str):
-                        out.write(" %s=%s" % (k, saxutils.quoteattr(p[kk])))
+                        out.write(f" {k}={saxutils.quoteattr(p[kk])}")
                     else:
-                        out.write(' %s="%s"' % (k, p[kk]))
+                        out.write(f' {k}="{p[kk]}"')
             # TODO: CPE
             out.write("></service>")
         for s in p.get("scripts", []):
@@ -404,29 +338,23 @@ def _display_xml_host(host: NmapHost, out: TextIO = sys.stdout) -> None:
     for trace in host.get("traces", []):
         out.write("<trace")
         if "port" in trace:
-            out.write(" port=%s" % (saxutils.quoteattr(str(trace["port"]))))
+            out.write(f" port={saxutils.quoteattr(str(trace['port']))}")
         if "protocol" in trace:
-            out.write(" proto=%s" % (saxutils.quoteattr(trace["protocol"])))
+            out.write(f" proto={saxutils.quoteattr(trace['protocol'])}")
         out.write(">\n")
         for hop in sorted(trace.get("hops", []), key=lambda hop: cast(int, hop["ttl"])):
             out.write("<hop")
             if "ttl" in hop:
-                out.write(" ttl=%s" % (saxutils.quoteattr(str(hop["ttl"]))))
+                out.write(f" ttl={saxutils.quoteattr(str(hop['ttl']))}")
             if "ipaddr" in hop:
-                out.write(" ipaddr=%s" % (saxutils.quoteattr(hop["ipaddr"])))
+                out.write(f" ipaddr={saxutils.quoteattr(hop['ipaddr'])}")
             if "rtt" in hop:
-                out.write(
-                    " rtt=%s"
-                    % (
-                        saxutils.quoteattr(
-                            "%.2f" % hop["rtt"]
-                            if isinstance(hop["rtt"], float)
-                            else hop["rtt"]
-                        )
-                    )
+                rtt = saxutils.quoteattr(
+                    f"{hop['rtt']:.2f}" if isinstance(hop["rtt"], float) else hop["rtt"]
                 )
+                out.write(f" rtt={rtt}")
             if "host" in hop:
-                out.write(" host=%s" % (saxutils.quoteattr(hop["host"])))
+                out.write(f" host={saxutils.quoteattr(hop['host'])}")
             out.write("/>\n")
         out.write("</trace>\n")
     out.write("</host>\n")
@@ -437,7 +365,7 @@ def _display_xml_epilogue(out: TextIO = sys.stdout) -> None:
 
 
 def _displayhost_csv(
-    fields: Dict[str, Any],
+    fields: dict[str, Any],
     separator: str,
     nastr: str,
     dic: NmapHost,
@@ -452,17 +380,19 @@ def _displayhost_csv(
     out.write("\n")
 
 
-def _display_gnmap_scan(scan: Dict[str, Any], out: TextIO = sys.stdout) -> None:
+def _display_gnmap_scan(scan: dict[str, Any], out: TextIO = sys.stdout) -> None:
     if "scaninfos" in scan and scan["scaninfos"]:
         for k in scan["scaninfos"][0]:
-            scan["scaninfo.%s" % k] = scan["scaninfos"][0][k]
+            scan[f"scaninfo.{k}"] = scan["scaninfos"][0][k]
         del scan["scaninfos"]
     for k in ["version", "startstr", "args"]:
         if k not in scan:
             scan[k] = ""
         elif isinstance(scan[k], str):
             scan[k] = scan[k].replace('"', "&quot;").replace("--", "-&#45;")
-    out.write("# Nmap %(version)s scan initiated %(startstr)s as: %(args)s\n")
+    out.write(
+        f"# Nmap {scan['version']} scan initiated {scan['startstr']} as: {scan['args']}\n"
+    )
 
 
 def _display_gnmap_host(host: NmapHost, out: TextIO = sys.stdout) -> None:
@@ -476,9 +406,9 @@ def _display_gnmap_host(host: NmapHost, out: TextIO = sys.stdout) -> None:
     if hostname is None:
         name = addr
     else:
-        name = "%s (%s)" % (addr, hostname)
+        name = f"{addr} ({hostname})"
     if host.get("state"):
-        out.write("Host: %s Status: %s\n" % (name, host["state"].capitalize()))
+        out.write(f"Host: {name} Status: {host['state'].capitalize()}\n")
     ports = []
     info = []
     for port in host.get("ports", []):
@@ -487,31 +417,24 @@ def _display_gnmap_host(host: NmapHost, out: TextIO = sys.stdout) -> None:
         if "service_product" in port:
             version = port["service_product"]
             for key in ["version", "extrainfo"]:
-                key = "service_%s" % key
+                key = f"service_{key}"
                 if key in port:
-                    version += " %s" % port[key]
+                    version += f" {port[key]}"
             version = version.replace("/", "|")
         else:
             version = ""
         ports.append(
-            "%d/%s/%s//%s//%s/"
-            % (
-                port["port"],
-                port["state_state"],
-                port["protocol"],
-                port.get("service_name", ""),
-                version,
-            )
+            f"{port['port']}/{port['state_state']}/{port['protocol']}//{port.get('service_name', '')}//{version}/"
         )
     if ports:
-        info.append("Ports: %s" % ", ".join(ports))
+        info.append(f"Ports: {', '.join(ports)}")
     extraports = []
     for state, counts in host.get("extraports", {}).items():
-        extraports.append("%s (%d)" % (state, counts["total"]))
+        extraports.append(f"{state} ({counts['total']})")
     if extraports:
-        info.append("Ignored State: %s" % ", ".join(extraports))
+        info.append(f"Ignored State: {', '.join(extraports)}")
     for osmatch in host.get("os", {}).get("osmatch", []):
-        info.append("OS: %s" % osmatch["name"])
+        info.append(f"OS: {osmatch['name']}")
         break
     # TODO: data from tcpsequence and ipidsequence is currently
     # missing
@@ -530,25 +453,62 @@ def displayfunction_honeyd(cur: Iterable[NmapHost]) -> None:
     _display_honeyd_epilogue(honeyd_routes, honeyd_entries, sys.stdout)
 
 
-def displayfunction_http_urls(cur: Iterable[NmapHost]) -> None:
+def displayfunction_http_urls(
+    cur: Iterable[NmapHost],
+    with_addrs: bool = True,
+    with_names: bool = False,
+    add_addrs: bool = False,
+) -> None:
     for h in cur:
+        addr = h["addr"]
+        names = []
+        if with_addrs:
+            if ":" in addr:
+                names.append(f"[{addr}]")
+            else:
+                names.append(addr)
+        if with_names:
+            names.extend(
+                sorted(
+                    {
+                        hn["name"]
+                        for hn in h.get("hostnames", [])
+                        if "*" not in hn["name"]
+                    },
+                    key=utils.key_sort_dom,
+                )
+            )
+        prefix = f"{addr}, " if add_addrs else ""
         for p in h.get("ports", []):
-            if p.get("service_name") not in {"http", "http-proxy", "https"}:
+            if p.get("service_name") not in {
+                "http",
+                "http-proxy",
+                "http-alt",
+                "https",
+                "https-alt",
+            }:
                 continue
-            if p.get("service_tunnel") == "ssl" or p.get("service_name") == "https":
+            if p.get("service_tunnel") == "ssl" or p.get("service_name") in {
+                "https",
+                "https-alt",
+            }:
                 if p.get("port") == 443:
-                    sys.stdout.write("https://%s/\n" % h["addr"])
+                    for name in names:
+                        sys.stdout.write(f"{prefix}https://{name}/\n")
                 else:
-                    sys.stdout.write("https://%s:%d/\n" % (h["addr"], p["port"]))
+                    for name in names:
+                        sys.stdout.write(f"{prefix}https://{name}:{p['port']}/\n")
             else:
                 if p.get("port") == 80:
-                    sys.stdout.write("http://%s/\n" % h["addr"])
+                    for name in names:
+                        sys.stdout.write(f"{prefix}http://{name}/\n")
                 else:
-                    sys.stdout.write("http://%s:%d/\n" % (h["addr"], p["port"]))
+                    for name in names:
+                        sys.stdout.write(f"{prefix}http://{name}:{p['port']}/\n")
 
 
 def displayfunction_nmapxml(
-    cur: Iterable[NmapHost], scan: Optional[Dict[str, Any]] = None
+    cur: Iterable[NmapHost], scan: dict[str, Any] | None = None
 ) -> None:
     _display_xml_preamble(out=sys.stdout)
     _display_xml_scan(scan or {}, out=sys.stdout)
@@ -564,7 +524,7 @@ def displayfunction_gnmap(cur: Iterable[NmapHost]) -> None:
 
 
 def displayfunction_explain(flt: Filter, dbase: DB) -> None:
-    sys.stdout.write(dbase.explain(dbase._get(flt), indent=4) + "\n")
+    sys.stdout.write(f"{dbase.explain(dbase._get(flt), indent=4)}\n")
 
 
 def displayfunction_remove(flt: Filter, dbase: DB) -> None:
@@ -574,11 +534,11 @@ def displayfunction_remove(flt: Filter, dbase: DB) -> None:
 def displayfunction_graphroute(
     cur: Iterable[NmapHost],
     arg: str,
-    cluster: Optional[str],
-    gr_include: Optional[str],
+    cluster: str | None,
+    gr_include: str | None,
     gr_dont_reset: bool,
 ) -> None:
-    cluster_f: Optional[Callable[[str], Optional[Tuple[Union[int, str], str]]]]
+    cluster_f: Callable[[str], tuple[int | str, str] | None] | None
     graph, entry_nodes = graphroute.buildgraph(
         cur,
         include_last_hop=gr_include == "last-hop",
@@ -587,21 +547,21 @@ def displayfunction_graphroute(
     if arg == "dot":
         if cluster == "AS":
 
-            def cluster_f(ipaddr: str) -> Optional[Tuple[int, str]]:
+            def cluster_f(ipaddr: str) -> tuple[int, str] | None:
                 res = db.data.as_byip(ipaddr)
                 if res is None:
                     return None
-                return (res["as_num"], "%(as_num)d\n[%(as_name)s]" % res)
+                return (res["as_num"], f"{res['as_num']}\n[{res['as_name']}]")
 
         elif cluster == "Country":
 
-            def cluster_f(ipaddr: str) -> Optional[Tuple[str, str]]:
+            def cluster_f(ipaddr: str) -> tuple[str, str] | None:
                 res = db.data.country_byip(ipaddr)
                 if res is None:
                     return None
                 return (
                     res["country_code"],
-                    "%(country_code)s - %(country_name)s" % res,
+                    f"{res['country_code']} - {res['country_name']}",
                 )
 
         else:
@@ -616,7 +576,7 @@ def displayfunction_graphroute(
 def displayfunction_csv(
     cur: Iterable[NmapHost], arg: str, csv_sep: str, csv_na_str: str, add_infos: bool
 ) -> None:
-    fields: Optional[OrderedDict] = {
+    fields: OrderedDict | None = {
         "ports": OrderedDict(
             [
                 ("addr", True),
@@ -697,17 +657,16 @@ def displayfunction_csv(
 def displayfunction_json(
     cur: Iterable[Record], dbase: DB, no_screenshots: bool = False
 ) -> None:
-    indent: Optional[int]
+    indent: int | None
     if os.isatty(sys.stdout.fileno()):
         indent = 4
     else:
         indent = None
     for h in cur:
-        for fld in ["_id", "scanid"]:
-            try:
-                del h[fld]
-            except KeyError:
-                pass
+        try:
+            del h["_id"]
+        except KeyError:
+            pass
         for port in h.get("ports", []):
             if no_screenshots:
                 for fname in ["screenshot", "screendata"]:
@@ -727,19 +686,19 @@ def displayfunction_json(
 
 
 def display_short(
-    dbase: DB, flt: Filter, srt: Optional[Any], lmt: Optional[int], skp: Optional[int]
+    dbase: DB, flt: Filter, srt: Any | None, lmt: int | None, skp: int | None
 ) -> None:
     for val in dbase.distinct("addr", flt=flt, sort=srt, limit=lmt, skip=skp):
-        sys.stdout.write(val + "\n")
+        sys.stdout.write(f"{val}\n")
 
 
 def display_distinct(
     dbase: DB,
     arg: str,
     flt: Filter,
-    srt: Optional[Any],
-    lmt: Optional[int],
-    skp: Optional[int],
+    srt: Any | None,
+    lmt: int | None,
+    skp: int | None,
 ) -> None:
     for val in dbase.distinct(arg, flt=flt, sort=srt, limit=lmt, skip=skp):
-        sys.stdout.write(str(val) + "\n")
+        sys.stdout.write(f"{val!s}\n")

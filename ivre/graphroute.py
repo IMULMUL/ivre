@@ -1,8 +1,7 @@
 #! /usr/bin/env python
-# -*- coding: utf-8 -*-
 
 # This file is part of IVRE.
-# Copyright 2011 - 2021 Pierre LALET <pierre@droids-corp.org>
+# Copyright 2011 - 2024 Pierre LALET <pierre@droids-corp.org>
 #
 # IVRE is free software: you can redistribute it and/or modify it
 # under the terms of the GNU General Public License as published by
@@ -20,7 +19,6 @@
 
 """This sub-module builds graphs of traceroute results."""
 
-
 # to build graphs with rtgraph3d
 try:
     import dbus  # type: ignore
@@ -30,31 +28,20 @@ try:
 except ImportError:
     HAVE_DBUS = False
 import hashlib
-from typing import (
-    Any,
-    Callable,
-    Dict,
-    Iterable,
-    Optional,
-    Set,
-    TextIO,
-    Tuple,
-    Union,
-)
-
+from collections.abc import Callable, Iterable
+from typing import Any, TextIO
 
 from ivre import utils
 
-
-Graph = Dict[str, Set[str]]
+Graph = dict[str, set[str]]
 
 
 def buildgraph(
-    cursor: Iterable[Dict[str, Any]],
+    cursor: Iterable[dict[str, Any]],
     include_last_hop: bool = False,
     include_target: bool = False,
     only_connected: bool = True,
-) -> Tuple[Graph, Set[str]]:
+) -> tuple[Graph, set[str]]:
     """Builds a graph (a dict object, {node: [dest nodes]}) by getting
     host documents from the database `cursor`, including (or not) the
     last hop and the target (for each host).
@@ -66,7 +53,7 @@ def buildgraph(
 
     """
     graph: Graph = {}
-    entry_nodes: Set[str] = set()
+    entry_nodes: set[str] = set()
     for host in cursor:
         if "traces" not in host:
             continue
@@ -94,9 +81,7 @@ def label(node: str) -> str:
 def writedotgraph(
     graph: Graph,
     out: TextIO,
-    cluster: Optional[
-        Callable[[str], Optional[Union[str, Tuple[Union[int, str], str]]]]
-    ] = None,
+    cluster: Callable[[str], str | tuple[int | str, str] | None] | None = None,
 ) -> None:
     """From a graph produced by buildgraph(), produces an output in
     the (Graphiz) Dot format.
@@ -116,10 +101,10 @@ def writedotgraph(
         def _add_node(node: str) -> None:
             if node not in nodes:
                 nodes.add(node)
-                out.write('\t"%s" [label="%s"];\n' % (label(node), node))
+                out.write(f'\t"{label(node)}" [label="{node}"];\n')
 
     else:
-        clusters: Dict[Optional[Union[str, Tuple[Union[int, str], str]]], Set[str]] = {}
+        clusters: dict[str | tuple[int | str, str] | None, set[str]] = {}
 
         def _add_node(node: str) -> None:
             if node not in nodes:
@@ -132,23 +117,23 @@ def writedotgraph(
         for destnode in node_edges:
             _add_node(destnode)
             if (node, destnode) not in edges:
-                out.write('\t"%s" -> "%s";\n' % (label(node), label(destnode)))
+                out.write(f'\t"{label(node)}" -> "{label(destnode)}";\n')
                 edges.add((node, destnode))
     if cluster is not None:
         if None in clusters:
             for node in clusters.pop(None):
-                out.write('\t"%s" [label="%s"];\n' % (label(node), node))
+                out.write(f'\t"{label(node)}" [label="{node}"];\n')
         for clu, nodes in clusters.items():
-            clu_data: Tuple[Union[int, str], str]
+            clu_data: tuple[int | str, str]
             if isinstance(clu, str):
                 clu_data = (clu, clu)
             else:
                 assert clu is not None  # None value has been .pop()ed
                 clu_data = clu
-            out.write("\tsubgraph cluster_%s {\n" % clu_data[0])
-            out.write('\t\tlabel = "%s";\n' % clu_data[1])
+            out.write(f"\tsubgraph cluster_{clu_data[0]} {{\n")
+            out.write(f'\t\tlabel = "{clu_data[1]}";\n')
             for node in nodes:
-                out.write('\t\t"%s" [label="%s"];\n' % (label(node), node))
+                out.write(f'\t\t"{label(node)}" [label="{node}"];\n')
             out.write("\t}\n")
     out.write("}\n")
 

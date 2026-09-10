@@ -1,8 +1,7 @@
 #! /usr/bin/env python
-# -*- coding: utf-8 -*-
 
 # This file is part of IVRE.
-# Copyright 2011 - 2021 Pierre LALET <pierre@droids-corp.org>
+# Copyright 2011 - 2024 Pierre LALET <pierre@droids-corp.org>
 #
 # IVRE is free software: you can redistribute it and/or modify it
 # under the terms of the GNU General Public License as published by
@@ -20,15 +19,11 @@
 
 """This sub-module contains functions used for flow."""
 
-
 import re
-from typing import Dict, List, Generator, Optional, Union
+from collections.abc import Generator
 
-
-from ivre import config
-from ivre import utils
+from ivre import config, utils
 from ivre.types.flow import Clause
-
 
 SCHEMA_VERSION = 1
 
@@ -74,7 +69,7 @@ META_DESC_ARRAYS = ["dns.keys.answers"]
 # field name equals the parsed Zeek file field name.
 # If its associated value is a list, each internal field name equals its
 # corresponding parsed Zeek file field name.
-META_DESC: Dict[str, Dict[str, Union[List[str], Dict[str, Optional[str]]]]] = {
+META_DESC: dict[str, dict[str, list[str] | dict[str, str | None]]] = {
     "arp": {
         "keys": ["op", "mac_src", "mac_dst"],
     },
@@ -178,7 +173,7 @@ META_DESC: Dict[str, Dict[str, Union[List[str], Dict[str, Optional[str]]]]] = {
 
 # Stores available fields
 # Populated by validate_field
-_ALL_FIELDS: Optional[Dict[str, bool]] = None
+_ALL_FIELDS: dict[str, bool] | None = None
 
 
 def validate_field(field: str) -> None:
@@ -193,8 +188,7 @@ def validate_field(field: str) -> None:
     assert _ALL_FIELDS is not None
     if field not in _ALL_FIELDS:
         raise ValueError(
-            "%s is not a valid field. Use --fields to get "
-            "the list of available fields." % field
+            f"{field} is not a valid field. Use --fields to get the list of available fields."
         )
     if not _ALL_FIELDS[field]:
         utils.LOGGER.warning(
@@ -217,11 +211,11 @@ def _compute_available_fields() -> None:
         _ALL_FIELDS[field] = True
     meta_enabled = config.FLOW_STORE_METADATA
     for proto, configs in META_DESC.items():
-        _ALL_FIELDS["meta.%s" % proto] = meta_enabled
+        _ALL_FIELDS[f"meta.{proto}"] = meta_enabled
         for name in configs["keys"]:
-            _ALL_FIELDS["meta.%s.%s" % (proto, name)] = meta_enabled
+            _ALL_FIELDS[f"meta.{proto}.{name}"] = meta_enabled
         for name in configs.get("counters", []):
-            _ALL_FIELDS["meta.%s.%s" % (proto, name)] = meta_enabled
+            _ALL_FIELDS[f"meta.{proto}.{name}"] = meta_enabled
 
 
 class Query:
@@ -233,11 +227,11 @@ class Query:
     # Used to split filter in tokens (attributes, operators, values)
     # Example: '"test" test' is divided in 2 groups "test" and test
     splitter_re = re.compile('(?:[^\\s"]|"(?:\\\\.|[^"])*")+')
-    clauses: List[List[Clause]] = []
+    clauses: list[list[Clause]] = []
 
     @classmethod
     def _split_filter_or(cls, flt: str) -> Generator[str, None, None]:
-        current: List[str] = []
+        current: list[str] = []
         for subflt in cls.splitter_re.finditer(flt):
             subflt_str = subflt.group()
             if cls.or_re.search(subflt_str):
@@ -247,7 +241,7 @@ class Query:
                 current.append(subflt_str)
         yield " ".join(current)
 
-    def _add_clause_from_filter(self, flt: str) -> Optional[Clause]:
+    def _add_clause_from_filter(self, flt: str) -> Clause | None:
         """
         Returns a clause object computed from the given filter
         flt format is
@@ -271,7 +265,7 @@ class Query:
             flt = flt[1:]
         array_modes = ["ANY", "ALL", "ONE", "NONE"]
         for array_mode in array_modes:
-            if flt.startswith(array_mode + " "):
+            if flt.startswith(f"{array_mode} "):
                 clause["array_mode"] = array_mode
                 flt = flt[len(array_mode) + 1 :]
                 break
@@ -294,7 +288,7 @@ class Query:
             validate_field(attr)
         return clause
 
-    def add_clause_from_filter(self, flt: str, mode: str = "node") -> None:
+    def add_clause_from_filter(self, flt: str) -> None:
         """
         Returns an array representing "AND" clauses, each
         clauses being an array of "OR" clauses
@@ -309,7 +303,7 @@ class Query:
                     clauses.append(subclause)
         return self.add_clause(clauses)
 
-    def add_clause(self, clauses: List[Clause]) -> None:
+    def add_clause(self, clauses: list[Clause]) -> None:
         self.clauses.append(clauses)
 
     def __init__(self) -> None:

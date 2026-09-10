@@ -1,7 +1,7 @@
 #! /usr/bin/env python
 
 # This file is part of IVRE.
-# Copyright 2011 - 2021 Pierre LALET <pierre@droids-corp.org>
+# Copyright 2011 - 2024 Pierre LALET <pierre@droids-corp.org>
 #
 # IVRE is free software: you can redistribute it and/or modify it
 # under the terms of the GNU General Public License as published by
@@ -19,23 +19,19 @@
 
 import argparse
 import math
-from typing import List, Optional, Tuple
-
 
 import matplotlib  # type: ignore
 import matplotlib.pyplot  # type: ignore
 
 # from mpl_toolkits.mplot3d import Axes3D
 # pylint: disable=unused-import
-from mpl_toolkits.mplot3d import axes3d, Axes3D  # type: ignore # noqa: F401
+from mpl_toolkits.mplot3d import Axes3D, axes3d  # type: ignore # noqa: F401
 
-
-from ivre import db
+from ivre import db, utils
 from ivre.types import Filter, Record
-from ivre import utils
 
 
-def graphhost(host: Record) -> Tuple[List[int], List[int]]:
+def graphhost(host: Record) -> tuple[list[int], list[int]]:
     if "ports" not in host:
         return [], []
     hh, pp = [], []
@@ -47,7 +43,7 @@ def graphhost(host: Record) -> Tuple[List[int], List[int]]:
     return hh, pp
 
 
-def getgraph(flt: Filter = db.db.view.flt_empty) -> Tuple[List[int], List[int]]:
+def getgraph(flt: Filter = db.db.view.flt_empty) -> tuple[list[int], list[int]]:
     h, p = [], []
     allhosts = db.db.view.get(flt)
     for ap in allhosts:
@@ -58,7 +54,7 @@ def getgraph(flt: Filter = db.db.view.flt_empty) -> Tuple[List[int], List[int]]:
 
 
 def graph3d(
-    mainflt: Filter = db.db.view.flt_empty, alertflt: Optional[Filter] = None
+    mainflt: Filter = db.db.view.flt_empty, alertflt: Filter | None = None
 ) -> None:
     h, p = getgraph(flt=mainflt)
     fig = matplotlib.pyplot.figure()
@@ -86,7 +82,7 @@ def graph3d(
 
 
 def graph2d(
-    mainflt: Filter = db.db.view.flt_empty, alertflt: Optional[Filter] = None
+    mainflt: Filter = db.db.view.flt_empty, alertflt: Filter | None = None
 ) -> None:
     h, p = getgraph(flt=mainflt)
     fig = matplotlib.pyplot.figure()
@@ -99,7 +95,8 @@ def graph2d(
     matplotlib.pyplot.show()
 
 
-def main() -> None:
+def build_parser() -> argparse.ArgumentParser:
+    """Build the argument parser for this tool."""
     parser = argparse.ArgumentParser(
         description="Plot scan results.",
         parents=[db.db.view.argparser],
@@ -121,5 +118,9 @@ def main() -> None:
         dest="alertflt",
         const=db.db.view.searchnfs(),
     )
-    args = parser.parse_args()
+    return parser
+
+
+def main() -> None:
+    args = build_parser().parse_args()
     args.graph(mainflt=db.db.view.parse_args(args), alertflt=args.alertflt)

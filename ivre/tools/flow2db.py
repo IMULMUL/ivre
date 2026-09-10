@@ -18,18 +18,15 @@
 
 """Update the flow database from log files"""
 
-
 from argparse import ArgumentParser
 
-
-from ivre import config
-from ivre import utils
+from ivre import config, utils
 from ivre.db import db
 
 # from ivre.parser.airodump import Airodump
 from ivre.parser.argus import Argus
-from ivre.parser.netflow import NetFlow
 from ivre.parser.iptables import Iptables
+from ivre.parser.netflow import NetFlow
 
 PARSERS_CHOICE = {
     # 'airodump': Airodump,
@@ -47,8 +44,8 @@ PARSERS_MAGIC = {
 }
 
 
-def main() -> None:
-    """Update the flow database from log files"""
+def build_parser() -> ArgumentParser:
+    """Build the argument parser for this tool."""
     parser = ArgumentParser(description=__doc__)
     parser.add_argument(
         "files", nargs="*", metavar="FILE", help="Files to import in the flow database"
@@ -61,7 +58,12 @@ def main() -> None:
     parser.add_argument(
         "-C", "--no-cleanup", help="avoid port cleanup heuristics", action="store_true"
     )
-    args = parser.parse_args()
+    return parser
+
+
+def main() -> None:
+    """Update the flow database from log files"""
+    args = build_parser().parse_args()
 
     if args.verbose:
         config.DEBUG = True

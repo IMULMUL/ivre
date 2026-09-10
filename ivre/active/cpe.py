@@ -1,7 +1,7 @@
 #! /usr/bin/env python
 
 # This file is part of IVRE.
-# Copyright 2011 - 2021 Pierre LALET <pierre@droids-corp.org>
+# Copyright 2011 - 2024 Pierre LALET <pierre@droids-corp.org>
 #
 # IVRE is free software: you can redistribute it and/or modify it
 # under the terms of the GNU General Public License as published by
@@ -21,33 +21,33 @@ documents from the active (nmap & view) purposes.
 
 """
 
+from typing import Any
 
-from typing import Any, Dict, List
-
-
-from ivre.utils import LOGGER
 from ivre.types import CpeDict
+from ivre.utils import LOGGER
 
 
 def cpe2dict(cpe_str: str) -> CpeDict:
-    """Helper function to parse CPEs. This is a very partial/simple parser.
+    """Helper function to parse CPEs. Supports both 2.2 (`cpe:/...`) and
+    2.3 (`cpe:2.3:...`) formats. This is a very partial/simple parser.
 
     Raises:
         ValueError if the cpe string is not parsable.
 
     """
-    # Remove prefix
-    if not cpe_str.startswith("cpe:/"):
-        raise ValueError("invalid cpe format (%s)\n" % cpe_str)
-    cpe_body = cpe_str[5:]
+    if cpe_str.startswith("cpe:2.3:"):
+        cpe_body = cpe_str[8:]
+    elif cpe_str.startswith("cpe:/"):
+        cpe_body = cpe_str[5:]
+    else:
+        raise ValueError(f"invalid cpe format ({cpe_str})\n")
+    # Keep anything after the version field grouped together to avoid losing
+    # update/edition components present in 2.2/2.3 strings.
     parts = cpe_body.split(":", 3)
-    nparts = len(parts)
-    if nparts < 2:
-        raise ValueError("invalid cpe format (%s)\n" % cpe_str)
-    cpe_type = parts[0]
-    cpe_vend = parts[1]
-    cpe_prod = parts[2] if nparts > 2 else ""
-    cpe_vers = parts[3] if nparts > 3 else ""
+    if len(parts) < 2:
+        raise ValueError(f"invalid cpe format ({cpe_str})\n")
+    parts += [""] * (4 - len(parts))
+    cpe_type, cpe_vend, cpe_prod, cpe_vers = parts[:4]
 
     ret: CpeDict = {
         "type": cpe_type,
@@ -58,7 +58,7 @@ def cpe2dict(cpe_str: str) -> CpeDict:
     return ret
 
 
-def add_cpe_values(hostrec: Dict[str, Any], path: str, cpe_values: List[str]) -> None:
+def add_cpe_values(hostrec: dict[str, Any], path: str, cpe_values: list[str]) -> None:
     """Add CPE values (`cpe_values`) to the `hostrec` at the given `path`.
 
     CPEs are indexed in a dictionary to agglomerate origins, but this dict

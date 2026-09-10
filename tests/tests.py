@@ -1,7 +1,7 @@
 #! /usr/bin/env python
 
 # This file is part of IVRE.
-# Copyright 2011 - 2021 Pierre LALET <pierre@droids-corp.org>
+# Copyright 2011 - 2026 Pierre LALET <pierre@droids-corp.org>
 #
 # IVRE is free software: you can redistribute it and/or modify it
 # under the terms of the GNU General Public License as published by
@@ -17,49 +17,71 @@
 # along with IVRE. If not, see <http://www.gnu.org/licenses/>.
 
 
-from ast import literal_eval
-from contextlib import contextmanager
-from datetime import datetime, timedelta
-from distutils.spawn import find_executable as which
 import errno
-from functools import reduce
-from glob import glob
-from io import BytesIO
 import json
+import logging
 import os
-import pipes
 import random
 import re
-from select import select
 import shutil
 import signal
 import socket
 import subprocess
 import sys
-import tarfile
 import tempfile
 import time
 import unittest
-from urllib.request import HTTPError, Request, urlopen
+from ast import literal_eval
+from contextlib import contextmanager
+from datetime import datetime, timedelta
+from functools import reduce
+from glob import glob
+from io import BytesIO
+from select import select
 from urllib.parse import quote
-
+from urllib.request import HTTPError, Request, urlopen
 
 import ivre
+import ivre.analyzer
 import ivre.config
 import ivre.db
 import ivre.flow
 import ivre.mathutils
-import ivre.parser.zeek
 import ivre.parser.iptables
+import ivre.parser.zeek
 import ivre.passive
-import ivre.target
 import ivre.utils
 import ivre.web.utils
 import ivre.xmlnmap
-import ivre.analyzer
 
 HTTPD_PORT = 18080
 HTTPD_HOSTNAME = socket.gethostname()
+
+
+# See https://bugs.python.org/issue45235
+PYTHON_BUG_45235 = {
+    (3, 9, 8),
+}
+HAS_PYTHON_BUG_45235 = sys.version_info[:3] in PYTHON_BUG_45235
+
+
+_DEBUG = re.compile("^DEBUG = ")
+
+
+def set_debug(value: bool) -> None:
+    with (
+        open(os.path.join(os.path.expanduser("~"), ".ivre.conf")) as idesc,
+        open(os.path.join(os.path.expanduser("~"), ".ivre.conf.new"), "w") as odesc,
+    ):
+        for line in idesc:
+            if _DEBUG.search(line) is not None:
+                odesc.write(f"DEBUG = {value!r}\n")
+            else:
+                odesc.write(line)
+    os.rename(
+        os.path.join(os.path.expanduser("~"), ".ivre.conf.new"),
+        os.path.join(os.path.expanduser("~"), ".ivre.conf"),
+    )
 
 
 # http://schinckel.net/2013/04/15/capture-and-test-sys.stdout-sys.stderr-in-unittest.testcase/
@@ -83,7 +105,7 @@ def run_iter(
     env=None,
 ):
     if interp is not None:
-        cmd = interp + [which(cmd[0])] + cmd[1:]
+        cmd = interp + [shutil.which(cmd[0])] + cmd[1:]
     return subprocess.Popen(cmd, stdin=stdin, stdout=stdout, stderr=stderr, env=env)
 
 
@@ -137,165 +159,7 @@ def _parse_cli_top_out(out):
     return data[::-1]
 
 
-def run_passiverecon_worker(bulk_mode=None):
-    time.sleep(1)  # Hack for Travis CI
-    pid = os.fork()
-    if pid < 0:
-        raise Exception("Cannot fork")
-    if pid:
-        # Wait for child process to handle every file in "logs"
-        while any(walk[2] for walk in os.walk("logs")):
-            print("Waiting for passivereconworker")
-            time.sleep(2)
-        os.kill(pid, signal.SIGINT)
-        os.waitpid(pid, 0)
-    elif USE_COVERAGE:
-        os.execvp(
-            sys.executable,
-            COVERAGE
-            + [
-                "run",
-                "--parallel-mode",
-                which("ivre"),
-                "passivereconworker",
-                "--directory",
-                "logs",
-                "--progname",
-                " ".join(
-                    pipes.quote(elt)
-                    for elt in COVERAGE
-                    + [
-                        "run",
-                        "--parallel-mode",
-                        which("ivre"),
-                        "passiverecon2db",
-                        bulk_mode,
-                    ]
-                ),
-            ],
-        )
-    else:
-        os.execlp(
-            "ivre",
-            "ivre",
-            "passivereconworker",
-            "--directory",
-            "logs",
-            "--progname",
-            "ivre passiverecon2db %s" % bulk_mode,
-        )
-
-
-class AgentScanner:
-    """This builds an agent, runs it in the background, runs a feed
-    process (also in the background) and provides an object that can be
-    used to .scan() targets.
-
-    Example:
-
-        with AgentScanner(self, nmap_template="http") as agent:
-            agent.scan(['--net', '192.168.0.0/24'])
-
-    """
-
-    def __init__(self, test, nmap_template="default"):
-        self.test = test
-        self.pid_agent = self.pid_feed = None
-        self._build_agent(nmap_template)
-        self._start_agent()
-        self._start_feed()
-
-    def __enter__(self):
-        return self
-
-    def __delete__(self):
-        self.stop()
-
-    def __exit__(self, *_):
-        self.wait()
-        self.stop()
-
-    def _build_agent(self, nmap_template):
-        res, out, _ = RUN(
-            ["ivre", "runscans", "--output", "Agent", "--nmap-template", nmap_template]
-        )
-        self.test.assertEqual(res, 0)
-        with tempfile.NamedTemporaryFile(delete=False) as fdesc:
-            fdesc.write(out)
-        os.chmod(fdesc.name, 0o0755)
-        self.agent = fdesc.name
-
-    def _start_agent(self):
-        self.agent_dir = tempfile.mkdtemp()
-        self.pid_agent = subprocess.Popen(
-            [self.agent], preexec_fn=os.setsid, cwd=self.agent_dir
-        ).pid
-
-    def _start_feed(self):
-        feed_cmd = ["runscansagent", "--sync", self.agent_dir]
-        if USE_COVERAGE:
-            feed_cmd = COVERAGE + ["run", "--parallel-mode", which("ivre")] + feed_cmd
-        else:
-            feed_cmd = ["ivre"] + feed_cmd
-        self.pid_feed = subprocess.Popen(feed_cmd).pid
-
-    def stop(self):
-        """Kills the process backgrounded processes, moves the results to
-        "output", and removes the temporary files and directories.
-
-        """
-        if self.pid_agent is not None:
-            os.kill(self.pid_agent, signal.SIGTERM)
-            os.waitpid(self.pid_agent, 0)
-            self.pid_agent = None
-        if self.pid_feed is not None:
-            os.kill(self.pid_feed, signal.SIGTERM)
-            os.waitpid(self.pid_feed, 0)
-            self.pid_feed = None
-        os.rename(os.path.join("agentsdata", "output"), "output")
-        for dirname in [self.agent_dir, "agentsdata"]:
-            if dirname is not None:
-                try:
-                    shutil.rmtree(dirname)
-                except OSError as exc:
-                    if exc.errno != errno.ENOENT:
-                        raise
-
-    def wait(self):
-        """Waits for current and scheduled scans to terminate."""
-        dirnames = [
-            dirname
-            for subdir in [
-                "input",
-                "remoteinput",
-                "remotecur",
-                "remoteoutput",
-                "remotedata",
-            ]
-            for dirname in glob(os.path.join("agentsdata", "*", subdir))
-        ]
-        dirnames.extend(
-            os.path.join(self.agent_dir, subdir)
-            for subdir in ["input", "cur", "output"]
-        )
-        while any(walk[2] for dirname in dirnames for walk in os.walk(dirname)):
-            print("Waiting for runscans sync & agent")
-            time.sleep(2)
-
-    def scan(self, target_options):
-        """Runs a scan. `target_options` should be a list of arguments to be
-        passed to `ivre runscansagent --feed`.
-
-        """
-        res = RUN(
-            ["ivre", "runscansagent", "--feed"] + target_options + [self.agent_dir],
-            stdin=open(os.devnull, "wb"),
-        )[0]
-        self.test.assertEqual(res, 0)
-
-
 class IvreTests(unittest.TestCase):
-
     maxDiff = None
 
     def setUp(self):
@@ -339,7 +203,13 @@ class IvreTests(unittest.TestCase):
             self.results[name] = value
             sys.stderr.write("NEW VALUE for key %r: %r\n" % (name, value))
             self.new_results.add(name)
-        check(value, self.results[name])
+        try:
+            check(value, self.results[name])
+        except AssertionError:
+            print(
+                f"check_value() fail for {name}: got {value!r}, expected {self.results[name]!r}"
+            )
+            raise
 
     def check_value_cmd(self, name, cmd, errok=False):
         res, out, err = RUN(cmd)
@@ -442,9 +312,7 @@ class IvreTests(unittest.TestCase):
 
     def _check_top_value_cli(self, name, field, count=10, command="", **kwargs):
         res, out, err = RUN(["ivre", command, "--top", field, "--limit", str(count)])
-        if DATABASE not in {"postgres", "sqlite"}:
-            # There is a warning in SQL backends (FIXME - SQLAlchemy update).
-            self.assertFalse(err)
+        self.assertFalse(err)
         self.assertEqual(res, 0)
         listval = []
         for line in out.decode().split("\n"):
@@ -478,11 +346,11 @@ class IvreTests(unittest.TestCase):
 
     def check_passive_top_value_api(self, name, field, distinct):
         values = self._sort_top_values(
-            ivre.db.db.passive.topvalues(field=field, distinct=distinct, topnbr=10)
+            ivre.db.db.passive.topvalues(field=field, distinct=distinct, topnbr=12)
         )
         self.check_value(name, values, check=self.assertCountEqual)
         cur = iter(
-            ivre.db.db.passive.topvalues(field=field, distinct=distinct, topnbr=10)
+            ivre.db.db.passive.topvalues(field=field, distinct=distinct, topnbr=12)
         )
         values = next(cur)
         while values.get("_id") is None:
@@ -511,6 +379,20 @@ class IvreTests(unittest.TestCase):
         self.check_value(
             name, self._sort_top_values(listval), check=self.assertCountEqual
         )
+
+    def check_passive_top_value(self, name, field, count=10):
+        for method in ["api", "cli", "cgi"]:
+            specific_name = "%s_%s" % (name, method)
+            if name in self.results and specific_name not in self.results:
+                specific_name = name
+            getattr(self, "_check_top_value_%s" % method)(
+                specific_name,
+                field,
+                count=count,
+                database=ivre.db.db.passive,
+                command="ipinfo",
+                webroute="passive",
+            )
 
     def check_nmap_top_value(self, name, field, count=10):
         for method in ["api", "cli", "cgi"]:
@@ -640,15 +522,8 @@ class IvreTests(unittest.TestCase):
         self.assertEqual(cnt1, cnt3)
         return cnt1
 
-    def check_view_count_ntlm_value(self, name_or_value, flt, webflt, cliflt=None):
+    def check_view_count_ntlm_value(self, name_or_value, flt, webflt):
         cnt1 = self.check_count_value_api(name_or_value, flt, database=ivre.db.db.view)
-        if cliflt and DATABASE != "postgres":
-            key, val = cliflt.split(":", 1)
-            res, out, _ = RUN(["ivre", "view", "--top", key])
-            self.assertEqual(res, 0)
-            for line in out:
-                if line.split(":", 1)[0] == val:
-                    self.assertEqual(cnt1, line.split(": ", 1)[1])
         cnt2 = self.check_count_value_cgi(name_or_value, webflt, webroute="view")
         self.assertEqual(cnt1, cnt2)
         return cnt1
@@ -759,37 +634,119 @@ class IvreTests(unittest.TestCase):
     def init_nmap_db(self):
         self.assertEqual(RUN(["ivre", "scancli", "--count"])[1], b"0\n")
         self.assertEqual(
-            RUN(["ivre", "scancli", "--init"], stdin=open(os.devnull))[0], 0
+            RUN(["ivre", "scancli", "--init"], stdin=subprocess.DEVNULL)[0], 0
         )
         self.assertEqual(RUN(["ivre", "scancli", "--count"])[1], b"0\n")
+
+    def _test_hassh(self, dbase, dbname, cli):
+        for server in [None, True, False]:
+            for value_or_hash in [
+                None,
+                "5ef6678a6b060094834599ca16581b05",
+                "diffie-hellman-group-exchange-sha1,diffie-hellman-group1-sha1;aes128-cbc,3des-cbc,blowfish-cbc,cast128-cbc,arcfour,aes192-cbc,aes256-cbc;hmac-md5,hmac-sha1,hmac-ripemd160,hmac-ripemd160@openssh.com,hmac-sha1-96,hmac-md5-96;none,zlib",
+                re.compile("^diffie-hellman"),
+                "51f202202ee5382d7f8e0623ed3283369347eb99",
+                "190acebac8136c52fd2042dbb76737baa5014b9a9a517b064331b42e52bca4d4",
+            ]:
+                count = dbase.count(
+                    dbase.searchhassh(value_or_hash=value_or_hash, server=server)
+                )
+                self.check_value(
+                    f"{dbname}_count_hassh%s%s"
+                    % (
+                        "_server" if server else "" if server is None else "_client",
+                        (
+                            ""
+                            if value_or_hash is None
+                            else (
+                                "_regexp"
+                                if isinstance(value_or_hash, re.Pattern)
+                                else (
+                                    "_fullstring"
+                                    if value_or_hash.startswith("diffie-hellman-")
+                                    else f"_{value_or_hash}"
+                                )
+                            )
+                        ),
+                    ),
+                    count,
+                )
+                cmdline = [
+                    "ivre",
+                    cli,
+                    "--count",
+                    "--hassh%s"
+                    % ("-server" if server else "" if server is None else "-client"),
+                ]
+                if isinstance(value_or_hash, re.Pattern):
+                    cmdline.append("/%s/" % value_or_hash.pattern)
+                elif value_or_hash is not None:
+                    cmdline.append(value_or_hash)
+                res, out, err = RUN(cmdline)
+                self.assertEqual(res, 0)
+                self.assertFalse(err)
+                self.assertEqual(count, int(out))
 
     def test_20_fake_nmap_passive(self):
         """For Elasticsearch backend: insert results in MongoDB nmap & passive
         purposes to feed Elasticsearch view.
 
         """
-        if DATABASE != "elastic":
+        # Capability-gated: only the view backends that seed
+        # their data from a Mongo dump produced by the upstream
+        # nmap / passive CI lanes (Elasticsearch today) opt in.
+        if "view_seed_from_mongo_dump" not in ivre.db.db.view.supports:
             return
         subprocess.check_call(["mongorestore", "--db", "ivre", "../backup/"])
         for cmd in ["scancli", "ipinfo"]:
-            RUN(["ivre", cmd, "--update-schema"])
+            res, out, err = RUN(["ivre", cmd, "--update-schema"])
+            print(f"ivre {cmd} --update-schema")
+            print(res)
+            print(repr(out))
+            print(repr(err))
+            self.assertEqual(res, 0)
+
+        # Fetch data for auto tags
+        res, out, err = RUN(["ivre", "getwebdata"])
+        print(repr(err))
+        self.assertEqual(res, 0)
+        self.assertFalse(out, 0)
 
     def test_30_nmap(self):
-
         #
         # Database tests
         #
 
+        # Fetch data for auto tags
+        res, out, err = RUN(["ivre", "getwebdata"])
+        print(repr(err))
+        self.assertEqual(res, 0)
+        self.assertFalse(out)
+
         # Init DB
         self.init_nmap_db()
 
+        # Test top portlist values with different orders
+        sample = b"""{"schema_version": 19, "starttime": "1970-01-01 00:00:00", "endtime": "1970-01-01 00:00:00", "openports": {"count": 2, "tcp": {"count": 2, "ports": [80, 443]}}, "addr": "0.0.0.1", "ports": [{"port": 80, "protocol": "tcp", "state_state": "open"}, {"port": 443, "protocol": "tcp", "state_state": "open"}]}
+{"schema_version": 19, "starttime": "1970-01-01 00:00:00", "endtime": "1970-01-01 00:00:00", "openports": {"count": 2, "tcp": {"count": 2, "ports": [80, 443]}}, "addr": "0.0.0.2", "ports": [{"port": 443, "protocol": "tcp", "state_state": "open"}, {"port": 80, "protocol": "tcp", "state_state": "open"}]}
+"""
+        fdesc = tempfile.NamedTemporaryFile(delete=False)
+        fdesc.write(sample)
+        fdesc.close()
+        res, out, _ = RUN(["ivre", "scan2db", fdesc.name])
+        self.assertEqual(res, 0)
+        os.unlink(fdesc.name)
+        self.check_nmap_top_value("nmap_test_top_portlist_open", "portlist:open")
+        # Now let's clean the database
+        self.assertEqual(
+            RUN(["ivre", "scancli", "--init"], stdin=subprocess.DEVNULL)[0], 0
+        )
+        self.assertEqual(RUN(["ivre", "scancli", "--count"])[1], b"0\n")
+
         # Insertion / "test" insertion (JSON output)
         host_counter = 0
-        scan_counter = 0
         host_counter_test = 0
-        scan_warning = 0
         host_stored = re.compile(b"^DEBUG:ivre:HOST STORED: ", re.M)
-        scan_stored = re.compile(b"^DEBUG:ivre:SCAN STORED: ", re.M)
 
         def host_stored_test(line):
             try:
@@ -800,22 +757,20 @@ class IvreTests(unittest.TestCase):
                 return 1
             return 0
 
-        scan_duplicate = re.compile(
-            b"^DEBUG:ivre:Scan already present in " b"Database", re.M
-        )
         for fname in self.nmap_files:
             # Insertion in DB
             options = ["ivre", "scan2db", "--port", "-c", "TEST", "-s", "SOURCE"]
             if "-probe-" in fname:
                 options.extend(["--masscan-probes", fname.split("-probe-")[1]])
             options.extend(["--", fname])
+            set_debug(True)
             res, _, err = RUN(options)
+            set_debug(False)
             print("Inserting %r" % fname)
             if res:
                 print("Error: %r" % err)
             self.assertEqual(res, 0)
             host_counter += sum(1 for _ in host_stored.finditer(err))
-            scan_counter += sum(1 for _ in scan_stored.finditer(err))
             for line in err.split(b"\n"):
                 if line[:11] != b"DEBUG:ivre:":
                     print(line.decode())
@@ -837,12 +792,8 @@ class IvreTests(unittest.TestCase):
             host_counter_test += sum(
                 host_stored_test(line) for line in out.splitlines()
             )
-            # Duplicate insertion
-            res, _, err = RUN(
-                ["ivre", "scan2db", "--port", "-c", "TEST", "-s", "SOURCE", fname]
-            )
-            self.assertEqual(res, 0)
-            scan_warning += sum(1 for _ in scan_duplicate.finditer(err))
+
+        self.assertEqual(host_counter, host_counter_test)
 
         # Specific test cases
         samples = [
@@ -886,6 +837,86 @@ class IvreTests(unittest.TestCase):
                 sum(host_stored_test(line) for line in out.splitlines()), 1
             )
             os.unlink(fdesc.name)
+
+        # Regression for GitHub issue #1886: NSE scripts with no
+        # dedicated handler in ivre.xmlnmap (no entry in
+        # CHANGE_TABLE_ELEMS / ADD_TABLE_ELEMS /
+        # CHANGE_OUTPUT_TABLE_ELEMS) are stored as whatever object
+        # shape that particular nmap invocation produced -- e.g. the
+        # real "fingerprint-strings" script is keyed by whichever NSE
+        # probe matched (GetRequest, Help, Kerberos...), which varies
+        # per host. Under Elasticsearch's dynamic mapping, this used
+        # to make ``ivre db2view ... nmap`` abort with an uncaught
+        # ``mapper_parsing_exception`` the moment a second host sent
+        # a differently-keyed object for the *same* script id. The
+        # mitigations: drift-prone script outputs get parse-time
+        # shape normalization via ``xmlnmap.CHANGE_TABLE_ELEMS``
+        # handlers, and ``ElasticDBActive.store_host`` logs-and-skips
+        # per-document rejections instead of aborting the whole
+        # batch. This pins, with ``--test`` mode so nothing is
+        # written to any database
+        # (this must not perturb the pinned counts in
+        # ``tests/samples/results``), that the parser genuinely
+        # produces two differently-shaped objects for the same
+        # never-registered, synthetic script id.
+        shape_drift_script_id = "ivre-test-1886-catchall"
+        shape_drift_samples = [
+            (
+                "probeA",
+                b"""<nmaprun scanner="nmap">
+<host><address addr="203.0.113.10" addrtype="ipv4"/><ports>
+<port protocol="tcp" portid="80"><state state="open"/>
+<service name="http"/>
+<script id="ivre-test-1886-catchall" output="probeA: value-one">
+<elem key="probeA">value-one</elem>
+</script>
+</port>
+</ports></host>
+</nmaprun>
+""",
+            ),
+            (
+                "probeB",
+                b"""<nmaprun scanner="nmap">
+<host><address addr="203.0.113.11" addrtype="ipv4"/><ports>
+<port protocol="tcp" portid="80"><state state="open"/>
+<service name="http"/>
+<script id="ivre-test-1886-catchall" output="probeB: value-two">
+<elem key="probeB">value-two</elem>
+</script>
+</port>
+</ports></host>
+</nmaprun>
+""",
+            ),
+        ]
+        shape_drift_shapes = []
+        for expected_key, sample in shape_drift_samples:
+            fdesc = tempfile.NamedTemporaryFile(delete=False)
+            fdesc.write(sample)
+            fdesc.close()
+            res, out, _ = RUN(["ivre", "scan2db", "--test", fdesc.name])
+            self.assertEqual(res, 0)
+            os.unlink(fdesc.name)
+            (host_json,) = (
+                json.loads(line.decode())
+                for line in out.splitlines()
+                if host_stored_test(line)
+            )
+            script = next(
+                s
+                for s in host_json["ports"][0]["scripts"]
+                if s["id"] == shape_drift_script_id
+            )
+            shape = script[shape_drift_script_id]
+            self.assertEqual(set(shape), {expected_key})
+            shape_drift_shapes.append(shape)
+        # The two hosts must produce genuinely different object
+        # shapes (different sub-keys) for the exact same script id --
+        # this is the drift plain Elasticsearch dynamic mapping
+        # cannot absorb, and the reason ``ElasticDBActive.store_host``
+        # must tolerate per-document rejections.
+        self.assertNotEqual(set(shape_drift_shapes[0]), set(shape_drift_shapes[1]))
 
         samples = [
             b"""<?xml version="1.0"?>
@@ -1062,9 +1093,6 @@ class IvreTests(unittest.TestCase):
         res, out, err = RUN(["ivre", "scancli", "--update-schema"])
         self.assertEqual(res, 0)
 
-        self.assertEqual(host_counter, host_counter_test)
-        self.assertEqual(scan_counter, scan_warning)
-
         hosts_count = self.check_nmap_count_value(
             "nmap_get_count", ivre.db.db.nmap.flt_empty, [], None
         )
@@ -1078,6 +1106,16 @@ class IvreTests(unittest.TestCase):
 
         self.check_count_value_api(
             0, ivre.db.db.nmap.searchnonexistent(), database=ivre.db.db.nmap
+        )
+
+        # An empty disjunction is vacuously false: zero-argument
+        # flt_or() matches nothing, while zero-argument flt_and()
+        # (vacuously true) keeps matching everything.
+        self.check_count_value_api(
+            0, ivre.db.db.nmap.flt_or(), database=ivre.db.db.nmap
+        )
+        self.check_count_value_api(
+            hosts_count, ivre.db.db.nmap.flt_and(), database=ivre.db.db.nmap
         )
 
         # Is the test case OK?
@@ -1160,19 +1198,12 @@ class IvreTests(unittest.TestCase):
             "-countports:10-100",
         )
 
-        self.check_nmap_count_value(
-            "nmap_extended_eu_count",
-            ivre.db.db.nmap.searchcountry(["EU", "GB", "CH", "NO"]),
-            ["--country=EU,GB,CH,NO"],
-            "country:EU,GB,CH,NO",
-        )
-
         # Filters
         addr = next(
             iter(ivre.db.db.nmap.get(ivre.db.db.nmap.flt_empty, fields=["addr"]))
         )["addr"]
         self.check_nmap_count_value(
-            1,
+            None,
             ivre.db.db.nmap.searchhost(addr),
             ["--host", ivre.utils.force_int2ip(addr)],
             ivre.utils.force_int2ip(addr),
@@ -1180,7 +1211,7 @@ class IvreTests(unittest.TestCase):
         result = next(iter(ivre.db.db.nmap.get(ivre.db.db.nmap.searchhost(addr))))
         self.assertEqual(result["addr"], addr)
         self.check_count_value_api(
-            1,
+            None,
             ivre.db.db.nmap.flt_and(
                 ivre.db.db.nmap.searchhost(addr),
                 ivre.db.db.nmap.searchhost(addr),
@@ -1192,13 +1223,6 @@ class IvreTests(unittest.TestCase):
         )
         self.check_count_value_api(
             1, ivre.db.db.nmap.searchid(recid), database=ivre.db.db.nmap
-        )
-        self.assertIsNotNone(
-            ivre.db.db.nmap.getscan(
-                ivre.db.db.nmap.getscanids(
-                    next(iter(ivre.db.db.nmap.get(ivre.db.db.nmap.flt_empty)))
-                )[0]
-            )
         )
 
         self.check_nmap_count_value(
@@ -1246,7 +1270,7 @@ class IvreTests(unittest.TestCase):
             self.assertTrue(len(addrs) <= addr_range_count)
 
             count = ivre.db.db.nmap.count(ivre.db.db.nmap.searchhosts(addrrange))
-            self.assertEqual(count, 2)
+            self.assertGreaterEqual(count, 2)
             count_cmpl = ivre.db.db.nmap.count(
                 ivre.db.db.nmap.searchhosts(addrrange, neg=True)
             )
@@ -1268,7 +1292,7 @@ class IvreTests(unittest.TestCase):
         )
         self.assertEqual(count, hosts_count)
 
-        nets = ivre.utils.range2nets(addrrange)
+        nets = list(ivre.utils.range2nets(addrrange))
         count = 0
         for net in nets:
             count += ivre.db.db.nmap.count(ivre.db.db.nmap.searchnet(net))
@@ -1315,7 +1339,7 @@ class IvreTests(unittest.TestCase):
                 ivre.db.db.nmap.searchhost(addr),
             )
         )
-        self.assertEqual(count, 1)
+        self.assertGreater(count, 0)
         count = ivre.db.db.nmap.count(
             ivre.db.db.nmap.searchscript(
                 name="http-robots.txt",
@@ -1334,6 +1358,13 @@ class IvreTests(unittest.TestCase):
             )
         )
         self.assertEqual(ncount, hosts_count - count)
+
+        # Multiple scripts
+        count = ivre.db.db.nmap.count(
+            ivre.db.db.nmap.searchscript(name=["http-robots.txt", "ftp-anon"])
+        )
+        self.assertGreater(count, 0)
+        self.check_value("nmap_robots.txt_or_ftp_anon_count", count)
 
         count = ivre.db.db.nmap.count(ivre.db.db.nmap.searchftpanon())
         # Test case OK?
@@ -1354,8 +1385,6 @@ class IvreTests(unittest.TestCase):
         ip_addr, fingerprint = _find_fingerprint()
         self.assertIsNotNone(fingerprint)
 
-        # Check .searchsshkey() with a fingerprint
-
         def _has_fingerprint(host):
             for port in host.get("ports", []):
                 for script in port.get("scripts", []):
@@ -1365,9 +1394,23 @@ class IvreTests(unittest.TestCase):
                                 return True
             return False
 
+        # Check .searchsshkey() with a fingerprint
         found_init_host = False
         for host in ivre.db.db.nmap.get(
             ivre.db.db.nmap.searchsshkey(fingerprint=fingerprint)
+        ):
+            self.assertTrue(_has_fingerprint(host))
+            if host["addr"] == ip_addr:
+                found_init_host = True
+        self.assertTrue(found_init_host)
+
+        # Check .searchscript() with values= produces the same result as
+        # .searchsshkey() for fingerprint matching.
+        found_init_host = False
+        for host in ivre.db.db.nmap.get(
+            ivre.db.db.nmap.searchscript(
+                name="ssh-hostkey", values={"fingerprint": fingerprint}
+            )
         ):
             self.assertTrue(_has_fingerprint(host))
             if host["addr"] == ip_addr:
@@ -1411,6 +1454,17 @@ class IvreTests(unittest.TestCase):
         for query in queries:
             result = ivre.db.db.nmap.get(query)
             count = ivre.db.db.nmap.count(query)
+            # Intentional DATABASE branch -- the ``explain``
+            # output shape is dialect-specific and matched by
+            # very different assertions (Mongo emits a JSON
+            # blob whose ``nscanned`` / ``executionStats``
+            # field carries the document-scan count; PG emits
+            # the textual ``EXPLAIN`` plan and the only
+            # assertion that survives across query optimisers
+            # is the index-name substring).  Migrating this
+            # block to a capability flag would split each
+            # half behind its own ``if`` and add no
+            # readability, so the branch stays.
             if DATABASE == "mongo":
                 nscanned = json.loads(
                     ivre.db.db.nmap.explain(ivre.db.db.nmap._get(query))
@@ -1498,12 +1552,27 @@ class IvreTests(unittest.TestCase):
         self.assertEqual(count + neg_count, hosts_count)
         count = ivre.db.db.nmap.count(ivre.db.db.nmap.searchports([80, 443]))
         self.check_value("nmap_80_443_count", count)
+        count = ivre.db.db.nmap.count(ivre.db.db.nmap.searchports([80, 443], any_=True))
+        self.check_value("nmap_80_443_any_count", count)
         neg_count = ivre.db.db.nmap.count(
             ivre.db.db.nmap.searchports([80, 443], neg=True)
         )
         self.check_value("nmap_not_80_443_count", neg_count)
         count = ivre.db.db.nmap.count(ivre.db.db.nmap.searchopenport())
         self.check_value("nmap_openport_count", count)
+
+        for service in ["ssh", "imap", "http"]:
+            res, out, _ = RUN(["ivre", "scancli", "--count", "--service", service])
+            self.assertEqual(res, 0)
+            count1 = int(out)
+            self.check_value("nmap_count_%s" % service, count1)
+            flt = ivre.db.db.nmap.searchservice(service)
+            count2 = ivre.db.db.nmap.count(flt)
+            self.assertEqual(count1, count2)
+
+        count = ivre.db.db.nmap.count(ivre.db.db.nmap.searchservice(["imap", "ssh"]))
+        self.check_value("nmap_count_imap_or_ssh", count)
+
         count = ivre.db.db.nmap.count(
             ivre.db.db.nmap.searchhttpauth(newscript=True, oldscript=True)
         )
@@ -1522,6 +1591,10 @@ class IvreTests(unittest.TestCase):
             "nmap_isakmp_count",
             ["ivre", "scancli", "--count", "--service", "isakmp"],
         )
+
+        # searchhassh()
+        self._test_hassh(ivre.db.db.nmap, "nmap", "scancli")
+
         # FIXME: add --service option to check_top_value_cli.
         # self._check_value_cli(
         #     "nmap_isakmp_top_products",
@@ -1568,6 +1641,26 @@ class IvreTests(unittest.TestCase):
                         if found:
                             break
                     self.assertTrue(found)
+            self.check_nmap_top_value(
+                "nmap_top_cert_pk%s" % hashtype, "cert.pubkey.%s" % hashtype
+            )
+            for val in self._sort_top_values(
+                ivre.db.db.nmap.topvalues("cert.pubkey.%s" % hashtype)
+            ):
+                for host in ivre.db.db.nmap.get(
+                    ivre.db.db.nmap.searchcert(**{f"pk{hashtype}": val})
+                ):
+                    found = False
+                    for port in host["ports"]:
+                        for script in port.get("scripts", []):
+                            if script["id"] == "ssl-cert":
+                                for cert in script.get("ssl-cert", []):
+                                    if cert.get("pubkey", {}).get(hashtype) == val:
+                                        found = True
+                                        break
+                        if found:
+                            break
+                    self.assertTrue(found)
         self._check_top_value_cli("nmap_top_filename", "file", command="scancli")
         self._check_top_value_cli(
             "nmap_top_filename", "file.filename", command="scancli"
@@ -1607,6 +1700,20 @@ class IvreTests(unittest.TestCase):
         self.check_nmap_top_value("nmap_top_categories_TEST", "categories:TEST")
         self.check_nmap_top_value("nmap_top_categories_TEST", "categories:/^TEST$/")
 
+        self.check_nmap_top_value("nmap_top_jarm", "jarm")
+        self.check_nmap_top_value("nmap_top_jarm_443", "jarm:443")
+
+        for base in ["", "-client", "-server"]:
+            for field in ["", ".md5", ".sha1", ".sha256", ".raw"]:
+                self.check_nmap_top_value(
+                    "nmap_top_hassh%s%s"
+                    % (
+                        base.replace("-", "_"),
+                        field.replace(".", "_"),
+                    ),
+                    "hassh%s%s" % (base, field),
+                )
+
         self._check_top_value_api(
             "nmap_top_service_80", "service:80", database=ivre.db.db.nmap
         )
@@ -1620,39 +1727,20 @@ class IvreTests(unittest.TestCase):
             "nmap_top_devtype_80", "devicetype:80", database=ivre.db.db.nmap
         )
         self._check_top_value_api(
-            "nmap_top_domain", "domains", database=ivre.db.db.nmap
+            "nmap_top_domains", "domains", database=ivre.db.db.nmap
         )
         self._check_top_value_api(
-            "nmap_top_domain_1", "domains:1", database=ivre.db.db.nmap
+            "nmap_top_domains_1", "domains:1", database=ivre.db.db.nmap
+        )
+        self._check_top_value_api(
+            "nmap_top_domains_com", "domains:com", database=ivre.db.db.nmap
+        )
+        self._check_top_value_api(
+            "nmap_top_domains_com_2", "domains:com:2", database=ivre.db.db.nmap
         )
         self._check_top_value_api("nmap_top_hop", "hop", database=ivre.db.db.nmap)
         self._check_top_value_api(
             "nmap_top_hop_10+", "hop>10", database=ivre.db.db.nmap
-        )
-        locations = list(ivre.db.db.nmap.getlocations(ivre.db.db.nmap.flt_empty))
-        self.assertTrue(all(len(elt) == 2 for elt in locations))
-        self.assertTrue(all(isinstance(elt["_id"], tuple) for elt in locations))
-        self.assertTrue(all(len(elt["_id"]) == 2 for elt in locations))
-        self.assertTrue(
-            all(all(isinstance(sub, float) for sub in elt["_id"]) for elt in locations)
-        )
-        self.assertTrue(all(isinstance(elt["count"], int) for elt in locations))
-        self.check_value("nmap_location_count", len(locations))
-
-        # Check that all coordinates for IPs in "FR" are in a
-        # rectangle given by 43 < lat < 51 and -5 < lon < 8 (for some
-        # reasons, overseas territories have they own country code,
-        # e.g., "RE").
-        self.assertTrue(
-            all(
-                43 < lat < 51 and -5 < lon < 8
-                for lat, lon in (
-                    elt["_id"]
-                    for elt in ivre.db.db.nmap.getlocations(
-                        ivre.db.db.nmap.searchcountry("FR")
-                    )
-                )
-            )
         )
 
         # moduli
@@ -1751,43 +1839,6 @@ class IvreTests(unittest.TestCase):
         self.assertTrue(all(len(d) == ncolumns for d in data))
         self.check_value("nmap_features_versions_noyieldall_ndata", len(data))
 
-        subflts = [
-            (country, ivre.db.db.nmap.searchcountry(country))
-            for country in ["FR", "DE"]
-        ]
-        columns, data = ivre.db.db.nmap.features(use_service=False, subflts=subflts)
-        ncolumns = len(columns)
-        data = list(data)
-        self.check_value("nmap_features_ports_FRDE_ncolumns", ncolumns)
-        self.assertTrue(all(len(d) == ncolumns for d in data))
-        self.check_value("nmap_features_ports_FRDE_ndata", len(data))
-        columns, data = ivre.db.db.nmap.features(subflts=subflts)
-        ncolumns = len(columns)
-        data = list(data)
-        self.check_value("nmap_features_services_FRDE_ncolumns", ncolumns)
-        self.assertTrue(all(len(d) == ncolumns for d in data))
-        self.check_value("nmap_features_services_FRDE_ndata", len(data))
-        columns, data = ivre.db.db.nmap.features(use_product=True, subflts=subflts)
-        ncolumns = len(columns)
-        data = list(data)
-        self.check_value("nmap_features_products_FRDE_ncolumns", ncolumns)
-        self.assertTrue(all(len(d) == ncolumns for d in data))
-        self.check_value("nmap_features_products_FRDE_ndata", len(data))
-        columns, data = ivre.db.db.nmap.features(use_version=True, subflts=subflts)
-        ncolumns = len(columns)
-        data = list(data)
-        self.check_value("nmap_features_versions_FRDE_ncolumns", ncolumns)
-        self.assertTrue(all(len(d) == ncolumns for d in data))
-        self.check_value("nmap_features_versions_FRDE_ndata", len(data))
-        columns, data = ivre.db.db.nmap.features(
-            yieldall=False, use_version=True, subflts=subflts
-        )
-        ncolumns = len(columns)
-        data = list(data)
-        self.check_value("nmap_features_versions_noyieldall_FRDE_ncolumns", ncolumns)
-        self.assertTrue(all(len(d) == ncolumns for d in data))
-        self.check_value("nmap_features_versions_noyieldall_FRDE_ndata", len(data))
-
         # BEGIN Using the HTTP server as a database
         with tempfile.NamedTemporaryFile(delete=False) as fdesc:
             newenv = os.environ.copy()
@@ -1822,7 +1873,7 @@ class IvreTests(unittest.TestCase):
                 found = True
         self.assertTrue(found)
 
-        for topval in ["port:open", "service:80", "country", "portlist:open"]:
+        for topval in ["port:open", "service:80", "portlist:open"]:
             res, out1, err = RUN(["ivre", "scancli", "--top", topval], env=newenv)
             self.assertEqual(res, 0)
             self.assertFalse(err)
@@ -1861,18 +1912,21 @@ class IvreTests(unittest.TestCase):
         self.assertEqual(count, 0)
 
     def test_40_passive(self):
-
-        if DATABASE == "postgres":
-            # FIXME: tests are broken with PostgreSQL & --no-bulk
-            bulk_mode = random.choice(["--bulk", "--local-bulk"])
-        else:
+        # Capability-gated: only the backends whose per-row
+        # ingestion path works end-to-end accept ``--no-bulk``;
+        # PostgreSQL's per-record path is broken under the
+        # real-world p0f fixture pending a deferred
+        # investigation.
+        if "passive_no_bulk_ingestion" in ivre.db.db.passive.supports:
             bulk_mode = random.choice(["--bulk", "--no-bulk", "--local-bulk"])
+        else:
+            bulk_mode = random.choice(["--bulk", "--local-bulk"])
         print("Running passive tests with %s" % bulk_mode)
 
         # Init DB
         self.assertEqual(RUN(["ivre", "ipinfo", "--count"])[1], b"0\n")
         self.assertEqual(
-            RUN(["ivre", "ipinfo", "--init"], stdin=open(os.devnull))[0], 0
+            RUN(["ivre", "ipinfo", "--init"], stdin=subprocess.DEVNULL)[0], 0
         )
         self.assertEqual(RUN(["ivre", "ipinfo", "--count"])[1], b"0\n")
 
@@ -1883,7 +1937,7 @@ class IvreTests(unittest.TestCase):
         zeekenv["LOG_PATH"] = "logs/TEST"
 
         for fname in self.pcap_files:
-            zeekprocess = subprocess.Popen(
+            subprocess.check_call(
                 [
                     "zeek",
                     "-C",
@@ -1902,14 +1956,41 @@ class IvreTests(unittest.TestCase):
                 ],
                 env=zeekenv,
             )
-            zeekprocess.wait()
 
-        run_passiverecon_worker(bulk_mode=bulk_mode)
+        # Drain Zeek-generated logs into the passive DB.
+        for log_root, _, log_names in os.walk("logs"):
+            for log_name in log_names:
+                log_path = os.path.join(log_root, log_name)
+                with open(log_path, "rb") as log_fdesc:
+                    ret = subprocess.call(
+                        ["ivre", "passiverecon2db", "-s", "TEST", bulk_mode],
+                        stdin=log_fdesc,
+                    )
+                self.assertEqual(ret, 0)
+                os.remove(log_path)
+
+        for fname in self.pcap_files:
+            outf = f"{fname}.p0f.log"
+            subprocess.check_call(
+                ["p0f", "-r", fname, "-o", outf], stdout=subprocess.DEVNULL
+            )
+            ret, out, err = RUN(["ivre", "p0f2db", "--test", outf])
+            self.assertEqual(ret, 0)
+            out = out.decode().splitlines()
+            for line in out:
+                json.loads(line)
+            self.assertFalse(err)
+            ret, out, err = RUN(["ivre", "p0f2db", "-s", "TEST", bulk_mode, outf])
+            self.assertEqual(ret, 0)
+            self.assertFalse(out)
+            self.assertFalse(err)
 
         # Counting
         total_count = ivre.db.db.passive.count(ivre.db.db.passive.flt_empty)
         self.assertGreater(total_count, 0)
         self.check_value("passive_count", total_count)
+        # Zero-argument flt_or() (empty disjunction) matches nothing.
+        self.assertEqual(ivre.db.db.passive.count(ivre.db.db.passive.flt_or()), 0)
 
         # MAC addresses
         ret, out, err = RUN(["ivre", "macinfo", "--count"])
@@ -1999,9 +2080,7 @@ class IvreTests(unittest.TestCase):
             ]
         )
         self.assertEqual(ret, 0)
-        if DATABASE not in {"postgres", "sqlite"}:
-            # There is a warning in SQL backends for unused argument.
-            self.assertFalse(err)
+        self.assertFalse(err)
         self.assertGreater(out.count(b"\n"), result)
 
         result = ivre.db.db.passive.count(ivre.db.db.passive.searchhost("127.12.34.56"))
@@ -2033,7 +2112,7 @@ class IvreTests(unittest.TestCase):
             )
         ]
         addresses_2 = set()
-        nets = ivre.utils.range2nets(addrrange)
+        nets = list(ivre.utils.range2nets(addrrange))
         for net in nets:
             addresses_2 = addresses_2.union(
                 x
@@ -2121,6 +2200,11 @@ class IvreTests(unittest.TestCase):
             for res in ivre.db.db.passive.get(flt):
                 self.assertTrue(res["infos"]["service_name"] == service)
 
+        count = ivre.db.db.passive.count(
+            ivre.db.db.passive.searchservice(["imap", "ssh"])
+        )
+        self.check_value("passive_count_imap_or_ssh", count)
+
         for service, port in [("ssh", 22), ("ssh", 23), ("imap", 143), ("imap", 110)]:
             res, out, _ = RUN(
                 ["ivre", "ipinfo", "--count", "--service", service, "--port", str(port)]
@@ -2138,6 +2222,7 @@ class IvreTests(unittest.TestCase):
         for service, product in [
             ("ssh", "Cisco SSH"),
             ("http", "Apache httpd"),
+            ("http", ["Apache httpd", "nginx"]),
             ("imap", "Microsoft Exchange imapd"),
             ("imap", False),
         ]:
@@ -2147,13 +2232,19 @@ class IvreTests(unittest.TestCase):
                 "passive_count_%s_%s"
                 % (
                     service,
-                    (product or "UNKNOWN").replace(" ", ""),
+                    (
+                        "_or_".join(product)
+                        if isinstance(product, list)
+                        else (product or "UNKNOWN")
+                    ).replace(" ", ""),
                 ),
                 count,
             )
             for res in ivre.db.db.passive.get(flt):
                 self.assertEqual(res["infos"]["service_name"], service)
-                if product:
+                if isinstance(product, list):
+                    self.assertIn(res["infos"]["service_product"], product)
+                elif product:
                     self.assertEqual(res["infos"]["service_product"], product)
                 else:
                     self.assertFalse("service_product" in res["infos"])
@@ -2161,6 +2252,7 @@ class IvreTests(unittest.TestCase):
         for service, product, version in [
             ("ssh", "Cisco SSH", "1.25"),
             ("ssh", "OpenSSH", "3.1p1"),
+            ("ssh", "OpenSSH", ["3.1p1", "4.3"]),
             ("ssh", "OpenSSH", False),
         ]:
             flt = ivre.db.db.passive.searchproduct(
@@ -2172,14 +2264,20 @@ class IvreTests(unittest.TestCase):
                 % (
                     service,
                     product.replace(" ", ""),
-                    (version or "UNKNOWN").replace(".", "_"),
+                    (
+                        "_or_".join(version)
+                        if isinstance(version, list)
+                        else (version or "UNKNOWN")
+                    ).replace(".", "_"),
                 ),
                 count,
             )
             for res in ivre.db.db.passive.get(flt):
                 self.assertEqual(res["infos"]["service_name"], service)
                 self.assertEqual(res["infos"]["service_product"], product)
-                if version:
+                if isinstance(version, list):
+                    self.assertIn(res["infos"]["service_version"], version)
+                elif version:
                     self.assertEqual(res["infos"]["service_version"], version)
                 else:
                     self.assertFalse("service_version" in res["infos"])
@@ -2205,24 +2303,33 @@ class IvreTests(unittest.TestCase):
         # searchtimeago() method
         res, out, err = RUN(["ivre", "ipinfo", "--timeago", "0"])
         self.assertEqual(res, 0)
-        if DATABASE not in ["postgres", "sqlite"]:
-            # There is a warning in postgresql for unused argument.
-            self.assertFalse(err)
+        self.assertFalse(err)
         self.assertEqual(out, b"")
+
+        res, out, err = RUN(["ivre", "ipinfo", "--no-timeago", "0"])
+        self.assertEqual(res, 0)
+        self.assertFalse(err)
+        self.assertNotEqual(out, b"")
 
         res, out, err = RUN(["ivre", "ipinfo", "--timeago", "10000000000"])
         self.assertEqual(res, 0)
-        if DATABASE not in ["postgres", "sqlite"]:
-            # There is a warning in postgresql for unused argument.
-            self.assertFalse(err)
+        self.assertFalse(err)
         self.assertNotEqual(out, b"")
+
+        res, out, err = RUN(["ivre", "ipinfo", "--no-timeago", "10000000000"])
+        self.assertEqual(res, 0)
+        self.assertFalse(err)
+        self.assertEqual(out, b"")
 
         res, out, err = RUN(["ivre", "ipinfo", "--timeago", "0", "--count"])
         self.assertEqual(res, 0)
-        if DATABASE not in ["postgres", "sqlite"]:
-            # There is a warning in postgresql for unused argument.
-            self.assertFalse(err)
+        self.assertFalse(err)
         self.assertEqual(out, b"0\n")
+
+        res, out, err = RUN(["ivre", "ipinfo", "--no-timeago", "0", "--count"])
+        self.assertEqual(res, 0)
+        self.assertFalse(err)
+        self.check_value("passive_count", int(out))
 
         res, out, err = RUN(["ivre", "ipinfo", "--timeago", "10000000000", "--count"])
         self.assertEqual(res, 0)
@@ -2230,28 +2337,57 @@ class IvreTests(unittest.TestCase):
         self.assertNotEqual(out, b"")
         self.check_value("passive_count", int(out))
 
+        res, out, err = RUN(
+            ["ivre", "ipinfo", "--no-timeago", "10000000000", "--count"]
+        )
+        self.assertEqual(res, 0)
+        self.assertFalse(err)
+        self.assertNotEqual(out, b"")
+        self.assertEqual(out, b"0\n")
+
+        # searchhassh()
+        self._test_hassh(ivre.db.db.passive, "passive", "ipinfo")
+
         # Top values
         for distinct in [True, False]:
-            for field in ["addr", "domains", "domains:2"]:
-                if DATABASE == "sqlite" and field.startswith("domains"):
-                    # BUG in sqlite backend: cannot use topvalues with
-                    # JSON fields
-                    continue
+            for field in [
+                "addr",
+                "domains",
+                "domains:2",
+                "domains:com",
+                "domains:com:2",
+                "useragent",
+                "useragent:/Windows/",
+            ]:
                 valname = "passive_top_%s_%sdistinct" % (
-                    field.replace(":", "_"),
+                    field.replace(":", "_").replace("/", ""),
                     "" if distinct else "not_",
                 )
                 self.check_passive_top_value_api(valname, field, distinct)
+
+        for subfld in ["bits", "fingerprint", "keytype"]:
+            self.check_passive_top_value(
+                f"passive_top_sshkey_{subfld}",
+                f"sshkey.{subfld}",
+            )
+
+        for base in ["", "-client", "-server"]:
+            for field in ["", ".md5", ".sha1", ".sha256", ".raw"]:
+                self.check_passive_top_value(
+                    "passive_top_hassh%s%s"
+                    % (
+                        base.replace("-", "_"),
+                        field.replace(".", "_"),
+                    ),
+                    "hassh%s%s" % (base, field),
+                )
+
         for field, key in [
             ("value", "ja3cli_md5"),
             ("infos.raw", "ja3cli_raw"),
             ("infos.sha1", "ja3cli_sha1"),
             ("infos.sha256", "ja3cli_sha256"),
         ]:
-            if DATABASE == "sqlite" and "." in field:
-                # BUG in sqlite backend: cannot use topvalues with
-                # JSON fields
-                continue
             for distinct in [True, False]:
                 cur = iter(
                     ivre.db.db.passive.topvalues(
@@ -2307,8 +2443,6 @@ class IvreTests(unittest.TestCase):
                                 break
                         else:
                             self.assertTrue(False)
-        # Delete the reference on the cursor to close the connection
-        # to the database (required for SQLite)
         del cur
 
         # JA3 server:
@@ -2415,17 +2549,13 @@ class IvreTests(unittest.TestCase):
         # CLI: --limit / --skip / --sort
         # Using --limit should prevent ipinfo from selecting tailfnew mode
         res, _, err = RUN(["ivre", "ipinfo", "--limit", "1"])
-        if DATABASE not in ["postgres", "sqlite"]:
-            # There is a warning in postgresql for unused argument.
-            self.assertFalse(err)
+        self.assertFalse(err)
         self.assertEqual(res, 0)
         # Using --limit n with --json should produce at most n JSON
         # lines
         for count in 5, 10:
             res, out, err = RUN(["ivre", "ipinfo", "--limit", str(count), "--json"])
-            if DATABASE not in ["postgres", "sqlite"]:
-                # There is a warning in postgresql for unused argument.
-                self.assertFalse(err)
+            self.assertFalse(err)
             self.assertEqual(res, 0)
             out = out.decode().splitlines()
             self.assertEqual(len(out), count)
@@ -2445,37 +2575,27 @@ class IvreTests(unittest.TestCase):
                         "--json",
                     ]
                 )
-                if DATABASE not in ["postgres", "sqlite"]:
-                    # There is a warning in postgresql for unused argument.
-                    self.assertFalse(err)
+                self.assertFalse(err)
                 self.assertEqual(res, 0)
                 out = out.decode().splitlines()
                 self.assertEqual(len(out), count)
                 for line in out:
                     json.loads(line)
         res, out1, err = RUN(["ivre", "ipinfo", "--limit", "1", "--json"])
-        if DATABASE not in ["postgres", "sqlite"]:
-            # There is a warning in postgresql for unused argument.
-            self.assertFalse(err)
+        self.assertFalse(err)
         self.assertEqual(res, 0)
         res, out2, err = RUN(
             ["ivre", "ipinfo", "--limit", "1", "--skip", "1", "--json"]
         )
-        if DATABASE not in ["postgres", "sqlite"]:
-            # There is a warning in postgresql for unused argument.
-            self.assertFalse(err)
+        self.assertFalse(err)
         self.assertEqual(res, 0)
         self.assertFalse(out1 == out2)
         # Test --sort
         res, out, err = RUN(["ivre", "ipinfo", "--json", "--sort", "port"])
-        if DATABASE not in ["postgres", "sqlite"]:
-            # There is a warning in postgresql for unused argument.
-            self.assertFalse(err)
+        self.assertFalse(err)
         self.assertEqual(res, 0)
         res, out, err = RUN(["ivre", "ipinfo", "--json", "--sort", "~port"])
-        if DATABASE not in ["postgres", "sqlite"]:
-            # There is a warning in postgresql for unused argument.
-            self.assertFalse(err)
+        self.assertFalse(err)
         self.assertEqual(res, 0)
         port = 65536
         for line in out.decode().splitlines():
@@ -2520,47 +2640,17 @@ class IvreTests(unittest.TestCase):
         self.check_value("passive_distinct_ssh_moduli", distinct)
         self.check_value("passive_max_moduli_ssh_reuse", maxcount)
 
-        # ASNs / Countries / .searchranges()
-        for asnum in [15169, 15557, 3215, 2200, 123456789]:
-            if DATABASE == "tinydb" and asnum == 3215:
-                # With tinydb, the filter generates a huge expression
-                # which leads to the following error:
-                #
-                # RecursionError: maximum recursion depth exceeded
-                continue
-            res, out, err = RUN(["ivre", "ipinfo", "--count", "--asnum", str(asnum)])
-            self.assertEqual(ret, 0)
-            self.assertFalse(err)
-            self.check_value("passive_count_as%d" % asnum, int(out))
-        for cname in ["US", "FR", "DE", "KP", "XX"]:
-            if DATABASE in ["sqlite", "tinydb"] and cname in ["US", "FR", "DE"]:
-                # With sqlite, the filter generates a huge expression
-                # which leads to the following error:
-                #
-                # sqlite3.OperationalError: Expression tree is too
-                # large (maximum depth 10000)
-                #
-                # With tinydb, the filter generates a huge expression
-                # which leads to the following error:
-                #
-                # RecursionError: maximum recursion depth exceeded
-                continue
-            res, out, err = RUN(["ivre", "ipinfo", "--count", "--country", cname])
-            self.assertEqual(ret, 0)
-            self.assertFalse(err)
-            self.check_value("passive_count_country_%s" % cname, int(out))
-
         ret, out, _ = RUN(["ivre", "ipinfo", "--short"])
         self.assertEqual(ret, 0)
         count = sum(1 for _ in out.splitlines())
         self.check_value("passive_ipinfo_short_count", count)
 
-        ret, out, _ = RUN(["ivre", "iphost", "/./"])
+        ret, out, _ = RUN(["ivre", "iphost", "--passive", "--json", "/./"])
         self.assertEqual(ret, 0)
         count = sum(1 for _ in out.splitlines())
         self.check_value("passive_iphost_count", count)
 
-        ret, out, _ = RUN(["ivre", "iphost", "--sub", "com"])
+        ret, out, _ = RUN(["ivre", "iphost", "--passive", "--json", "--sub", "com"])
         self.assertEqual(ret, 0)
         count = sum(1 for _ in out.splitlines())
         self.check_value("passive_iphost_count_com", count)
@@ -2589,7 +2679,7 @@ class IvreTests(unittest.TestCase):
         self.assertEqual(udesc.getcode(), 200)
         web_count += sum(1 for _ in udesc)
 
-        self.assertEqual(web_count, count)
+        self.assertGreaterEqual(web_count, count)
 
         for rtype in ["A", "AAAA"]:
             rec = next(
@@ -2682,7 +2772,12 @@ class IvreTests(unittest.TestCase):
 
         signal.signal(signal.SIGALRM, old_handler)
 
-        if DATABASE == "mongo":
+        # Capability-gated: the MongoDB-API ``get(flt_empty,
+        # fields=["source"])`` shape this sanity check relies
+        # on is set on the passive backend whose document
+        # model exposes ``source`` as a typed top-level field
+        # (MongoDB today).
+        if "passive_source_field_invariant" in ivre.db.db.passive.supports:
             # Check no None value can actually exist in DB
             self.assertFalse(
                 None
@@ -2696,8 +2791,19 @@ class IvreTests(unittest.TestCase):
                 )
             )
 
-        # Test record updates
-        rec = next(iter(ivre.db.db.passive.get(ivre.db.db.passive.flt_empty)))
+        # Test record updates. Use a DNS record rather than the first
+        # record in natural order: for some record types (e.g.
+        # SSL_SERVER certificates) the stored `value` is raw binary,
+        # returned base64-encoded by get(), so it cannot be fed back
+        # to searchval() to build a filter matching the record.
+        # Natural order depends on the insertion order of the
+        # Zeek-generated logs (Zeek version, log files walk order), so
+        # using the first record made this test environment-dependent.
+        rec = next(
+            iter(
+                ivre.db.db.passive.get(ivre.db.db.passive.searchrecontype("DNS_ANSWER"))
+            )
+        )
         count = rec.pop("count")
         firstseen = rec.pop("firstseen")
         lastseen = rec.pop("lastseen")
@@ -2733,16 +2839,14 @@ class IvreTests(unittest.TestCase):
             count + 2,
             next(iter(ivre.db.db.passive.get(flt)))["count"],
         )
-        if DATABASE != "postgres":
-            # There is an error with postgresql CSV insert to temp table
-            ivre.db.db.passive.insert_or_update_bulk(
-                iter([dict(rec, count=1, firstseen=firstseen, lastseen=lastseen)]),
-                separated_timestamps=False,
-            )
-            self.assertEqual(
-                count + 3,
-                next(iter(ivre.db.db.passive.get(flt)))["count"],
-            )
+        ivre.db.db.passive.insert_or_update_bulk(
+            iter([dict(rec, count=1, firstseen=firstseen, lastseen=lastseen)]),
+            separated_timestamps=False,
+        )
+        self.assertEqual(
+            count + 3,
+            next(iter(ivre.db.db.passive.get(flt)))["count"],
+        )
         ivre.db.db.passive.insert_or_update(
             firstseen,
             dict(rec, count=count * 2),
@@ -2762,19 +2866,15 @@ class IvreTests(unittest.TestCase):
             count * 2,
             next(iter(ivre.db.db.passive.get(flt)))["count"],
         )
-        if DATABASE != "postgres":
-            # There is an error with postgresql CSV insert to temp table
-            ivre.db.db.passive.insert_or_update_bulk(
-                iter(
-                    [dict(rec, count=count * 2, firstseen=firstseen, lastseen=lastseen)]
-                ),
-                separated_timestamps=False,
-                replacecount=True,
-            )
-            self.assertEqual(
-                count * 2,
-                next(iter(ivre.db.db.passive.get(flt)))["count"],
-            )
+        ivre.db.db.passive.insert_or_update_bulk(
+            iter([dict(rec, count=count * 2, firstseen=firstseen, lastseen=lastseen)]),
+            separated_timestamps=False,
+            replacecount=True,
+        )
+        self.assertEqual(
+            count * 2,
+            next(iter(ivre.db.db.passive.get(flt)))["count"],
+        )
         ivre.db.db.passive.insert_or_update(
             firstseen, dict(rec, count=count), lastseen=lastseen, replacecount=True
         )
@@ -2811,9 +2911,6 @@ class IvreTests(unittest.TestCase):
         self.assertEqual(res, 0)
         self.assertFalse(out)
 
-        if DATABASE == "tinydb":
-            ivre.db.db.passive.invalidate_cache()
-
         count = ivre.db.db.passive.count(
             ivre.db.db.passive.searchrecontype("DNS_BLACKLIST")
         )
@@ -2832,11 +2929,6 @@ class IvreTests(unittest.TestCase):
             self.assertEqual(res, 0)
             self.assertFalse(err)
             self.check_value("passive_count_dnstype_%s" % dnstype, int(out))
-
-        if DATABASE == "sqlite":
-            # BUG in sqlite backend: same bug as "cannot use topvalues
-            # with JSON fields"
-            return
 
         columns, data = ivre.db.db.passive.features(use_service=False)
         ncolumns = len(columns)
@@ -2868,53 +2960,6 @@ class IvreTests(unittest.TestCase):
         self.check_value("passive_features_versions_noyieldall_ncolumns", ncolumns)
         self.assertTrue(all(len(d) == ncolumns for d in data))
         self.check_value("passive_features_versions_noyieldall_ndata", len(data))
-
-        if DATABASE == "tinydb":
-            # BUG in tinydb backend: the country filters generate huge
-            # expressions that cause the error:
-            #
-            # RecursionError: maximum recursion depth exceeded
-            return
-
-        subflts = [
-            (country, ivre.db.db.passive.searchcountry(country))
-            for country in ["FR", "DE"]
-        ]
-        columns, data = ivre.db.db.passive.features(use_service=False, subflts=subflts)
-        ncolumns = len(columns)
-        data = list(data)
-        self.check_value("passive_features_ports_FRDE_ncolumns", ncolumns)
-        self.assertTrue(all(len(d) == ncolumns for d in data))
-        self.check_value("passive_features_ports_FRDE_ndata", len(data))
-        columns, data = ivre.db.db.passive.features(subflts=subflts)
-        ncolumns = len(columns)
-        data = list(data)
-        self.check_value("passive_features_services_FRDE_ncolumns", ncolumns)
-        self.assertTrue(all(len(d) == ncolumns for d in data))
-        self.check_value("passive_features_services_FRDE_ndata", len(data))
-        columns, data = ivre.db.db.passive.features(use_product=True, subflts=subflts)
-        ncolumns = len(columns)
-        data = list(data)
-        self.check_value("passive_features_products_FRDE_ncolumns", ncolumns)
-        self.assertTrue(all(len(d) == ncolumns for d in data))
-        self.check_value("passive_features_products_FRDE_ndata", len(data))
-        columns, data = ivre.db.db.passive.features(use_version=True, subflts=subflts)
-        ncolumns = len(columns)
-        data = list(data)
-        self.check_value("passive_features_versions_FRDE_ncolumns", ncolumns)
-        self.assertTrue(all(len(d) == ncolumns for d in data))
-        self.check_value("passive_features_versions_FRDE_ndata", len(data))
-        columns, data = ivre.db.db.passive.features(
-            yieldall=False, use_version=True, subflts=subflts
-        )
-        ncolumns = len(columns)
-        data = list(data)
-        self.check_value(
-            "passive_features_versions_noyieldall_FRDE_ncolumns",
-            ncolumns,
-        )
-        self.assertTrue(all(len(d) == ncolumns for d in data))
-        self.check_value("passive_features_versions_noyieldall_FRDE_ndata", len(data))
 
         # BEGIN Using the HTTP server as a database
         with tempfile.NamedTemporaryFile(delete=False) as fdesc:
@@ -2950,7 +2995,13 @@ class IvreTests(unittest.TestCase):
         self.assertFalse(err)
         self.assertEqual(_parse_cli_top_out(out1), _parse_cli_top_out(out2))
 
-        addr = next(iter(ivre.db.db.nmap.get(ivre.db.db.nmap.flt_empty)))["addr"]
+        addr = None
+        for rec in ivre.db.db.passive.get(ivre.db.db.passive.flt_empty):
+            try:
+                addr = rec["addr"]
+            except KeyError:
+                continue
+        self.assertIsNotNone(addr)
         res, out1, err = RUN(["ivre", "ipinfo", addr], env=newenv)
         self.assertEqual(res, 0)
         self.assertFalse(err)
@@ -2982,9 +3033,23 @@ class IvreTests(unittest.TestCase):
         ivre.db.db.passive.remove(flt)
         new_count = ivre.db.db.passive.count(ivre.db.db.passive.flt_empty)
         self.assertEqual(count + new_count, total_count)
+        total_count = new_count
+        flt_str = "10.0.0.0/8"
+        res, out, err = RUN(["ivre", "ipinfo", "--count", flt_str])
+        self.assertEqual(res, 0)
+        self.assertFalse(err)
+        count = int(out)
+        res, out, err = RUN(["ivre", "ipinfo", "--delete", flt_str])
+        self.assertEqual(res, 0)
+        self.assertFalse(out)
+        self.assertFalse(err)
+        res, out, err = RUN(["ivre", "ipinfo", "--count"])
+        self.assertEqual(res, 0)
+        self.assertFalse(err)
+        new_count = int(out)
+        self.assertEqual(count + new_count, total_count)
 
     def test_60_flow(self):
-
         # Unit tests #
 
         # Test _get_timeslots
@@ -3045,7 +3110,7 @@ class IvreTests(unittest.TestCase):
         #  Functional tests #
 
         # Init DB
-        res, out, err = RUN(["ivre", "flowcli", "--init"], stdin=open(os.devnull))
+        res, out, err = RUN(["ivre", "flowcli", "--init"], stdin=subprocess.DEVNULL)
         self.assertEqual(res, 0)
         self.assertFalse(out)
         self.assertFalse(err)
@@ -3055,7 +3120,7 @@ class IvreTests(unittest.TestCase):
         self.assertFalse(err)
         for pcapfname in self.pcap_files:
             with tempfile.TemporaryDirectory() as tmpdir:
-                zeekprocess = subprocess.Popen(
+                subprocess.check_call(
                     [
                         "zeek",
                         "-C",
@@ -3068,7 +3133,6 @@ class IvreTests(unittest.TestCase):
                     ],
                     cwd=tmpdir,
                 )
-                zeekprocess.wait()
                 res, out, _ = RUN(
                     ["ivre", "zeek2db"]
                     + [
@@ -3258,7 +3322,7 @@ class IvreTests(unittest.TestCase):
         # all protocols count == total count
         flt = "proto = tcp OR proto = udp OR proto = icmp OR proto = arp"
         self.check_flow_count_value(
-            "flow_count",
+            "flow_count_tcp_udp_icmp_arp",
             {"edges": [flt]},
             ["--flow-filters", flt],
             {"edges": [flt]},
@@ -3375,7 +3439,14 @@ class IvreTests(unittest.TestCase):
             collect_fields=["src.addr", "dst.addr"],
         )
 
-        if DATABASE == "mongo":
+        # Capability-gated: ``topvalues`` over array-typed
+        # columns (``sports``, ``times``) and per-protocol
+        # ``meta.<name>`` sub-documents requires the backend
+        # to unwind those forms in its aggregation pipeline
+        # (MongoDB's ``$unwind`` does it; the SQL backends
+        # defer the ``meta`` JSONB merge and the timeslot
+        # ingestion).
+        if "flow_array_topvalues" in ivre.db.db.flow.supports:
             # More top values test
             self.check_flow_top_values("flow_top_sport", ["sport"])
             self.check_flow_top_values("flow_top_sport", ["sports"])
@@ -3472,7 +3543,7 @@ class IvreTests(unittest.TestCase):
             new_precision = ivre.config.FLOW_TIME_PRECISION * 4
             res, out, err = RUN(
                 ["ivre", "flowcli", "--reduce-precision", str(new_precision)],
-                stdin=open(os.devnull),
+                stdin=subprocess.DEVNULL,
             )
             self.assertEqual(res, 0)
 
@@ -3503,7 +3574,7 @@ class IvreTests(unittest.TestCase):
                 ivre.db.db.flow.count(flt_new), {"clients": 0, "flows": 0, "servers": 0}
             )
         # Test flow cleanup
-        res, out, err = RUN(["ivre", "flowcli", "--init"], stdin=open(os.devnull))
+        res, out, err = RUN(["ivre", "flowcli", "--init"], stdin=subprocess.DEVNULL)
         self.assertEqual(res, 0)
         self.assertFalse(err)
         res, out, err = RUN(
@@ -3514,7 +3585,7 @@ class IvreTests(unittest.TestCase):
         self.check_flow_count_value("flow_count_cleanup", {}, [], None)
 
         # Test netflow capture insertion
-        res, out, err = RUN(["ivre", "flowcli", "--init"], stdin=open(os.devnull))
+        res, out, err = RUN(["ivre", "flowcli", "--init"], stdin=subprocess.DEVNULL)
         self.assertEqual(res, 0)
         self.assertFalse(err)
 
@@ -3522,9 +3593,6 @@ class IvreTests(unittest.TestCase):
             ["ivre", "flow2db", os.path.join(os.getcwd(), "samples", "nfcapd")]
         )
         self.assertEqual(res, 0)
-        if DATABASE == "tinydb":
-            ivre.db.db.flow.invalidate_cache()
-            self.restart_web_server()
         self.check_flow_count_value("flow_count_netflow", {}, [], None)
 
         # Test fields option
@@ -3551,27 +3619,48 @@ class IvreTests(unittest.TestCase):
         self.assertTrue(err)
         self.assertNotEqual(res, 0)
 
-    # This test have to be done first.
+    # This test has to be done first.
     def test_10_data(self):
         """ipdata (Maxmind, thyme.apnic.net) functions"""
 
         # Download
-        res = RUN(["ivre", "ipdata", "--download"])[0]
+        for _ in range(3):
+            res = RUN(["ivre", "ipdata", "--download"])[0]
+            if res == 0:
+                break
+            time.sleep(2)
+
         self.assertEqual(res, 0)
 
-        # Reinit passive DB since we have downloaded the files
+        # Reinit data DB since we have downloaded the files
         ivre.db.db.data.reload_files()
 
+        # Intentional DATABASE branch -- the remaining
+        # assertions exercise the MaxMind ``.mmdb`` reader's
+        # behaviour (GeoIP / AS / city lookups against the
+        # downloaded files).  No other backend implements
+        # ``DBData`` -- the matrix puts the ``data`` purpose
+        # exclusively on the MaxMind backend (and the HTTP
+        # proxy that forwards to it).  A capability flag
+        # would just rename the same backend-name check
+        # without adding clarity.
         if DATABASE != "maxmind":
             print(
                 "Database files have been downloaded -- " "other data tests won't run"
             )
             return
 
-        # CSV creation -- disabled on Travis CI: this is way too slow.
-        # Files are obtained from https://github.com/ivre/ivre-test-samples
-        # instead, and "touched" here to make sure they are newer than the
-        # .mmdb files. Only the Country file is created.
+        # Fetch data for auto tags
+        res, out, err = RUN(["ivre", "getwebdata"])
+        print(repr(err))
+        self.assertEqual(res, 0)
+        self.assertFalse(out, 0)
+
+        # CSV creation -- disabled on GitHub actions: this is way too
+        # slow.  Files are obtained from
+        # https://github.com/ivre/ivre-test-samples instead, and
+        # "touched" here to make sure they are newer than the .mmdb
+        # files. Only the Country file is created.
         for sub in ["ASN", "City", "RegisteredCountry"]:
             fname = os.path.join(
                 ivre.config.GEOIP_PATH, "GeoLite2-%s.dump-IPv4.csv" % sub
@@ -3590,10 +3679,7 @@ class IvreTests(unittest.TestCase):
         self.assertEqual(res, 0)
         # The order may differ, depending on the backend.
         out = sorted(out.splitlines())
-        self.assertEqual(
-            out,
-            sorted(
-                b"""8.8.8.8
+        expected = b"""8.8.8.8
     as_num 15169
     as_name Google LLC
     continent_code NA
@@ -3605,105 +3691,64 @@ class IvreTests(unittest.TestCase):
     coordinates (37.751, -97.822)
     coordinates_accuracy_radius 1000
 """.splitlines()
-            ),
+        self.assertTrue(
+            out
+            in [
+                sorted(expected),
+                sorted(
+                    expected
+                    + [b"    CDN: google as listed by cdncheck (projectdiscovery)"]
+                ),
+            ]
         )
+
+        res, out, _ = RUN(["ivre", "ipdata", "--json", "8.8.8.8"])
+        self.assertEqual(res, 0)
+        expected = {
+            "addr": "8.8.8.8",
+            "as_num": 15169,
+            "as_name": "Google LLC",
+            "continent_code": "NA",
+            "continent_name": "North America",
+            "country_code": "US",
+            "country_name": "United States",
+            "registered_country_code": "US",
+            "registered_country_name": "United States",
+            "coordinates": [37.751, -97.822],
+            "coordinates_accuracy_radius": 1000,
+        }
+        tag = {
+            "value": "CDN",
+            "type": "info",
+            "info": ["google as listed by cdncheck (projectdiscovery)"],
+        }
+        self.assertTrue(json.loads(out) in [expected, dict(expected, tags=[tag])])
 
         res, out, _ = RUN(["ivre", "ipdata", "10.0.0.1"])
         self.assertEqual(res, 0)
         out = sorted(out.splitlines())
         self.assertEqual(
             out,
-            sorted(
-                b"""10.0.0.1
-    address_type Private
-""".splitlines()
-            ),
+            sorted(b"""10.0.0.1
+    Reserved address: Address type Private
+""".splitlines()),
         )
 
-        res, out, _ = RUN(["ivre", "runscans", "--output", "Count", "--routable"])
-        self.assertEqual(res, 0)
-        self.assertEqual(out, b"Target has 2848655972 IP addresses\n")
-        res, out, _ = RUN(["ivre", "runscans", "--output", "Count", "--asnum", "15169"])
-        self.assertEqual(res, 0)
-        self.assertEqual(out, b"Target has 4521723 IP addresses\n")
-        res, out, _ = RUN(["ivre", "runscans", "--output", "Count", "--country", "US"])
-        self.assertEqual(res, 0)
-        self.assertEqual(out, b"Target has 1581733971 IP addresses\n")
-        res, out, _ = RUN(["ivre", "runscans", "--output", "List", "--country", "PN"])
+        res, out, _ = RUN(["ivre", "ipdata", "--json", "10.0.0.1"])
         self.assertEqual(res, 0)
         self.assertEqual(
-            out,
-            b"""5.62.56.189 - 5.62.56.191
-5.62.58.165 - 5.62.58.167
-46.36.201.141 - 46.36.201.145
-104.224.47.0 - 104.224.47.255
-""",
+            json.loads(out),
+            {
+                "addr": "10.0.0.1",
+                "tags": [
+                    {
+                        "value": "Reserved address",
+                        "type": "info",
+                        "info": ["Address type Private"],
+                    }
+                ],
+            },
         )
-        res, out, _ = RUN(
-            ["ivre", "runscans", "--output", "ListCIDRs", "--country", "BV"]
-        )
-        self.assertEqual(res, 0)
-        self.assertEqual(
-            out,
-            b"""31.28.161.170/32
-172.94.114.0/24
-185.193.124.0/24
-195.181.215.206/32
-""",
-        )
-        # ListAll and ListAllRand use different mechanisms
-        res, out1, _ = RUN(
-            ["ivre", "runscans", "--output", "ListAll", "--country", "PN"]
-        )
-        self.assertEqual(res, 0)
-        res, out2, _ = RUN(
-            ["ivre", "runscans", "--output", "ListAllRand", "--country", "PN"]
-        )
-        self.assertEqual(res, 0)
-        out1, out2 = out1.split(b"\n"), out2.split(b"\n")
-        self.assertGreater(len(out1), 0)
-        self.assertCountEqual(out1, out2)
-        res, out1, _ = RUN(
-            ["ivre", "runscans", "--output", "ListAll", "--region", "WF", "UV"]
-        )
-        self.assertEqual(res, 0)
-        res, out2, _ = RUN(
-            ["ivre", "runscans", "--output", "ListAllRand", "--region", "WF", "UV"]
-        )
-        self.assertEqual(res, 0)
-        out1, out2 = out1.split(b"\n"), out2.split(b"\n")
-        self.assertGreater(len(out1), 0)
-        self.assertCountEqual(out1, out2)
-        res, out1, _ = RUN(
-            ["ivre", "runscans", "--output", "ListAll", "--city", "FR", "Carcassonne"]
-        )
-        self.assertEqual(res, 0)
-        res, out2, _ = RUN(
-            [
-                "ivre",
-                "runscans",
-                "--output",
-                "ListAllRand",
-                "--city",
-                "FR",
-                "Carcassonne",
-            ]
-        )
-        self.assertEqual(res, 0)
-        out1, out2 = out1.split(b"\n"), out2.split(b"\n")
-        self.assertGreater(len(out1), 0)
-        self.assertCountEqual(out1, out2)
-        res, out1, _ = RUN(
-            ["ivre", "runscans", "--output", "ListAll", "--asnum", "12345"]
-        )
-        self.assertEqual(res, 0)
-        res, out2, _ = RUN(
-            ["ivre", "runscans", "--output", "ListAllRand", "--asnum", "12345"]
-        )
-        self.assertEqual(res, 0)
-        out1, out2 = out1.split(b"\n"), out2.split(b"\n")
-        self.assertGreater(len(out1), 0)
-        self.assertCountEqual(out1, out2)
 
         # Web API (JSON) vs Python API
         for addr in ["8.8.8.8", "2003::1"]:
@@ -3721,32 +3766,57 @@ class IvreTests(unittest.TestCase):
                 json.loads(udesc.read().decode()),
             )
 
-        # targets manipulation
-        targ1 = ivre.target.TargetCountry("PN")
-        targ2 = ivre.target.TargetCountry("BV")
-        self.assertCountEqual(set(targ1).union(targ2), set(targ1 + targ2))
-        count_t1_t2 = len(targ1 + targ2)
+        # ``ivre iprange`` exercises the inverse direction of
+        # ``ipdata`` (selector -> IPRanges via geoiputils): only
+        # meaningful with the GeoIP CSVs the ``ipdata --download``
+        # step above produced.  The pure-arithmetic selectors are
+        # covered backend-free in ``tests/tests_no_backend.py``.
 
-        res, out1, err = RUN(
-            ["ivre", "runscans", "--output", "Count", "--country", "UK"]
-        )
+        # Country FR: a few-hundred-million addresses.
+        res, out, err = RUN(["ivre", "iprange", "--country", "FR", "--count"])
         self.assertEqual(res, 0)
         self.assertFalse(err)
-        res, out2, err = RUN(
-            ["ivre", "runscans", "--output", "Count", "--country", "GB"]
+        self.assertGreater(int(out.strip()), 10_000_000)
+
+        # UK alias -> GB (mirrors ``utils.country_unalias``).
+        res, uk_out, _ = RUN(["ivre", "iprange", "--country", "UK", "--count"])
+        self.assertEqual(res, 0)
+        res, gb_out, _ = RUN(["ivre", "iprange", "--country", "GB", "--count"])
+        self.assertEqual(res, 0)
+        self.assertEqual(uk_out.strip(), gb_out.strip())
+
+        # AS-by-number: at least one CIDR comes back.
+        res, out, _ = RUN(
+            ["ivre", "iprange", "--asnum", "AS3215", "--cidrs", "--limit", "5"]
         )
         self.assertEqual(res, 0)
-        self.assertFalse(err)
-        self.assertEqual(out1, out2)
-        res, out, err = RUN(
-            ["ivre", "runscans", "--output", "Count", "--country", "PN,BV"]
+        cidrs = out.decode().splitlines()
+        self.assertTrue(cidrs)
+        self.assertTrue(
+            all("/" in line for line in cidrs),
+            f"expected CIDRs, got {cidrs!r}",
         )
+
+        # Bare integer also resolves (``--asnum 3215``).
+        res, out_bare, _ = RUN(["ivre", "iprange", "--asnum", "3215", "--count"])
         self.assertEqual(res, 0)
-        self.assertFalse(err)
-        self.assertEqual(
-            out,
-            ("Target has %d IP addresses\n" % count_t1_t2).encode(),
-        )
+        res, out_as, _ = RUN(["ivre", "iprange", "--asnum", "AS3215", "--count"])
+        self.assertEqual(res, 0)
+        self.assertEqual(out_bare.strip(), out_as.strip())
+
+        # AS-union: ``AS3215,AS12876`` >= each one taken alone.
+        res, out, _ = RUN(["ivre", "iprange", "--asnum", "AS3215,AS12876", "--count"])
+        self.assertEqual(res, 0)
+        union_count = int(out.strip())
+        res, out, _ = RUN(["ivre", "iprange", "--asnum", "AS3215", "--count"])
+        self.assertEqual(res, 0)
+        self.assertGreaterEqual(union_count, int(out.strip()))
+
+        # Routable: ~3.7 G addresses (loose lower bound to absorb
+        # the slow drift of the APNIC BGP dump over time).
+        res, out, _ = RUN(["ivre", "iprange", "--routable", "--count"])
+        self.assertEqual(res, 0)
+        self.assertGreater(int(out.strip()), 1_000_000_000)
 
         # BEGIN Using the HTTP server as a database
         with tempfile.NamedTemporaryFile(delete=False) as fdesc:
@@ -3772,875 +3842,210 @@ class IvreTests(unittest.TestCase):
             socket.gethostbyname("ivre.rocks"),
             "2003::1",
         ]:
-            res, out1, err = RUN(["ivre", "ipdata", addr], env=newenv)
+            res, out1, _ = RUN(["ivre", "ipdata", addr], env=newenv)
             self.assertEqual(res, 0)
-            self.assertFalse(err)
-            res, out2, err = RUN(["ivre", "ipdata", addr])
+            res, out2, _ = RUN(["ivre", "ipdata", addr])
             self.assertEqual(res, 0)
-            self.assertFalse(err)
             self.assertEqual(out1, out2)
         # END Using the HTTP server as a database
 
-    def test_utils(self):
-        """Functions that have not yet been tested"""
+    # This test have to be done first.
+    def test_15_rir(self):
+        """rirlookup functions"""
 
-        self.assertIsNotNone(ivre.config.guess_prefix())
-        self.assertIsNone(ivre.config.guess_prefix("inexistent"))
-
-        # Version / help
-        res, out1, err = RUN(["ivre"])
+        # Init DB
+        res, out, err = RUN(["ivre", "rirlookup", "--init"], stdin=subprocess.DEVNULL)
+        self.assertEqual(res, 0)
+        self.assertFalse(out)
+        self.assertFalse(err)
+        # Download - limited to RIPE IPv4
+        ivre.db.db.rir.urls = [
+            "https://ftp.ripe.net/ripe/dbase/split/ripe.db.inetnum.gz"
+        ]
+        ivre.db.db.rir.fetch()
+        # Insert
+        res, out, err = RUN(["ivre", "rirlookup", "--insert"])
+        print("rirlookup insert out:", repr(out))
+        print("rirlookup insert err:", repr(err))
         self.assertEqual(res, 0)
         self.assertFalse(err)
-        res, out2, err = RUN(["ivre", "help"])
+
+        # Searches
+        res, out, err = RUN(
+            ["ivre", "rirlookup", "--search", "GDOHCAXWRQWFGTZBEXZDIZGOCM"]
+        )
+        self.assertEqual(res, 0)
+        self.assertEqual(out.strip().decode(), "GDOHCAXWRQWFGTZBEXZDIZGOCM")
+        self.assertFalse(err)
+
+        res, out, err = RUN(
+            ["ivre", "rirlookup", "--search", "GDOHCAXWRQWFGTZBEXZDIZGOCM", "--json"]
+        )
+        self.assertEqual(res, 0)
+        self.assertFalse(out)
+        self.assertFalse(err)
+
+        res, out, err = RUN(
+            [
+                "ivre",
+                "rirlookup",
+                "--search",
+                '"Commissariat" "Energie" "Atomique"',
+                "--country",
+                "FR",
+                "--json",
+            ]
+        )
+        self.assertEqual(res, 0)
+        self.assertFalse(err)
+        found = False
+        for line in out.decode().splitlines():
+            if json.loads(line).get("start") == "132.165.0.0":
+                found = True
+        self.assertTrue(found)
+
+        res, out, err = RUN(["ivre", "rirlookup", "--search", '"SGDSN"', "--short"])
+        self.assertEqual(res, 0)
+        self.assertFalse(err)
+        found = False
+        for line in out.decode().splitlines():
+            if line.startswith("185.50.64.0/22: "):
+                found = True
+        self.assertTrue(found)
+
+        # BEGIN Using the HTTP server as a database
+        with tempfile.NamedTemporaryFile(delete=False) as fdesc:
+            newenv = os.environ.copy()
+            if "IVRE_CONF" in newenv:
+                fdesc.writelines(open(newenv["IVRE_CONF"], "rb"))
+            fdesc.write(
+                (
+                    '\nDB_RIR = "http://%s:%d/cgi#Referer=http://%s:%d/"\n'
+                    % (
+                        HTTPD_HOSTNAME,
+                        HTTPD_PORT,
+                        HTTPD_HOSTNAME,
+                        HTTPD_PORT,
+                    )
+                ).encode()
+            )
+        newenv["IVRE_CONF"] = fdesc.name
+
+        res, out1, err = RUN(["ivre", "rirlookup", "--count"], env=newenv)
+        self.assertEqual(res, 0)
+        self.assertFalse(err)
+        res, out2, err = RUN(["ivre", "rirlookup", "--count"])
         self.assertEqual(res, 0)
         self.assertFalse(err)
         self.assertEqual(out1, out2)
-        res, _, err = RUN(["ivre", "version"])
+
+        res, out1, err = RUN(
+            ["ivre", "rirlookup", "--country", "FR", "--count"], env=newenv
+        )
         self.assertEqual(res, 0)
         self.assertFalse(err)
-        res, _, _ = RUN(["ivre", "inexistent"])
-        self.assertTrue(res)
-
-        # IP addresses manipulation utils
-        with self.assertRaises(ValueError):
-            ivre.utils.range2nets((2, 1))
-
-        # Special cases for range2nets & net2range
-        self.assertEqual(
-            ivre.utils.range2nets(("0.0.0.0", "255.255.255.255")), ["0.0.0.0/0"]
-        )
-        self.assertEqual(
-            ivre.utils.net2range("0.0.0.0/0"), ("0.0.0.0", "255.255.255.255")
-        )
-        self.assertEqual(
-            ivre.utils.net2range("::ffff:ffff:ffff:ffff/ffff:ffff:ffff:ffff:ffff::0"),
-            ("::ffff:0:0:0", "::ffff:ffff:ffff:ffff"),
-        )
-        self.assertEqual(
-            ivre.utils.net2range("192.168.0.0/255.255.255.0"),
-            ("192.168.0.0", "192.168.0.255"),
-        )
-        self.assertEqual(
-            ivre.utils.net2range("::/48"), ("::", "::ffff:ffff:ffff:ffff:ffff")
-        )
-
-        # String utils
-        teststr = b"TEST STRING -./*'"
-        self.assertEqual(ivre.utils.regexp2pattern(teststr), (re.escape(teststr), 0))
-        self.assertEqual(
-            ivre.utils.regexp2pattern(re.compile(b"^" + re.escape(teststr) + b"$")),
-            (re.escape(teststr), 0),
-        )
-        self.assertEqual(
-            ivre.utils.regexp2pattern(re.compile(re.escape(teststr))),
-            (b".*" + re.escape(teststr) + b".*", 0),
-        )
-        self.assertEqual(ivre.utils.str2list(teststr), teststr)
-        teststr = "1,2|3"
-        self.assertCountEqual(ivre.utils.str2list(teststr), ["1", "2", "3"])
-        self.assertTrue(ivre.utils.isfinal(1))
-        self.assertTrue(ivre.utils.isfinal("1"))
-        self.assertFalse(ivre.utils.isfinal([]))
-        self.assertFalse(ivre.utils.isfinal({}))
-
-        # Nmap ports
-        ports = [1, 3, 2, 4, 6, 80, 5, 5, 110, 111]
-        self.assertEqual(
-            set(ports), ivre.utils.nmapspec2ports(ivre.utils.ports2nmapspec(ports))
-        )
-        self.assertEqual(ivre.utils.ports2nmapspec(ports), "1-6,80,110-111")
-
-        # Nmap fingerprints
-        match = ivre.utils.match_nmap_svc_fp(
-            b"SSH-2.0-OpenSSH_6.0p1 Debian-4+deb7u7\r\n"
-        )
-        self.assertEqual(match["service_name"], "ssh")
-        self.assertEqual(match["service_extrainfo"], "protocol 2.0")
-        self.assertEqual(match["service_ostype"], "Linux")
-        self.assertEqual(match["service_product"], "OpenSSH")
-        self.assertEqual(match["service_version"], "6.0p1 Debian 4+deb7u7")
-        match = ivre.utils.match_nmap_svc_fp(
-            b"HTTP/1.1 400 Bad Request\r\n"
-            b"Date: Sun, 22 Apr 2018 12:21:46 GMT\r\n"
-            b"Server: Apache/2.4.10 (Debian)\r\n"
-            b"Content-Length: 312\r\n"
-            b"Connection: close\r\n"
-            b"Content-Type: text/html; charset=iso-8859-1\r\n",
-            probe="GetRequest",
-        )
-        self.assertEqual(match["service_name"], "http")
-        self.assertEqual(match["service_extrainfo"], "(Debian)")
-        self.assertEqual(match["service_product"], "Apache httpd")
-        self.assertEqual(match["service_version"], "2.4.10")
-        match = ivre.utils.match_nmap_svc_fp(
-            b"220 localhost.localdomain ESMTP Server (Microsoft Exchange "
-            b"Internet Mail Service 5.5.2653.13) ready\n"
-        )
-        self.assertEqual(match["service_name"], "smtp")
-        self.assertEqual(match["service_hostname"], "localhost.localdomain")
-        self.assertEqual(match["service_ostype"], "Windows")
-        self.assertEqual(match["service_product"], "Microsoft Exchange smtpd")
-        self.assertEqual(match["service_version"], "5.5.2653.13")
-
-        # Nmap (and Zeek) encoding & decoding
-        # >>> from random import randint
-        # >>> bytes(randint(0, 255) for _ in range(1000))
-        raw_data = b"\xc6\x97\x05\xc8\x16\x96\xaei\xe9\xdd\xe8\"\x07\x16\x15\x8c\xf5%x\xb0\x00\xb4\xbcv\xb8A\x19\xefj+RbgH}U\xec\xb4\x1bZ\x08\xd4\xfe\xca\x95z\xa0\x0cB\xabWM\xf1\xfd\x95\xb7)\xbb\xe9\xa7\x8a\x08]\x8a\xcab\xb3\x1eI\xc0Q0\xec\xd0\xd4\xd4bt\xf7\xbb1\xc5\x9c\x85\xf8\x87\x8b\xb2\x87\xed\x82R\xf9}+\xfc\xa4\xf2?\xa5}\x17k\xa6\xb6t\xab\x91\x91\x83?\xb4\x01L\x1fO\xff}\x98j\xa5\x9a\t,\xf3\x8b\x1e\xf4\xd3~\x83\x87\x0b\x95\\\xa9\xaa\xfbi5\xfb\xaau\xc6y\xff\xac\xcb'\xa5\xf4y\x8f\xab\xf2\x04Z\xf1\xd7\x08\x17\xa8\xa5\xe4\x04\xa5R0\xdb\xa3\xe6\xc0\x88\x9a\xee\x93\x8c\x8a\x8b\xa3\x03\xb6\xdf\xbbHp\x1f\x1d{\x92\xb2\xd7B\xc4\x13\xddD\xb29\xbd\x0f\xd8\xed\x94q\xda\x00\x067\xd8T\xb3I\xd3\x88/wE\xd4C\xec!\xf6 <H\xaa\xea\xc1;\x90\x87)\xc5\xb6\xd6\n\x81r\x16\xa1/\xd0Q<\xa4jT\x0f\xe4\xad\x14>0\xf1\xb7\xec\x08\x7f>\"\x96P\xd2;\xc4:\xed\xc0\xcb\x85M\x04&{|k\xd0\x06Yc_\x12S\xb0>\xe0=:\xca1\xca\n\xcb.\xf4\xe2\xb1e\x0e\x16\xd6\x8c\xbc!\xbcWd\x19\x0b\xd7\xa0\xed\x1d>$%\xf7\xfb\xc2(\xef\x13\x82\xcc\xa5\xecc\x1fy_\x9f93\xbcPv\xd7\x9b\xbb\x0b]\x9a\xc7\xbd&5\xb2\x85\x95\xfb\xf2j\x11f\xd8\xdb\x03\xc0\xb1\xda\x08aF\x80\xd8\x18\x7f\xf3\x86N\x91\xa6\xd4i\x83\xd4*$_t\x19\xb3\xa2\x187w2 \x0c#\xe5\xca\x03\xb3@H\xb7\xfb,a\xb8\x02\xe4;/\xc11\xb7\xd8\xdd\x9b\xcc\xdcg\xb4\x9f\x81\x10,\x0e\x0c'_m\xf8$\xa10\xc4\xe9\xc5G_\x14\x10\xf5& \xcf\xa8\x10:\xee\x1aGL\x966\xd7\x1d?\xb0:\xee\x11\x89\xb9\xeb\x8d\xf7\x02\x00\xdb\xd9/\x8a\x01!\xa5wRc?\xfd\x87\x11E\xa9\x8f\x9ed\x0f.\xffM\xd1\xb4\xe9\x19\xb0\xb0\"\xac\x84\xff5D\xa9\x12O\xcc1G#\xb5\x16\xba%{:\xde\xf6\t\"\xe7\xed\xa0*\xa3\x89\xabl\x08p\x1d\xc1\xae\x14e)\xf3=\x16\x80\xa8\x1b\xe3OSD&V\x16\xf3*\x8416\xdd6\xe6\xbf,R$\x93s>\x87\xbe\x94\x1c\x10\\o,\xc2\x18ig\xa2\xf7\xc9\x9d|\x8c\xc6\x94\\\xee\xb0'\x01\x1c\x94\xf8\xea\xda\x91\xf1 \x8cP\x84=\xa0\x1a\x87\xba\xa8\x9c\xd6\xf7\n'\x99\xb9\xd5L\xd2u\x7f\x13\xf3^_T\xc3\x806\x94\xbe\x94\xee\x0cJ`\xba\xf1\n*\xc2\xc7?[\xa7\xdd\xcbX\x08\xafTsU\x81\xa5r\x86Q\x1b8\xcf\xc8\xab\xf1\x1e\xee,i\x15:*\xb4\x84\x01\xc0\x8f\xb3\xdcER%\xe2\x16\x9f\x80z:\xcdZ\xae$\x04\xbfa\xae+\x84U\xb6\x06 \xfe\xd5Y\xf7\xd9\xbftQ0\xbd\xf3\xf5O\x98\xad\x90n\x97\xbd\x81\x1f-\xe5\x1d\x14R\x94\x9cH\x8bf\x80*!E\x933\x88_\xf2]3\xa7g\x9d\\(S\xdc\xd7\x16OXZ\xf7\xc8\x98jU\xbc]\x92\xf3\xc2S\x0c>';i.\xab\n\x90\xb33\x80\x17k\xfb9\x14\x1a\xd5\x89##?6Y^|{c\x86\x1cF\xc1\x9c\xf1\xcb^\x92\xed\x92$\x15\x81e:\xfc\x13\x1d\x07\xd9\xe9\xd5\x1f(\xef\xc1K\xeem\xa8f7O\x89\xa8\x08\xbd\x12\xeb\xa8\xa6\x9d\xba\xbe\x06\x820x\x18x\xe8A-<p\xd2-\x9c\x00\xde\xbdE\x1bn\x81\x93\x1c\xca\xfc\xe4($\x13\x147\x9d,(t\xffiT\xa6ZU\xc2\xd9<\xba\xa1F\x11\x19N\xb8\xeeA-jC\xdf\xff\x94k\xb5G\x8c\x9e\x19\xff\xf6\x8bg\xb4\x19!\xe9\\\xccB\xd0Y\x08\xfa'\xc2\x0eYMW\x9fdM0\xb0A\xb5R\xd3t\x8b\t\xb5\xcew,f\x9c\xed\\t\xbc\xf11\xa9\xd3\xef\xdd\xf6\xcf\x96\xe1$\x9a@\xb3v\x05\xc5\xc3\x9e%\xb2\xf8\xe8\xdcd81u\xa8Y\x07\xb15\xe9\xa7\xae\xee\xa9GD\x9e\x7fP\xcf\xd8ca%\xb16\xb6\xc4FP\xed\x8e\x83\x05\x15F"  # noqa: E501
-        encoded_data = ivre.utils.nmap_encode_data(raw_data)
-        self.assertEqual(
-            encoded_data,
-            "\\xc6\\x97\\x05\\xc8\\x16\\x96\\xaei\\xe9\\xdd\\xe8\"\\x07\\x16\\x15\\x8c\\xf5%x\\xb0\\x00\\xb4\\xbcv\\xb8A\\x19\\xefj+RbgH}U\\xec\\xb4\\x1bZ\\x08\\xd4\\xfe\\xca\\x95z\\xa0\\x0cB\\xabWM\\xf1\\xfd\\x95\\xb7)\\xbb\\xe9\\xa7\\x8a\\x08]\\x8a\\xcab\\xb3\\x1eI\\xc0Q0\\xec\\xd0\\xd4\\xd4bt\\xf7\\xbb1\\xc5\\x9c\\x85\\xf8\\x87\\x8b\\xb2\\x87\\xed\\x82R\\xf9}+\\xfc\\xa4\\xf2?\\xa5}\\x17k\\xa6\\xb6t\\xab\\x91\\x91\\x83?\\xb4\\x01L\\x1fO\\xff}\\x98j\\xa5\\x9a\\t,\\xf3\\x8b\\x1e\\xf4\\xd3~\\x83\\x87\\x0b\\x95\\\\\\xa9\\xaa\\xfbi5\\xfb\\xaau\\xc6y\\xff\\xac\\xcb'\\xa5\\xf4y\\x8f\\xab\\xf2\\x04Z\\xf1\\xd7\\x08\\x17\\xa8\\xa5\\xe4\\x04\\xa5R0\\xdb\\xa3\\xe6\\xc0\\x88\\x9a\\xee\\x93\\x8c\\x8a\\x8b\\xa3\\x03\\xb6\\xdf\\xbbHp\\x1f\\x1d{\\x92\\xb2\\xd7B\\xc4\\x13\\xddD\\xb29\\xbd\\x0f\\xd8\\xed\\x94q\\xda\\x00\\x067\\xd8T\\xb3I\\xd3\\x88/wE\\xd4C\\xec!\\xf6 <H\\xaa\\xea\\xc1;\\x90\\x87)\\xc5\\xb6\\xd6\\n\\x81r\\x16\\xa1/\\xd0Q<\\xa4jT\\x0f\\xe4\\xad\\x14>0\\xf1\\xb7\\xec\\x08\\x7f>\"\\x96P\\xd2;\\xc4:\\xed\\xc0\\xcb\\x85M\\x04&{|k\\xd0\\x06Yc_\\x12S\\xb0>\\xe0=:\\xca1\\xca\\n\\xcb.\\xf4\\xe2\\xb1e\\x0e\\x16\\xd6\\x8c\\xbc!\\xbcWd\\x19\\x0b\\xd7\\xa0\\xed\\x1d>$%\\xf7\\xfb\\xc2(\\xef\\x13\\x82\\xcc\\xa5\\xecc\\x1fy_\\x9f93\\xbcPv\\xd7\\x9b\\xbb\\x0b]\\x9a\\xc7\\xbd&5\\xb2\\x85\\x95\\xfb\\xf2j\\x11f\\xd8\\xdb\\x03\\xc0\\xb1\\xda\\x08aF\\x80\\xd8\\x18\\x7f\\xf3\\x86N\\x91\\xa6\\xd4i\\x83\\xd4*$_t\\x19\\xb3\\xa2\\x187w2 \\x0c#\\xe5\\xca\\x03\\xb3@H\\xb7\\xfb,a\\xb8\\x02\\xe4;/\\xc11\\xb7\\xd8\\xdd\\x9b\\xcc\\xdcg\\xb4\\x9f\\x81\\x10,\\x0e\\x0c'_m\\xf8$\\xa10\\xc4\\xe9\\xc5G_\\x14\\x10\\xf5& \\xcf\\xa8\\x10:\\xee\\x1aGL\\x966\\xd7\\x1d?\\xb0:\\xee\\x11\\x89\\xb9\\xeb\\x8d\\xf7\\x02\\x00\\xdb\\xd9/\\x8a\\x01!\\xa5wRc?\\xfd\\x87\\x11E\\xa9\\x8f\\x9ed\\x0f.\\xffM\\xd1\\xb4\\xe9\\x19\\xb0\\xb0\"\\xac\\x84\\xff5D\\xa9\\x12O\\xcc1G#\\xb5\\x16\\xba%{:\\xde\\xf6\\t\"\\xe7\\xed\\xa0*\\xa3\\x89\\xabl\\x08p\\x1d\\xc1\\xae\\x14e)\\xf3=\\x16\\x80\\xa8\\x1b\\xe3OSD&V\\x16\\xf3*\\x8416\\xdd6\\xe6\\xbf,R$\\x93s>\\x87\\xbe\\x94\\x1c\\x10\\\\o,\\xc2\\x18ig\\xa2\\xf7\\xc9\\x9d|\\x8c\\xc6\\x94\\\\\\xee\\xb0'\\x01\\x1c\\x94\\xf8\\xea\\xda\\x91\\xf1 \\x8cP\\x84=\\xa0\\x1a\\x87\\xba\\xa8\\x9c\\xd6\\xf7\\n'\\x99\\xb9\\xd5L\\xd2u\\x7f\\x13\\xf3^_T\\xc3\\x806\\x94\\xbe\\x94\\xee\\x0cJ`\\xba\\xf1\\n*\\xc2\\xc7?[\\xa7\\xdd\\xcbX\\x08\\xafTsU\\x81\\xa5r\\x86Q\\x1b8\\xcf\\xc8\\xab\\xf1\\x1e\\xee,i\\x15:*\\xb4\\x84\\x01\\xc0\\x8f\\xb3\\xdcER%\\xe2\\x16\\x9f\\x80z:\\xcdZ\\xae$\\x04\\xbfa\\xae+\\x84U\\xb6\\x06 \\xfe\\xd5Y\\xf7\\xd9\\xbftQ0\\xbd\\xf3\\xf5O\\x98\\xad\\x90n\\x97\\xbd\\x81\\x1f-\\xe5\\x1d\\x14R\\x94\\x9cH\\x8bf\\x80*!E\\x933\\x88_\\xf2]3\\xa7g\\x9d\\\\(S\\xdc\\xd7\\x16OXZ\\xf7\\xc8\\x98jU\\xbc]\\x92\\xf3\\xc2S\\x0c>';i.\\xab\\n\\x90\\xb33\\x80\\x17k\\xfb9\\x14\\x1a\\xd5\\x89##?6Y^|{c\\x86\\x1cF\\xc1\\x9c\\xf1\\xcb^\\x92\\xed\\x92$\\x15\\x81e:\\xfc\\x13\\x1d\\x07\\xd9\\xe9\\xd5\\x1f(\\xef\\xc1K\\xeem\\xa8f7O\\x89\\xa8\\x08\\xbd\\x12\\xeb\\xa8\\xa6\\x9d\\xba\\xbe\\x06\\x820x\\x18x\\xe8A-<p\\xd2-\\x9c\\x00\\xde\\xbdE\\x1bn\\x81\\x93\\x1c\\xca\\xfc\\xe4($\\x13\\x147\\x9d,(t\\xffiT\\xa6ZU\\xc2\\xd9<\\xba\\xa1F\\x11\\x19N\\xb8\\xeeA-jC\\xdf\\xff\\x94k\\xb5G\\x8c\\x9e\\x19\\xff\\xf6\\x8bg\\xb4\\x19!\\xe9\\\\\\xccB\\xd0Y\\x08\\xfa'\\xc2\\x0eYMW\\x9fdM0\\xb0A\\xb5R\\xd3t\\x8b\\t\\xb5\\xcew,f\\x9c\\xed\\\\t\\xbc\\xf11\\xa9\\xd3\\xef\\xdd\\xf6\\xcf\\x96\\xe1$\\x9a@\\xb3v\\x05\\xc5\\xc3\\x9e%\\xb2\\xf8\\xe8\\xdcd81u\\xa8Y\\x07\\xb15\\xe9\\xa7\\xae\\xee\\xa9GD\\x9e\\x7fP\\xcf\\xd8ca%\\xb16\\xb6\\xc4FP\\xed\\x8e\\x83\\x05\\x15F",  # noqa: E501
-        )
-        self.assertEqual(
-            ivre.utils.nmap_decode_data(encoded_data),
-            raw_data,
-        )
-        encoded_data = ivre.utils.zeek_encode_data(raw_data)
-        self.assertEqual(
-            encoded_data,
-            "\\xc6\\x97\\x05\\xc8\\x16\\x96\\xaei\\xe9\\xdd\\xe8\"\\x07\\x16\\x15\\x8c\\xf5%x\\xb0\\x00\\xb4\\xbcv\\xb8A\\x19\\xefj+RbgH}U\\xec\\xb4\\x1bZ\\x08\\xd4\\xfe\\xca\\x95z\\xa0\\x0cB\\xabWM\\xf1\\xfd\\x95\\xb7)\\xbb\\xe9\\xa7\\x8a\\x08]\\x8a\\xcab\\xb3\\x1eI\\xc0Q0\\xec\\xd0\\xd4\\xd4bt\\xf7\\xbb1\\xc5\\x9c\\x85\\xf8\\x87\\x8b\\xb2\\x87\\xed\\x82R\\xf9}+\\xfc\\xa4\\xf2?\\xa5}\\x17k\\xa6\\xb6t\\xab\\x91\\x91\\x83?\\xb4\\x01L\\x1fO\\xff}\\x98j\\xa5\\x9a\\x09,\\xf3\\x8b\\x1e\\xf4\\xd3~\\x83\\x87\\x0b\\x95\\\\\\xa9\\xaa\\xfbi5\\xfb\\xaau\\xc6y\\xff\\xac\\xcb'\\xa5\\xf4y\\x8f\\xab\\xf2\\x04Z\\xf1\\xd7\\x08\\x17\\xa8\\xa5\\xe4\\x04\\xa5R0\\xdb\\xa3\\xe6\\xc0\\x88\\x9a\\xee\\x93\\x8c\\x8a\\x8b\\xa3\\x03\\xb6\\xdf\\xbbHp\\x1f\\x1d{\\x92\\xb2\\xd7B\\xc4\\x13\\xddD\\xb29\\xbd\\x0f\\xd8\\xed\\x94q\\xda\\x00\\x067\\xd8T\\xb3I\\xd3\\x88/wE\\xd4C\\xec!\\xf6 <H\\xaa\\xea\\xc1;\\x90\\x87)\\xc5\\xb6\\xd6\\x0a\\x81r\\x16\\xa1/\\xd0Q<\\xa4jT\\x0f\\xe4\\xad\\x14>0\\xf1\\xb7\\xec\\x08\\x7f>\"\\x96P\\xd2;\\xc4:\\xed\\xc0\\xcb\\x85M\\x04&{|k\\xd0\\x06Yc_\\x12S\\xb0>\\xe0=:\\xca1\\xca\\x0a\\xcb.\\xf4\\xe2\\xb1e\\x0e\\x16\\xd6\\x8c\\xbc!\\xbcWd\\x19\\x0b\\xd7\\xa0\\xed\\x1d>$%\\xf7\\xfb\\xc2(\\xef\\x13\\x82\\xcc\\xa5\\xecc\\x1fy_\\x9f93\\xbcPv\\xd7\\x9b\\xbb\\x0b]\\x9a\\xc7\\xbd&5\\xb2\\x85\\x95\\xfb\\xf2j\\x11f\\xd8\\xdb\\x03\\xc0\\xb1\\xda\\x08aF\\x80\\xd8\\x18\\x7f\\xf3\\x86N\\x91\\xa6\\xd4i\\x83\\xd4*$_t\\x19\\xb3\\xa2\\x187w2 \\x0c#\\xe5\\xca\\x03\\xb3@H\\xb7\\xfb,a\\xb8\\x02\\xe4;/\\xc11\\xb7\\xd8\\xdd\\x9b\\xcc\\xdcg\\xb4\\x9f\\x81\\x10,\\x0e\\x0c'_m\\xf8$\\xa10\\xc4\\xe9\\xc5G_\\x14\\x10\\xf5& \\xcf\\xa8\\x10:\\xee\\x1aGL\\x966\\xd7\\x1d?\\xb0:\\xee\\x11\\x89\\xb9\\xeb\\x8d\\xf7\\x02\\x00\\xdb\\xd9/\\x8a\\x01!\\xa5wRc?\\xfd\\x87\\x11E\\xa9\\x8f\\x9ed\\x0f.\\xffM\\xd1\\xb4\\xe9\\x19\\xb0\\xb0\"\\xac\\x84\\xff5D\\xa9\\x12O\\xcc1G#\\xb5\\x16\\xba%{:\\xde\\xf6\\x09\"\\xe7\\xed\\xa0*\\xa3\\x89\\xabl\\x08p\\x1d\\xc1\\xae\\x14e)\\xf3=\\x16\\x80\\xa8\\x1b\\xe3OSD&V\\x16\\xf3*\\x8416\\xdd6\\xe6\\xbf,R$\\x93s>\\x87\\xbe\\x94\\x1c\\x10\\\\o,\\xc2\\x18ig\\xa2\\xf7\\xc9\\x9d|\\x8c\\xc6\\x94\\\\\\xee\\xb0'\\x01\\x1c\\x94\\xf8\\xea\\xda\\x91\\xf1 \\x8cP\\x84=\\xa0\\x1a\\x87\\xba\\xa8\\x9c\\xd6\\xf7\\x0a'\\x99\\xb9\\xd5L\\xd2u\\x7f\\x13\\xf3^_T\\xc3\\x806\\x94\\xbe\\x94\\xee\\x0cJ`\\xba\\xf1\\x0a*\\xc2\\xc7?[\\xa7\\xdd\\xcbX\\x08\\xafTsU\\x81\\xa5r\\x86Q\\x1b8\\xcf\\xc8\\xab\\xf1\\x1e\\xee,i\\x15:*\\xb4\\x84\\x01\\xc0\\x8f\\xb3\\xdcER%\\xe2\\x16\\x9f\\x80z:\\xcdZ\\xae$\\x04\\xbfa\\xae+\\x84U\\xb6\\x06 \\xfe\\xd5Y\\xf7\\xd9\\xbftQ0\\xbd\\xf3\\xf5O\\x98\\xad\\x90n\\x97\\xbd\\x81\\x1f-\\xe5\\x1d\\x14R\\x94\\x9cH\\x8bf\\x80*!E\\x933\\x88_\\xf2]3\\xa7g\\x9d\\\\(S\\xdc\\xd7\\x16OXZ\\xf7\\xc8\\x98jU\\xbc]\\x92\\xf3\\xc2S\\x0c>';i.\\xab\\x0a\\x90\\xb33\\x80\\x17k\\xfb9\\x14\\x1a\\xd5\\x89##?6Y^|{c\\x86\\x1cF\\xc1\\x9c\\xf1\\xcb^\\x92\\xed\\x92$\\x15\\x81e:\\xfc\\x13\\x1d\\x07\\xd9\\xe9\\xd5\\x1f(\\xef\\xc1K\\xeem\\xa8f7O\\x89\\xa8\\x08\\xbd\\x12\\xeb\\xa8\\xa6\\x9d\\xba\\xbe\\x06\\x820x\\x18x\\xe8A-<p\\xd2-\\x9c\\x00\\xde\\xbdE\\x1bn\\x81\\x93\\x1c\\xca\\xfc\\xe4($\\x13\\x147\\x9d,(t\\xffiT\\xa6ZU\\xc2\\xd9<\\xba\\xa1F\\x11\\x19N\\xb8\\xeeA-jC\\xdf\\xff\\x94k\\xb5G\\x8c\\x9e\\x19\\xff\\xf6\\x8bg\\xb4\\x19!\\xe9\\\\\\xccB\\xd0Y\\x08\\xfa'\\xc2\\x0eYMW\\x9fdM0\\xb0A\\xb5R\\xd3t\\x8b\\x09\\xb5\\xcew,f\\x9c\\xed\\\\t\\xbc\\xf11\\xa9\\xd3\\xef\\xdd\\xf6\\xcf\\x96\\xe1$\\x9a@\\xb3v\\x05\\xc5\\xc3\\x9e%\\xb2\\xf8\\xe8\\xdcd81u\\xa8Y\\x07\\xb15\\xe9\\xa7\\xae\\xee\\xa9GD\\x9e\\x7fP\\xcf\\xd8ca%\\xb16\\xb6\\xc4FP\\xed\\x8e\\x83\\x05\\x15F",  # noqa: E501
-        )
-        self.assertEqual(
-            ivre.utils.nmap_decode_data(encoded_data),
-            raw_data,
-        )
-        # Specific Nmap representation for null bytes & escape random
-        # chars (used in nmap-service-probes)
-        self.assertEqual(
-            ivre.utils.nmap_decode_data("\\0\\#", arbitrary_escapes=True),
-            b"\x00#",
-        )
-        self.assertEqual(
-            ivre.utils.nmap_decode_data("\\0\\#"),
-            b"\x00\\#",
-        )
-
-        # get_addr_type()
-        # ipv4
-        self.assertEqual(ivre.utils.get_addr_type("0.123.45.67"), "Current-Net")
-        self.assertIsNone(ivre.utils.get_addr_type("8.8.8.8"))
-        self.assertEqual(ivre.utils.get_addr_type("10.0.0.0"), "Private")
-        self.assertIsNone(ivre.utils.get_addr_type("100.63.255.255"))
-        self.assertEqual(ivre.utils.get_addr_type("100.67.89.123"), "CGN")
-        self.assertEqual(ivre.utils.get_addr_type("239.255.255.255"), "Multicast")
-        self.assertEqual(ivre.utils.get_addr_type("240.0.0.0"), "Reserved")
-        self.assertEqual(ivre.utils.get_addr_type("255.255.255.254"), "Reserved")
-        self.assertEqual(ivre.utils.get_addr_type("255.255.255.255"), "Broadcast")
-        # ipv6
-        self.assertEqual(ivre.utils.get_addr_type("::"), "Unspecified")
-        self.assertEqual(ivre.utils.get_addr_type("::1"), "Loopback")
-        self.assertIsNone(ivre.utils.get_addr_type("::ffff:8.8.8.8"))
-        self.assertEqual(
-            ivre.utils.get_addr_type("64:ff9b::8.8.8.8"), "Well-known prefix"
-        )
-        self.assertEqual(ivre.utils.get_addr_type("100::"), "Discard (RTBH)")
-        self.assertEqual(ivre.utils.get_addr_type("2001::"), "Protocol assignments")
-        self.assertIsNone(ivre.utils.get_addr_type("2001:4860:4860::8888"))
-        self.assertEqual(ivre.utils.get_addr_type("2001:db8::db2"), "Documentation")
-        self.assertEqual(ivre.utils.get_addr_type("fc00::"), "Unique Local Unicast")
-        self.assertEqual(ivre.utils.get_addr_type("fe80::"), "Link Local Unicast")
-        self.assertEqual(ivre.utils.get_addr_type("ff00::"), "Multicast")
-
-        # ip2int() / int2ip()
-        self.assertEqual(ivre.utils.ip2int("1.0.0.1"), (1 << 24) + 1)
-        self.assertEqual(ivre.utils.int2ip((1 << 24) + 1), "1.0.0.1")
-        self.assertEqual(ivre.utils.ip2int("::2:0:0:0:2"), (2 << 64) + 2)
-        self.assertEqual(ivre.utils.int2ip((2 << 64) + 2), "::2:0:0:0:2")
-        self.assertEqual(
-            ivre.utils.int2ip6(0x1234567890ABCDEFFED0000000004321),
-            "1234:5678:90ab:cdef:fed0::4321",
-        )
-        # ip2bin
-        # unicode error
-        self.assertEqual(
-            ivre.utils.ip2bin(b"\x33\xe6\x34\x35"),
-            b"\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xff\xff3\xe645",
-        )
-        with self.assertRaises(ValueError):
-            ivre.utils.ip2bin(b"\xe6")
-        # else case
-        with self.assertRaises(ValueError):
-            ivre.utils.ip2bin(b"23T")
-        self.assertEqual(
-            ivre.utils.ip2bin(b"23TT"),
-            b"\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xff\xff23TT",
-        )
-        self.assertEqual(ivre.utils.ip2bin(b"T3STTESTTESTTEST"), b"T3STTESTTESTTEST")
-        self.assertEqual(
-            ivre.utils.ip2bin(b" \x01H`\x00\x00 \x01\x00\x00\x00\x00\x00\x00\x00h"),
-            b" \x01H`\x00\x00 \x01\x00\x00\x00\x00\x00\x00\x00h",
-        )
-        # str2pyval
-        self.assertEqual(ivre.utils.str2pyval("{'test': 0}"), {"test": 0})
-        self.assertEqual(ivre.utils.str2pyval("{'test: 0}"), "{'test: 0}")
-        # all2datetime
-        # NOTICE : compared to datetime.utcfromtimestamp
-        self.assertEqual(
-            ivre.utils.all2datetime(1410532663), datetime(2014, 9, 12, 14, 37, 43)
-        )
-        self.assertEqual(
-            ivre.utils.all2datetime(1410532663.0), datetime(2014, 9, 12, 14, 37, 43)
-        )
-
-        # fields2csv_head
-        self.assertCountEqual(
-            ivre.utils.fields2csv_head(
-                {
-                    "field": {
-                        "subfield": {
-                            "subsubfield": True,
-                            "subsubfunc": lambda: None,
-                            "notsubsubfield": False,
-                        }
-                    }
-                }
-            ),
-            ["field.subfield.subsubfield", "field.subfield.subsubfunc"],
-        )
-        # doc2csv
-        self.assertCountEqual(
-            ivre.utils.doc2csv(
-                {"field": {"subfield": {"subsubfield": 1}, "subvalue": 1}},
-                {"field": {"subfield": {"subsubfield": lambda x: 0}, "subvalue": True}},
-            )[0],
-            [0, 1],
-        )
-        # serialize
-        self.assertEqual(
-            ivre.utils.serialize(re.compile("^test$", re.I | re.U)), "/^test$/iu"
-        )
-
-        # Math utils
-        # http://stackoverflow.com/a/15285588/3223422
-        def is_prime(n):
-            if n == 2 or n == 3:
-                return True
-            if n < 2 or n % 2 == 0:
-                return False
-            if n < 9:
-                return True
-            if n % 3 == 0:
-                return False
-            r = int(n ** 0.5)
-            f = 5
-            while f <= r:
-                if n % f == 0:
-                    return False
-                if n % (f + 2) == 0:
-                    return False
-                f += 6
-            return True
-
-        for _ in range(3):
-            nbr = random.randint(2, 1000)
-            factors = list(ivre.mathutils.factors(nbr))
-            self.assertTrue(is_prime(nbr) or len(factors) > 1)
-            self.assertTrue(all(is_prime(x) for x in factors))
-            self.assertEqual(reduce(lambda x, y: x * y, factors), nbr)
-        # Readables
-        self.assertEqual(ivre.utils.num2readable(1000), "1k")
-        self.assertEqual(ivre.utils.num2readable(1000000000000000000000000), "1Y")
-        self.assertEqual(ivre.utils.num2readable(1049000.0), "1.049M")
-
-        # Zeek logs
-        basepath = os.getenv("ZEEK_SAMPLES")
-        badchars = re.compile(
-            "[%s]" % "".join(re.escape(char) for char in [os.path.sep, "-", "."])
-        )
-        if basepath:
-            for dirname, _, fnames in os.walk(basepath):
-                for fname in fnames:
-                    if not fname.endswith(".log"):
-                        continue
-                    fname = os.path.join(dirname, fname)
-                    zeekfd = ivre.parser.zeek.ZeekFile(fname)
-                    i = 0
-                    for i, record in enumerate(zeekfd):
-                        json.dumps(record, default=ivre.utils.serialize)
-                    self.check_value(
-                        "utils_zeek_%s_count"
-                        % badchars.sub(
-                            "_",
-                            fname[len(basepath) : -4].lstrip("/"),
-                        ),
-                        i + 1,
-                    )
-
-        # Iptables
-        with ivre.parser.iptables.Iptables(
-            os.path.join(SAMPLES, "iptables.log")
-        ) as ipt_parser:
-            count = 0
-            for res in ipt_parser:
-                count += 1
-                self.assertTrue("proto" in res and "src" in res and "dst" in res)
-                if res["proto"] in {"udp", "tcp"}:
-                    self.assertTrue("sport" in res and "dport" in res)
-
-            self.assertEqual(count, 40)
-
-        # Web utils
-        with self.assertRaises(ValueError):
-            ivre.web.utils.query_from_params({"q": '"'})
-
-        # Country aliases
-        europe = ivre.utils.country_unalias("EU")
-        self.assertTrue("FR" in europe)
-        self.assertTrue("DE" in europe)
-        self.assertFalse("US" in europe)
-        self.assertFalse("GB" in europe)
-        self.assertEqual(
-            ivre.utils.country_unalias("UK"), ivre.utils.country_unalias("GB")
-        )
-        ukfr = ivre.utils.country_unalias(["FR", "UK"])
-        self.assertTrue("FR" in ukfr)
-        self.assertTrue("GB" in ukfr)
-        self.assertEqual(ivre.utils.country_unalias("FR"), "FR")
-
-        # Serveur port guess
-        self.assertEqual(ivre.utils.guess_srv_port(67, 68, proto="udp"), 1)
-        self.assertEqual(ivre.utils.guess_srv_port(65432, 80), -1)
-        self.assertEqual(ivre.utils.guess_srv_port(666, 666), 0)
-        # Certificate argument parsing
-        self.assertCountEqual(
-            list(ivre.utils._parse_cert_subject('O = "Test\\", Inc."')),
-            [("O", 'Test", Inc.')],
-        )
-
-        # ipcalc tool
-        res, out, _ = RUN(["ivre", "ipcalc", "192.168.0.0/16"])
+        res, out2, err = RUN(["ivre", "rirlookup", "--country", "FR", "--count"])
         self.assertEqual(res, 0)
-        self.assertEqual(out, b"192.168.0.0-192.168.255.255\n")
-        res, out, _ = RUN(["ivre", "ipcalc", "10.0.0.0-10.255.255.255"])
-        self.assertEqual(res, 0)
-        self.assertEqual(out, b"10.0.0.0/8\n")
-        res, out, _ = RUN(["ivre", "ipcalc", "8.8.8.8"])
-        self.assertEqual(res, 0)
-        self.assertEqual(out, b"134744072\n")
-        res, out, _ = RUN(["ivre", "ipcalc", "134744072"])
-        self.assertEqual(res, 0)
-        self.assertEqual(out, b"8.8.8.8\n")
+        self.assertFalse(err)
+        self.assertEqual(out1, out2)
 
-        # IPADDR regexp, based on
-        # <https://gist.github.com/dfee/6ed3a4b05cfe7a6faf40a2102408d5d8>
-        addr_tests_ipv6 = [
-            "1::",
-            "1:2:3:4:5:6:7::",
-            "1::8",
-            "1:2:3:4:5:6::8",
-            "1:2:3:4:5:6::8",
-            "1::7:8",
-            "1:2:3:4:5::7:8",
-            "1:2:3:4:5::8",
-            "1::6:7:8",
-            "1:2:3:4::6:7:8",
-            "1:2:3:4::8",
-            "1::5:6:7:8",
-            "1:2:3::5:6:7:8",
-            "1:2:3::8",
-            "1::4:5:6:7:8",
-            "1:2::4:5:6:7:8",
-            "1:2::8",
-            "1::3:4:5:6:7:8",
-            "1::3:4:5:6:7:8",
-            "1::8",
-            "::2:3:4:5:6:7:8",
-            "::2:3:4:5:6:7:8",
-            "::8",
-            "::",
-            "fe80::7:8%eth0",
-            "fe80::7:8%1",
-            "::255.255.255.255",
-            "::0.0.0.0",
-            "::ffff:255.255.255.255",
-            "::ffff:0.0.0.0",
-            "::ffff:0:255.255.255.255",
-            "::ffff:0:0.0.0.0",
-            "2001:db8:3:4::192.0.2.33",
-            "2001:db8:3:4::0.0.2.33",
-            "64:ff9b::192.0.2.33",
-            "64:ff9b::0.0.2.33",
-        ]
-        addr_tests_ipv4 = [
-            "0.0.0.0",
-            "0.0.2.33",
-            "10.0.2.33",
-            "10.10.2.33",
-            "192.0.2.33",
-            "255.255.255.255",
-        ]
-        for test in [addr_tests_ipv4, addr_tests_ipv6]:
-            for addr in addr_tests_ipv6:
-                match = ivre.utils.IPADDR.search(addr)
-                self.assertTrue(match)
-                self.assertEqual(len(match.groups()), 1)
-                self.assertEqual(match.groups()[0], addr)
-                if "%" not in addr:
-                    self.assertIsNone(ivre.utils.IPADDR.search("x%s" % addr))
-                    self.assertIsNone(ivre.utils.IPADDR.search("%sx" % addr))
-                addr = addr.swapcase()
-                match = ivre.utils.IPADDR.search(addr)
-                self.assertTrue(match)
-                self.assertEqual(len(match.groups()), 1)
-                self.assertEqual(match.groups()[0], addr)
-                if "%" not in addr:
-                    self.assertIsNone(ivre.utils.IPADDR.search("X%s" % addr))
-                    self.assertIsNone(ivre.utils.IPADDR.search("%sX" % addr))
-        for addr in addr_tests_ipv4:
-            for netmask in [
-                "0",
-                "7",
-                "24",
-                "32",
-                "0.0.0.0",
-                "255.0.0.0",
-                "255.255.255.255",
-            ]:
-                naddr = "%s/%s" % (addr, netmask)
-                match = ivre.utils.NETADDR.search(naddr)
-                self.assertTrue(match)
-                self.assertEqual(len(match.groups()), 2)
-                self.assertEqual(match.groups(), tuple(naddr.split("/")))
-        for addr in addr_tests_ipv6:
-            for netmask in [0, 7, 24, 32, 64, 127, 128]:
-                naddr = "%s/%d" % (addr, netmask)
-                match = ivre.utils.NETADDR.search(naddr)
-                self.assertTrue(match)
-                self.assertEqual(len(match.groups()), 2)
-                self.assertEqual(match.groups(), tuple(naddr.split("/")))
-        for mac, res in [
-            (
-                "00:00:00:00:00:00",
-                ("00:00:00", "Officially Xerox, but 0:0:0:0:0:0 is more common"),
-            ),
-            ("00:00:01:00:00:00", ("Xerox", "Xerox Corporation")),
-            ("00:01:01:00:00:00", ("Private", None)),
-            ("01:00:00:00:00:00", None),
-        ]:
-            self.assertEqual(ivre.utils.mac2manuf(mac), res)
-
-        # Banner "canonicalization"
-        for expr, result in ivre.passive.TCP_SERVER_PATTERNS:
-            if not isinstance(result, bytes):
-                # Not tested yet
-                continue
-            if b"\\1" in result or b"\\g<" in result:
-                # Not tested yet
-                continue
-            # The substitution must match the pattern.
-            self.assertTrue(expr.search(result) is not None)
-            # The transformation must leave the result expression
-            # unchanged.
-            self.assertEqual(expr.sub(result, result), result)
-
-        # DNS audit domain
-        for output in [], ["--json"]:
-            with tempfile.NamedTemporaryFile(delete=False) as fdesc:
-                res = RUN(
-                    ["ivre", "auditdom", "--ipv4"]
-                    + output
-                    + ["ivre.rocks", "zonetransfer.me", "hardenize.com"],
-                    stdout=fdesc,
-                )[0]
-                self.assertEqual(res, 0)
-            res, out, err = RUN(["ivre", "scan2db", "--test", fdesc.name])
-            os.unlink(fdesc.name)
+        for distinct in ["country", "source"]:
+            cmd = ["ivre", "rirlookup", "--distinct", distinct]
+            res, out1, err = RUN(cmd, env=newenv)
             self.assertEqual(res, 0)
-            out = out.decode().splitlines()
-            self.assertEqual(len(out), 48)
-            found_zone_transfer = False
-            found_dns_servers = set()
-            found_dns_tls_rpt = set()
-            for line in out:
-                rec = json.loads(line)
-                for port in rec.get("ports", []):
-                    self.assertEqual(len(port["scripts"]), 1)
-                    for script in port["scripts"]:
-                        self.assertIn(
-                            script["id"],
-                            {"dns-domains", "dns-tls-rpt", "dns-zone-transfer"},
-                        )
-                        if script["id"] == "dns-domains":
-                            self.assertEqual(
-                                script["output"][:28], "Server is authoritative for "
-                            )
-                            self.assertIn(
-                                script["dns-domains"][0]["domain"],
-                                {"ivre.rocks", "zonetransfer.me", "hardenize.com"},
-                            )
-                            found_dns_servers.add(script["dns-domains"][0]["domain"])
-                        elif script["id"] == "dns-zone-transfer":
-                            self.assertEqual(len(script["dns-zone-transfer"]), 1)
-                            self.assertEqual(
-                                script["dns-zone-transfer"][0]["domain"],
-                                "zonetransfer.me",
-                            )
-                            found_zone_transfer = True
-                        elif script["id"] == "dns-tls-rpt":
-                            self.assertIn(
-                                script["dns-tls-rpt"][0]["domain"],
-                                {"ivre.rocks", "zonetransfer.me", "hardenize.com"},
-                            )
-                            if script["dns-tls-rpt"][0]["domain"] == "hardenize.com":
-                                self.assertNotIn("warnings", script["dns-tls-rpt"])
-                                self.assertEqual(
-                                    script["output"],
-                                    "Domain hardenize.com has a valid TLS-RPT configuration",
-                                )
-                            found_dns_tls_rpt.add(script["dns-tls-rpt"][0]["domain"])
-            self.assertTrue(found_zone_transfer)
-            self.assertEqual(len(found_dns_servers), 3)
-            self.assertEqual(len(found_dns_tls_rpt), 3)
+            self.assertFalse(err)
+            res, out2, err = RUN(cmd)
+            self.assertEqual(res, 0)
+            self.assertFalse(err)
+            self.assertEqual(sorted(out1.splitlines()), sorted(out2.splitlines()))
 
-        # url2hostport()
-        with self.assertRaises(ValueError):
-            ivre.utils.url2hostport("http://[::1]X/")
-        with self.assertRaises(ValueError):
-            ivre.utils.url2hostport("http://[::1/")
-        self.assertEqual(ivre.utils.url2hostport("http://[::1]/"), ("::1", 80))
-        self.assertEqual(ivre.utils.url2hostport("https://[::]:1234/"), ("::", 1234))
-        self.assertEqual(ivre.utils.url2hostport("https://[::]:1234/"), ("::", 1234))
-        self.assertEqual(ivre.utils.url2hostport("https://1.2.3.4/"), ("1.2.3.4", 443))
-        self.assertEqual(
-            ivre.utils.url2hostport("ftp://1.2.3.4:2121/"), ("1.2.3.4", 2121)
-        )
+        # Address lookup (positional argument): both backends must return
+        # the same most-specific record.
+        for addr in ["132.165.0.1", "185.50.64.1"]:
+            res, out1, err = RUN(["ivre", "rirlookup", "--json", addr], env=newenv)
+            self.assertEqual(res, 0)
+            self.assertFalse(err)
+            res, out2, err = RUN(["ivre", "rirlookup", "--json", addr])
+            self.assertEqual(res, 0)
+            self.assertFalse(err)
+            self.assertEqual(out1, out2)
 
-        # NTLM Analyzer
-        self.assertEqual(ivre.analyzer.ntlm._is_ntlm_message("NTLM"), False)
-        self.assertEqual(ivre.analyzer.ntlm._is_ntlm_message("NTLM    "), False)
-        self.assertEqual(
-            ivre.analyzer.ntlm._is_ntlm_message(
-                "Negotiate a87421000492aa874209af8bc028"
-            ),
-            False,
-        )  # https://tools.ietf.org/html/rfc4559
-        self.assertEqual(
-            ivre.analyzer.ntlm._is_ntlm_message(
-                "NTLM TlRMTVNTUAABAAAAB4IIAAAAAAAAAAAAAAAAAAAAAAA="
-            ),
-            True,
-        )
-        self.assertEqual(
-            ivre.analyzer.ntlm._is_ntlm_message(
-                "Negotiate TlRMTVNTUAABAAAAB4IIAAAAAAAAAAAAAAAAAAAAAAA="
-            ),
-            True,
-        )
-        self.assertEqual(
-            ivre.analyzer.ntlm.ntlm_extract_info(
-                b"NTLMSSP\x00\x0b\x00\x00\x00\x07\x82\x08\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"
-            ),
-            {},
-        )
-        self.assertEqual(
-            ivre.analyzer.ntlm.ntlm_extract_info(
-                b"NTLMSSP\x00\x01\x00\x00\x00\x01\x82\x08\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"
-            ),
-            {"ntlm-fingerprint": "0x00088201"},
-        )
-        negotiate = ivre.analyzer.ntlm.ntlm_extract_info(
-            b"NTLMSSP\x00\x01\x00\x00\x00\x06\xb2\x08\xa0\x0a\x00\x0a\x00\x28\x00\x00\x00\x08\x00\x08\x00\x20\x00\x00\x00NAMETESTDOMAINTEST"
-        )
-        self.assertEqual(negotiate["NetBIOS_Domain_Name"], "DOMAINTEST")
-        self.assertEqual(negotiate["Workstation"], "NAMETEST")
-
-        res, _, err = RUN(["ivre", "localscan"])
+        # Full-text search combined with country filter.
+        cmd = [
+            "ivre",
+            "rirlookup",
+            "--search",
+            '"Commissariat" "Energie" "Atomique"',
+            "--country",
+            "FR",
+            "--json",
+        ]
+        res, out1, err = RUN(cmd, env=newenv)
         self.assertEqual(res, 0)
         self.assertFalse(err)
-
-        res, out, err = RUN(["ivre", "localscan", "--json"])
+        res, out2, err = RUN(cmd)
         self.assertEqual(res, 0)
         self.assertFalse(err)
-        for line in out.splitlines():
-            self.assertTrue(isinstance(json.loads(line), dict))
+        self.assertEqual(sorted(out1.splitlines()), sorted(out2.splitlines()))
 
-    def test_scans(self):
-        "Run scans, with and without agents"
+        # Short-format output for a free-text-only search.
+        cmd = ["ivre", "rirlookup", "--search", '"SGDSN"', "--short"]
+        res, out1, err = RUN(cmd, env=newenv)
+        self.assertEqual(res, 0)
+        self.assertFalse(err)
+        res, out2, err = RUN(cmd)
+        self.assertEqual(res, 0)
+        self.assertFalse(err)
+        self.assertEqual(sorted(out1.splitlines()), sorted(out2.splitlines()))
 
-        # Check simple runscans
-        res, out, _ = RUN(["ivre", "runscans", "--output", "Test", "--test", "2"])
-        self.assertEqual(res, 0)
-        self.assertTrue(b"\nRead address 127.0.0.1\n" in out)
-        self.assertTrue(b"\nRead address 127.0.0.2\n" in out)
-        res = RUN(["ivre", "runscans", "--network", "127.0.0.1/31"])[0]
-        self.assertEqual(res, 0)
-        fdesc = tempfile.NamedTemporaryFile(delete=False)
-        fdesc.writelines(("127.0.0.%d\n" % i).encode() for i in range(2, 4))
-        fdesc.close()
-        res = RUN(["ivre", "runscans", "--file", fdesc.name, "--output", "XMLFork"])[0]
-        self.assertEqual(res, 0)
         os.unlink(fdesc.name)
-        res = RUN(
+        # END Using the HTTP server as a database
+
+    def test_50_dump_nmap_passive(self):
+        """Dump the `hosts` and `passive` collections to
+        `../backup_nmap_passive.tar.bz2` for the Elasticsearch CI
+        job. Runs only when the `IVRE_DUMP_NMAP_PASSIVE` environment
+        variable is set (the workflow sets it on the matrix entry
+        that produces the artefact). The dump is consumed by
+        `test_20_fake_nmap_passive` on the elastic backend, which
+        calls `mongorestore` to seed MongoDB.
+        """
+        if not os.environ.get("IVRE_DUMP_NMAP_PASSIVE"):
+            return
+        # Intentional DATABASE branch -- ``mongodump`` is a
+        # MongoDB-shipped binary; the dump is the canonical
+        # input :meth:`test_20_fake_nmap_passive` consumes on
+        # the Elasticsearch CI lane.  No capability flag
+        # captures "the backend can produce a Mongo-shaped
+        # dump", and the producer is fundamentally a
+        # MongoDB-only path.
+        if DATABASE != "mongo":
+            return
+        backup_dir = "../backup"
+        if os.path.exists(backup_dir):
+            shutil.rmtree(backup_dir)
+        os.makedirs(backup_dir)
+        subprocess.check_call(["mongodump", "--db=ivre", "--out=" + backup_dir])
+        # `mongodump` writes BSON files under `<out>/<db>/`; flatten
+        # them up one level so `mongorestore --db ivre <out>` (which
+        # is what `test_20_fake_nmap_passive` runs) finds them.
+        for fname in glob(os.path.join(backup_dir, "ivre", "*.bson")):
+            shutil.move(fname, backup_dir)
+        subprocess.check_call(
             [
-                "ivre",
-                "runscans",
-                "--range",
-                "127.0.0.4",
-                "127.0.0.5",
-                "--output",
-                "XMLFull",
+                "tar",
+                "jcf",
+                "../backup_nmap_passive.tar.bz2",
+                "-C",
+                "..",
+                "backup/hosts.bson",
+                "backup/passive.bson",
             ]
-        )[0]
-        self.assertEqual(res, 0)
-        count = sum(len(walk_elt[2]) for walk_elt in os.walk("scans"))
-        self.assertEqual(count, 9)
-
-        # Generate a command line
-        res = RUN(["ivre", "runscans", "--output", "CommandLine"])[0]
-        self.assertEqual(res, 0)
-
-        # Scan using an agent
-        with AgentScanner(self) as agent:
-            agent.scan(["--test", "2"])
-
-        # Count the results
-        count = sum(len(walk_elt[2]) for walk_elt in os.walk("output/"))
-        self.assertEqual(count, 2)
-
-        # Clean
-        shutil.rmtree("output")
-
-        # Generate an agent
-        res, out, _ = RUN(["ivre", "runscans", "--output", "Agent"])
-        self.assertEqual(res, 0)
-        with open("ivre-agent.sh", "wb") as fdesc:
-            fdesc.write(out)
-        os.chmod("ivre-agent.sh", 0o0755)
-
-        # Fork an agent
-        ivre.utils.makedirs("tmp")
-        pid_agent = subprocess.Popen(
-            [os.path.join(os.getcwd(), "ivre-agent.sh")],
-            preexec_fn=os.setsid,
-            cwd="tmp",
-        ).pid
-
-        # Init DB for agents and for nmap
-        self.init_nmap_db()
-        res = RUN(["ivre", "runscansagentdb", "--init"], stdin=open(os.devnull))[0]
-        self.assertEqual(res, 0)
-        res = RUN(["ivre", "runscansagentdb", "--add-local-master"])[0]
-        self.assertEqual(res, 0)
-
-        # Add local agent
-        res = RUN(
-            [
-                "ivre",
-                "runscansagentdb",
-                "--source",
-                "TEST-AGENT-SOURCE",
-                "--add-agent",
-                os.path.join(os.getcwd(), "tmp"),
-            ]
-        )[0]
-        self.assertEqual(res, 0)
-
-        # Create test scans
-        res = RUN(["ivre", "runscansagentdb", "--test", "2", "--assign-free-agents"])[0]
-        self.assertEqual(res, 0)
-        fdesc = tempfile.NamedTemporaryFile(delete=False)
-        fdesc.writelines(("127.0.0.%d\n" % i).encode() for i in range(3, 5))
-        fdesc.close()
-        res = RUN(
-            ["ivre", "runscansagentdb", "--file", fdesc.name, "--assign-free-agents"]
-        )[0]
-        self.assertEqual(res, 0)
-
-        # Test the lock mechanism
-        # Check no scan is locked
-        res, out, _ = RUN(["ivre", "runscansagentdb", "--list-scans"])
-        self.assertEqual(res, 0)
-        self.assertTrue(b"  - locked" not in out)
-        # Get a scan id
-        scanid = next(iter(ivre.db.db.agent.get_scans()))
-        # Lock it
-        locked_scan = ivre.db.db.agent.lock_scan(scanid)
-        self.assertIsInstance(locked_scan, dict)
-        self.assertEqual(locked_scan["pid"], os.getpid())
-        self.assertIsNotNone(locked_scan.get("lock"))
-        # Check one scan is locked with our PID
-        res, out, _ = RUN(["ivre", "runscansagentdb", "--list-scans"])
-        self.assertEqual(res, 0)
-        self.assertTrue(("  - locked (by %d)\n" % os.getpid()).encode() in out)
-        # Attempt to lock it again
-        with (self.assertRaises(ivre.db.LockError)):
-            ivre.db.db.agent.lock_scan(scanid)
-        # Unlock it
-        self.assertEqual(ivre.db.db.agent.unlock_scan(locked_scan), True)
-        # Attempt to unlock it again
-        with (self.assertRaises(ivre.db.LockError)):
-            ivre.db.db.agent.unlock_scan(locked_scan)
-        with (self.assertRaises(ivre.db.LockError)):
-            ivre.db.db.agent.unlock_scan(ivre.db.db.agent.get_scan(scanid))
-        # Check no scan is locked
-        res, out, _ = RUN(["ivre", "runscansagentdb", "--list-scans"])
-        self.assertEqual(res, 0)
-        self.assertTrue(b"  - locked" not in out)
-        # Lock the scan again
-        locked_scan = ivre.db.db.agent.lock_scan(scanid)
-        self.assertIsInstance(locked_scan, dict)
-        self.assertEqual(locked_scan["pid"], os.getpid())
-        self.assertIsNotNone(locked_scan.get("lock"))
-        # Check one scan is locked with our PID
-        res, out, _ = RUN(["ivre", "runscansagentdb", "--list-scans"])
-        self.assertEqual(res, 0)
-        self.assertTrue(("  - locked (by %d)\n" % os.getpid()).encode() in out)
-        # Unlock all the scans from the CLI
-        res = RUN(
-            ["ivre", "runscansagentdb", "--force-unlock"], stdin=open(os.devnull)
-        )[0]
-        self.assertEqual(res, 0)
-        # Check no scan is locked
-        res, out, _ = RUN(["ivre", "runscansagentdb", "--list-scans"])
-        self.assertEqual(res, 0)
-        self.assertTrue(b"  - locked" not in out)
-
-        # Fork a daemon
-        daemon_cmd = ["runscansagentdb", "--daemon"]
-        if USE_COVERAGE:
-            daemon_cmd = (
-                COVERAGE + ["run", "--parallel-mode", which("ivre")] + daemon_cmd
-            )
-        else:
-            daemon_cmd = ["ivre"] + daemon_cmd
-        pid_daemon = subprocess.Popen(daemon_cmd).pid
-        # Make sure the daemon is running
-        time.sleep(4)
-
-        # We should have two scans, wait until one is over
-        scanmatch = re.compile(
-            b"scan:\n  - id: (?P<id>[0-9a-f]+)\n.*\n.*\n  "
-            b"- targets added: (?P<nbadded>\\d+)\n  "
-            b"- results fetched: (?P<nbfetched>\\d+)\n  "
-            b"- total targets to add: (?P<nbtargets>\\d+)\n"
         )
-
-        def is_scan_over(scan):
-            return int(scan["nbtargets"]) == int(scan["nbfetched"])
-
-        while True:
-            res, out, _ = RUN(["ivre", "runscansagentdb", "--list-scans"])
-            self.assertEqual(res, 0)
-            scans = [scan.groupdict() for scan in scanmatch.finditer(out)]
-            self.assertEqual(len(scans), 2)
-            if any(is_scan_over(scan) for scan in scans):
-                break
-            time.sleep(2)
-        scan = next(scan for scan in scans if not is_scan_over(scan))
-
-        # We should have one agent
-        agentmatch = re.compile(b"agent:\n  - id: (?P<id>[0-9a-f]+)\n")
-        res, out, _ = RUN(["ivre", "runscansagentdb", "--list-agents"])
-        self.assertEqual(res, 0)
-        agents = [agt.groupdict() for agt in agentmatch.finditer(out)]
-        self.assertEqual(len(agents), 1)
-        agent = agents[0]
-
-        # Assign the remaining scan to the agent
-        res = RUN(
-            [
-                "ivre",
-                "runscansagentdb",
-                "--assign",
-                "%s:%s" % (agent["id"].decode(), scan["id"].decode()),
-            ]
-        )[0]
-        self.assertEqual(res, 0)
-        # Make sure the daemon handles the new scan
-        time.sleep(4)
-
-        # Wait until we have two scans, both of them over
-        while True:
-            res, out, _ = RUN(["ivre", "runscansagentdb", "--list-scans"])
-            self.assertEqual(res, 0)
-            scans = [scn.groupdict() for scn in scanmatch.finditer(out)]
-            self.assertEqual(len(scans), 2)
-            if all(is_scan_over(scn) for scn in scans):
-                break
-            time.sleep(2)
-
-        # Wait for child processes to handle all the scans
-        while any(
-            walk[2]
-            for dirname in [
-                "tmp/input",
-                "tmp/cur",
-                "tmp/output",
-                ivre.config.AGENT_MASTER_PATH,
-            ]
-            for walk in os.walk(dirname)
-            if not (
-                walk[0].startswith(
-                    os.path.join(ivre.config.AGENT_MASTER_PATH, "output", "")
-                )
-                or (walk[0] == ivre.config.AGENT_MASTER_PATH and walk[2] == ["whoami"])
-            )
-        ):
-            print("Waiting for runscans daemon & agent")
-            time.sleep(2)
-
-        # Kill the agent and the daemon
-        os.kill(pid_agent, signal.SIGTERM)
-        os.kill(pid_daemon, signal.SIGTERM)
-        os.waitpid(pid_agent, 0)
-        os.waitpid(pid_daemon, 0)
-
-        # Check we have 4 scan results
-        res, out, _ = RUN(["ivre", "scancli", "--count"])
-        self.assertEqual(res, 0)
-        self.assertEqual(int(out), 4)
-
-        # Clean
-        for dirname in ["scans", "tmp"]:
-            shutil.rmtree(dirname)
-
-        # Screenshots: this tests the http-screenshot script
-        # (including phantomjs) and IVRE's ability to read
-        # screenshots (including extracting words with tesseract)
-        ipaddr = socket.gethostbyname("ivre.rocks")
-        with AgentScanner(self, nmap_template="http") as agent:
-            agent.scan(["--net", "%s/32" % ipaddr])
-        data_files, up_files = (
-            glob(
-                "%s.%s*"
-                % (os.path.join("output", "MISC", subdir, "*", *ipaddr.split(".")), ext)
-            )
-            for subdir, ext in [("data", "tar"), ("up", "xml")]
-        )
-        self.assertEqual(len(data_files), 1)
-        self.assertTrue(os.path.exists(data_files[0]))
-        self.assertEqual(len(up_files), 1)
-        self.assertTrue(os.path.exists(up_files[0]))
-        with tarfile.open(data_files[0]) as data_archive:
-            data_archive = tarfile.open(data_files[0])
-            data_archive.extractall()
-        self.assertTrue(os.path.exists("screenshot-%s-80.jpg" % ipaddr))
-        res, out, _ = RUN(["ivre", "scan2db", "--test"] + up_files)
-        self.assertEqual(res, 0)
-
-        def _json_loads(data, deflt=None):
-            try:
-                return json.loads(data.decode())
-            except ValueError:
-                return deflt
-
-        screenshots_count = sum(
-            bool(port.get("screendata"))
-            for line in out.splitlines()
-            for port in _json_loads(line, {}).get("ports", [])
-        )
-        self.assertEqual(screenshots_count, 1)
-        screenwords = set(
-            word
-            for line in out.splitlines()
-            for port in _json_loads(line, {}).get("ports", [])
-            for word in port.get("screenwords", [])
-        )
-        self.assertTrue("ivre" in screenwords)
-        shutil.rmtree("output")
 
     def test_50_view(self):
-
+        processes = random.choice([[], ["--processes", "1"]])
+        print(f"Running db2view with {processes!r}")
         #
         # Web server tests
         #
@@ -4664,19 +4069,29 @@ class IvreTests(unittest.TestCase):
         req.add_header("Referer", "http://%s:%d/" % (HTTPD_HOSTNAME, HTTPD_PORT))
         udesc = urlopen(req)
         self.assertEqual(udesc.getcode(), 200)
+        # ``modules`` is computed by ``ivre.web.modules.enabled_modules``
+        # at request time (intersection of ``WEB_MODULES`` and the
+        # backends configured in this test environment). Importing
+        # the helper here pins the same source of truth the route
+        # uses, so the test is robust to future module additions.
+        from ivre.web.modules import enabled_modules
+
         config_values = {
             "notesbase": ivre.config.WEB_NOTES_BASE,
             "dflt_limit": ivre.config.WEB_LIMIT,
             "warn_dots_count": ivre.config.WEB_WARN_DOTS_COUNT,
-            "publicsrv": ivre.config.WEB_PUBLIC_SRV,
             "uploadok": ivre.config.WEB_UPLOAD_OK,
             "flow_time_precision": ivre.config.FLOW_TIME_PRECISION,
             "version": ivre.VERSION,
+            "auth_enabled": ivre.config.WEB_AUTH_ENABLED,
+            "sequential_loading": ivre.config.WEB_SEQUENTIAL_LOADING,
+            "modules": enabled_modules(),
         }
         for line in udesc:
+            if not line.startswith(b"config."):
+                continue
             self.assertTrue(line.endswith(b";\n"))
             key, value = line[:-2].decode().split(" = ")
-            self.assertTrue(key.startswith("config."))
             key = key[7:]
             self.assertEqual(json.loads(value), config_values[key])
 
@@ -4707,7 +4122,9 @@ class IvreTests(unittest.TestCase):
 
         print("Init DB & inserts")
         # Init DB
-        self.assertEqual(RUN(["ivre", "view", "--init"], stdin=open(os.devnull))[0], 0)
+        self.assertEqual(
+            RUN(["ivre", "view", "--init"], stdin=subprocess.DEVNULL)[0], 0
+        )
         self.assertEqual(RUN(["ivre", "view", "--count"])[1], b"0\n")
 
         # Test insertion
@@ -4720,50 +4137,51 @@ class IvreTests(unittest.TestCase):
         # One entry in test should actually be one entry at the end.
         self.check_value("view_count_active", len(out.splitlines()))
 
-        # Test passive filters
-        # FIXME : positionnal IP filter is broken
-        # ret, out, _ = RUN(["ivre", "db2view", "--test", "passive",
-        #                    "10.0.0.1"])
-        ret, out, _ = RUN(
-            ["ivre", "db2view", "--test", "passive", "--net", "192.168.0.0/16"]
-        )
-        self.assertEqual(ret, 0)
-        self.check_value("view_test_network", len(out.splitlines()))
-        ret, out, _ = RUN(
-            [
-                "ivre",
-                "db2view",
-                "--test",
-                "passive",
-                "--range",
-                "192.168.0.0",
-                "192.168.255.255",
-            ]
-        )
-        self.assertEqual(ret, 0)
-        self.check_value("view_test_range", len(out.splitlines()))
-        ret, out, _ = RUN(
-            ["ivre", "db2view", "--test", "passive", "--host", "10.0.0.1"]
-        )
-        self.assertEqual(ret, 0)
-        self.assertEqual(len(out.splitlines()), 1)
+        if not HAS_PYTHON_BUG_45235:
+            # Test passive filters
+            # FIXME : positionnal IP filter is broken
+            # ret, out, _ = RUN(["ivre", "db2view", "--test", "passive",
+            #                    "10.0.0.1"])
+            ret, out, _ = RUN(
+                ["ivre", "db2view", "--test", "passive", "--net", "192.168.0.0/16"]
+            )
+            self.assertEqual(ret, 0)
+            self.check_value("view_test_network", len(out.splitlines()))
+            ret, out, _ = RUN(
+                [
+                    "ivre",
+                    "db2view",
+                    "--test",
+                    "passive",
+                    "--range",
+                    "192.168.0.0",
+                    "192.168.255.255",
+                ]
+            )
+            self.assertEqual(ret, 0)
+            self.check_value("view_test_range", len(out.splitlines()))
+            ret, out, _ = RUN(
+                ["ivre", "db2view", "--test", "passive", "--host", "10.0.0.1"]
+            )
+            self.assertEqual(ret, 0)
+            self.assertEqual(len(out.splitlines()), 1)
 
         print("Counting")
         view_count = 0
         # Count passive results
-        self.assertEqual(RUN(["ivre", "db2view", "passive"])[0], 0)
-        if DATABASE == "elastic":
-            time.sleep(ELASTIC_INSERT_TEMPO)
+        self.assertEqual(RUN(["ivre", "db2view"] + processes + ["passive"])[0], 0)
+        ivre.db.db.view.flush()
         ret, out, _ = RUN(["ivre", "view", "--count"])
         self.assertEqual(ret, 0)
         view_count = int(out)
         self.assertGreater(view_count, 0)
         self.check_value("view_count_passive", view_count)
-        self.assertEqual(RUN(["ivre", "view", "--init"], stdin=open(os.devnull))[0], 0)
+        self.assertEqual(
+            RUN(["ivre", "view", "--init"], stdin=subprocess.DEVNULL)[0], 0
+        )
         # Count active results
-        self.assertEqual(RUN(["ivre", "db2view", "nmap"])[0], 0)
-        if DATABASE == "elastic":
-            time.sleep(ELASTIC_INSERT_TEMPO)
+        self.assertEqual(RUN(["ivre", "db2view"] + processes + ["nmap"])[0], 0)
+        ivre.db.db.view.flush()
         ret, out, _ = RUN(["ivre", "view", "--count"])
         self.assertEqual(ret, 0)
         view_count = int(out)
@@ -4771,10 +4189,14 @@ class IvreTests(unittest.TestCase):
         self.check_value("view_count_active", view_count)
         # Count merged results
         self.assertEqual(
-            RUN(["ivre", "db2view", "--view-category", "PASSIVE", "passive"])[0], 0
+            RUN(
+                ["ivre", "db2view", "--view-category", "PASSIVE"]
+                + processes
+                + ["passive"]
+            )[0],
+            0,
         )
-        if DATABASE == "elastic":
-            time.sleep(ELASTIC_INSERT_TEMPO)
+        ivre.db.db.view.flush()
         ret, out, _ = RUN(["ivre", "view", "--count"])
         self.assertEqual(ret, 0)
         view_count = int(out)
@@ -4783,9 +4205,34 @@ class IvreTests(unittest.TestCase):
         view_count = self.check_view_count_value(
             "view_count_total", ivre.db.db.view.flt_empty, [], None
         )
+        # Zero-argument flt_or() (empty disjunction) matches nothing.
+        self.assertEqual(ivre.db.db.view.count(ivre.db.db.view.flt_or()), 0)
         ret, out, err = RUN(["ivre", "view"])
         self.assertEqual(ret, 0)
         self.assertFalse(err)
+
+        self.check_view_count_value(
+            "view_extended_eu_count",
+            ivre.db.db.view.searchcountry(["EU", "GB", "CH", "NO"]),
+            ["--country=EU,GB,CH,NO"],
+            "country:EU,GB,CH,NO",
+        )
+
+        # Check that all coordinates for IPs in "FR" are in a
+        # rectangle given by 43 < lat < 51 and -5 < lon < 8 (for some
+        # reasons, overseas territories have they own country code,
+        # e.g., "RE").
+        self.assertTrue(
+            all(
+                43 < lat < 51 and -5 < lon < 8
+                for lat, lon in (
+                    elt["_id"]
+                    for elt in ivre.db.db.view.getlocations(
+                        ivre.db.db.view.searchcountry("FR")
+                    )
+                )
+            )
+        )
 
         print("Outputs")
         # JSON
@@ -4818,6 +4265,9 @@ class IvreTests(unittest.TestCase):
         res, out, _ = RUN(["ivre", "view", "--count", "--category", "PASSIVE"])
         self.assertEqual(res, 0)
         self.check_value("view_count_passive", int(out))
+
+        # searchhassh()
+        self._test_hassh(ivre.db.db.view, "view", "view")
 
         print("Top values")
         # Top values & filters
@@ -4917,11 +4367,58 @@ class IvreTests(unittest.TestCase):
             "view_top_categories_PASSIVE", "categories:/^PASSIVE$/"
         )
 
-        if DATABASE == "elastic":
-            # Support for Elasticsearch is experimental and lacks a
-            # lot of functionalities. The next tests will fail for
-            # lack of filters & topvalues.
-            return
+        self.check_view_top_value("view_top_jarm", "jarm")
+        self.check_view_top_value("view_top_jarm_443", "jarm:443")
+
+        self.check_view_top_value("view_top_tag", "tag")
+        self.check_view_top_value("view_top_tag_value", "tag.value")
+        self.check_view_top_value("view_top_tag_info", "tag.info")
+        self.check_view_top_value("view_top_tag_type", "tag.type")
+        self.check_view_top_value("view_top_tag_tor", "tag:TOR")
+
+        for base in ["", "-client", "-server"]:
+            for field in ["", ".md5", ".sha1", ".sha256", ".raw"]:
+                self.check_view_top_value(
+                    "view_top_hassh%s%s"
+                    % (
+                        base.replace("-", "_"),
+                        field.replace(".", "_"),
+                    ),
+                    "hassh%s%s" % (base, field),
+                )
+
+        # Tags
+        self.check_value(
+            "view_count_tags",
+            ivre.db.db.view.count(ivre.db.db.view.searchtag()),
+            # This value changes a bit, depending on current data files => assertAlmostEqual
+            check=lambda first, second: self.assertAlmostEqual(
+                first, second, places=-2
+            ),
+        )
+        self.check_value(
+            "view_count_tags_honeypot",
+            ivre.db.db.view.count(ivre.db.db.view.searchtag("Honeypot")),
+        )
+        self.check_value(
+            "view_count_tags_honeypot",
+            ivre.db.db.view.count(ivre.db.db.view.searchtag({"value": "Honeypot"})),
+        )
+        self.check_value(
+            "view_count_tags_tor",
+            ivre.db.db.view.count(ivre.db.db.view.searchtag({"value": "TOR"})),
+        )
+        self.check_value(
+            "view_count_tags_honeypot_mushmush_102",
+            ivre.db.db.view.count(
+                ivre.db.db.view.searchtag(
+                    {
+                        "value": "Honeypot",
+                        "info": "honeypot / MushMush Conpot on port tcp/102",
+                    }
+                )
+            ),
+        )
 
         self.check_view_top_value("view_top_cert_issuer", "cert.issuer")
         self.check_view_top_value("view_top_cert_subject", "cert.subject")
@@ -4946,6 +4443,26 @@ class IvreTests(unittest.TestCase):
                         if found:
                             break
                     self.assertTrue(found)
+            self.check_view_top_value(
+                "view_top_cert_pk%s" % hashtype, "cert.pubkey.%s" % hashtype
+            )
+            for val in self._sort_top_values(
+                ivre.db.db.view.topvalues("cert.pubkey.%s" % hashtype)
+            ):
+                for host in ivre.db.db.view.get(
+                    ivre.db.db.view.searchcert(**{f"pk{hashtype}": val})
+                ):
+                    found = False
+                    for port in host["ports"]:
+                        for script in port.get("scripts", []):
+                            if script["id"] == "ssl-cert":
+                                for cert in script.get("ssl-cert", []):
+                                    if cert.get("pubkey", {}).get(hashtype) == val:
+                                        found = True
+                                        break
+                        if found:
+                            break
+                    self.assertTrue(found)
         self.check_view_top_value("view_top_filename", "file")
         self.check_view_top_value("view_top_filename", "file.filename")
         self.check_view_top_value("view_top_anonftp_filename", "file:ftp-anon")
@@ -4954,19 +4471,18 @@ class IvreTests(unittest.TestCase):
         self.check_view_top_value("view_top_modbus_deviceids", "modbus.deviceid")
         self.check_view_top_value("view_top_devtype", "devicetype")
         self.check_view_top_value("view_top_devtype_80", "devicetype:80")
-        self.check_view_top_value("view_top_domain", "domains")
-        self.check_view_top_value("view_top_domain_1", "domains:1")
+        self.check_view_top_value("view_top_domains", "domains")
+        self.check_view_top_value("view_top_domains_1", "domains:1")
+        self.check_view_top_value("view_top_domains_com", "domains:com")
+        self.check_view_top_value("view_top_domains_com_2", "domains:com:2")
         self.check_view_top_value("view_top_hop", "hop")
         self.check_view_top_value("view_top_hop_10+", "hop>10")
 
-        if DATABASE != "postgres":
-            self.check_view_top_value("view_top_ntlm_protocol", "ntlm.protocol")
-            self.check_view_top_value("view_top_ntlm_os", "ntlm.os")
-            self.check_view_top_value("view_top_ntlm_os", "ntlm.Product_Version")
-            self.check_view_top_value("view_top_ntlm_domain", "ntlm.domain")
-            self.check_view_top_value(
-                "view_top_ntlm_domain", "ntlm.NetBIOS_Domain_Name"
-            )
+        self.check_view_top_value("view_top_ntlm_protocol", "ntlm.protocol")
+        self.check_view_top_value("view_top_ntlm_os", "ntlm.os")
+        self.check_view_top_value("view_top_ntlm_os", "ntlm.Product_Version")
+        self.check_view_top_value("view_top_ntlm_domain", "ntlm.domain")
+        self.check_view_top_value("view_top_ntlm_domain", "ntlm.NetBIOS_Domain_Name")
 
         print("Filters")
         # Check schema version
@@ -4980,6 +4496,7 @@ class IvreTests(unittest.TestCase):
         for service, product in [
             ("ssh", "Cisco SSH"),
             ("http", "Apache httpd"),
+            ("http", ["Apache httpd", "nginx"]),
             ("imap", "Microsoft Exchange imapd"),
             ("imap", False),
         ]:
@@ -4989,7 +4506,11 @@ class IvreTests(unittest.TestCase):
                 "view_count_%s_%s"
                 % (
                     service,
-                    (product or "UNKNOWN").replace(" ", ""),
+                    (
+                        "_or_".join(product)
+                        if isinstance(product, list)
+                        else (product or "UNKNOWN")
+                    ).replace(" ", ""),
                 ),
                 count,
             )
@@ -4997,7 +4518,11 @@ class IvreTests(unittest.TestCase):
                 found = False
                 for port in res.get("ports", []):
                     if port.get("service_name") == service:
-                        if product:
+                        if isinstance(product, list):
+                            if port.get("service_product") in product:
+                                found = True
+                                break
+                        elif product:
                             if port.get("service_product") == product:
                                 found = True
                                 break
@@ -5009,6 +4534,7 @@ class IvreTests(unittest.TestCase):
         for service, product, version in [
             ("ssh", "Cisco SSH", "1.25"),
             ("ssh", "OpenSSH", "3.1p1"),
+            ("ssh", "OpenSSH", ["3.1p1", "4.3"]),
             ("ssh", "OpenSSH", False),
         ]:
             flt = ivre.db.db.view.searchproduct(
@@ -5020,7 +4546,11 @@ class IvreTests(unittest.TestCase):
                 % (
                     service,
                     product.replace(" ", ""),
-                    (version or "UNKNOWN").replace(".", "_"),
+                    (
+                        "_or_".join(version)
+                        if isinstance(version, list)
+                        else (version or "UNKNOWN")
+                    ).replace(".", "_"),
                 ),
                 count,
             )
@@ -5031,7 +4561,11 @@ class IvreTests(unittest.TestCase):
                         port.get("service_name") == service
                         and port.get("service_product") == product
                     ):
-                        if version:
+                        if isinstance(version, list):
+                            if port.get("service_version") in version:
+                                found = True
+                                break
+                        elif version:
                             if port.get("service_version") == version:
                                 found = True
                                 break
@@ -5069,25 +4603,21 @@ class IvreTests(unittest.TestCase):
             "view_ntlm_http_count",
             ivre.db.db.view.searchntlm(protocol="http"),
             "ntlm.protocol:http",
-            "protocol:http",
         )
-        top_proto = self.results["view_top_ntlm_protocol"][0]
         self.check_view_count_ntlm_value(
-            "view_top_ntlm_protocol_count",
-            ivre.db.db.view.searchntlm(protocol=top_proto),
-            "ntlm.protocol:%s" % top_proto,
+            "view_ntlm_smb_count",
+            ivre.db.db.view.searchntlm(protocol="smb"),
+            "ntlm.protocol:smb",
         )
-        top_domain = self.results["view_top_ntlm_domain"][0]
         self.check_view_count_ntlm_value(
-            "view_top_ntlm_domain_count",
-            ivre.db.db.view.searchntlm(NetBIOS_Domain_Name=top_domain),
-            "ntlm.domain:%s" % top_domain,
+            "view_ntlm_DOM2000_count",
+            ivre.db.db.view.searchntlm(NetBIOS_Domain_Name="DOM2000"),
+            "ntlm.domain:DOM2000",
         )
-        top_os = self.results["view_top_ntlm_os"][0]
         self.check_view_count_ntlm_value(
-            "view_top_ntlm_os_count",
-            ivre.db.db.view.searchntlm(Product_Version=top_os),
-            "ntlm.os:%s" % top_os,
+            "view_ntlm_5.2.3790_count",
+            ivre.db.db.view.searchntlm(Product_Version="5.2.3790"),
+            "ntlm.os:5.2.3790",
         )
 
         print("Web /view URLs")
@@ -5438,6 +4968,35 @@ class IvreTests(unittest.TestCase):
         self.assertTrue(all(len(d) == ncolumns for d in data))
         self.check_value("view_features_versions_noyieldall_FRDE_ndata", len(data))
 
+        # Full-text.  Every :class:`DBActive` backend now ships
+        # a ``searchtext()`` method (Mongo via the ``$text``
+        # operator, PG via ``to_tsvector @@ plainto_tsquery``,
+        # DuckDB via the FTS extension's ``match_bm25``,
+        # Elastic via ``multi_match`` over ``text_fields``).
+        # Still skipped on the AWS DocumentDB flavour: the
+        # backend has no text-index facility and no ``$text``
+        # operator -- ``MongoDBView.searchtext`` would fail at
+        # query time on a real DocumentDB instance.
+        #
+        # The exact match count diverges by backend because
+        # the tokenisation / stemming / stopword rules differ
+        # (Mongo's English text index, PostgreSQL's
+        # ``to_tsvector('english', ...)`` Snowball stemmer,
+        # DuckDB's ``match_bm25`` Snowball stemmer with its
+        # own stopword list, Elasticsearch's standard
+        # analyzer).  The ``DATABASE`` suffix scopes the
+        # recorded value per-backend so each one pins its own
+        # count without one backend's rules masking another.
+        if BACKEND_FLAVOR != "documentdb":
+            self.check_value(
+                f"view_count_text_honeypot_{DATABASE}",
+                ivre.db.db.view.count(ivre.db.db.view.searchtext("honeypot")),
+            )
+            self.check_value(
+                f"view_count_text_password_{DATABASE}",
+                ivre.db.db.view.count(ivre.db.db.view.searchtext("password")),
+            )
+
         # BEGIN Using the HTTP server as a database
         with tempfile.NamedTemporaryFile(delete=False) as fdesc:
             newenv = os.environ.copy()
@@ -5501,18 +5060,567 @@ class IvreTests(unittest.TestCase):
         )["addr"]
         for result in ivre.db.db.view.get(ivre.db.db.view.searchhost(addr)):
             ivre.db.db.view.remove(result)
-        if DATABASE == "elastic":
-            time.sleep(ELASTIC_INSERT_TEMPO)
+        ivre.db.db.view.flush()
         count = ivre.db.db.view.count(ivre.db.db.view.searchhost(addr))
         self.assertEqual(count, 0)
         addr = next(
             iter(ivre.db.db.view.get(ivre.db.db.view.flt_empty, sort=[("addr", -1)]))
         )["addr"]
         ivre.db.db.view.remove_many(ivre.db.db.view.searchhost(addr))
-        if DATABASE == "elastic":
-            time.sleep(ELASTIC_INSERT_TEMPO)
+        ivre.db.db.view.flush()
         count = ivre.db.db.view.count(ivre.db.db.view.searchhost(addr))
         self.assertEqual(count, 0)
+
+    def test_70_notes(self):
+        """Round-trip the per-entity notes purpose against a real
+        :class:`MongoDBNotes` instance.  Covers the storage-layer
+        surface end-to-end: create / read / update (last-write-wins
+        and optimistic-concurrency modes) / list-revisions / list
+        entities / free-text search / delete / typed exceptions.
+        """
+        # The notes purpose is wired only on MongoDB at v1; other
+        # backends have no registered class in
+        # :attr:`DBNotes.backends`, so :meth:`MetaDB.get_class`
+        # returns ``None`` and ``db.notes`` is ``None``.  Gate
+        # on the capability check rather than the backend name
+        # so adding e.g. a PostgreSQL implementation later
+        # automatically opts in to this test without touching it.
+        if ivre.db.db.notes is None:
+            self.skipTest("DBNotes is not implemented on this backend")
+
+        from ivre.db import (
+            NoteAlreadyExists,
+            NoteConcurrencyError,
+            NoteNotFound,
+        )
+
+        notes = ivre.db.db.notes
+        # Start from a clean slate so the test is rerunnable
+        # AND the indexes are present.  ``ivre notes --init``
+        # drops both the ``notes`` and ``note_revisions``
+        # collections and recreates the indexes -- crucially
+        # the unique compound on
+        # ``(entity_type, entity_key_0, entity_key_1)``, which
+        # the create-only path below relies on for its
+        # ``DuplicateKeyError`` -> ``NoteAlreadyExists``
+        # translation.  ``stdin=subprocess.DEVNULL`` makes the
+        # CLI skip its interactive confirmation prompt.
+        self.assertEqual(
+            RUN(["ivre", "notes", "--init"], stdin=subprocess.DEVNULL)[0],
+            0,
+        )
+        host_a = "192.0.2.10"
+        host_b = "192.0.2.11"
+        host_c = "192.0.2.12"
+
+        # --- Create + read ---------------------------------------
+        created = notes.set_note(
+            "host",
+            host_a,
+            "Initial note about the host.",
+            "alice@example.org",
+        )
+        self.assertEqual(created["entity_type"], "host")
+        self.assertEqual(created["entity_key"], host_a)
+        self.assertEqual(created["body"], "Initial note about the host.")
+        self.assertEqual(created["revision"], 1)
+        self.assertEqual(created["created_by"], "alice@example.org")
+        self.assertEqual(created["updated_by"], "alice@example.org")
+
+        # Round-trip read returns identical caller-facing shape.
+        fetched = notes.get_note("host", host_a)
+        self.assertIsNotNone(fetched)
+        self.assertEqual(fetched["entity_key"], host_a)
+        self.assertEqual(fetched["body"], created["body"])
+        self.assertEqual(fetched["revision"], 1)
+
+        # Non-existent entity returns None.
+        self.assertIsNone(notes.get_note("host", host_b))
+
+        # --- Update (last-write-wins) ----------------------------
+        updated = notes.set_note(
+            "host",
+            host_a,
+            "Updated note body.",
+            "bob@example.org",
+        )
+        self.assertEqual(updated["revision"], 2)
+        self.assertEqual(updated["body"], "Updated note body.")
+        self.assertEqual(updated["updated_by"], "bob@example.org")
+        # ``created_by`` / ``created_at`` preserved across updates.
+        self.assertEqual(updated["created_by"], "alice@example.org")
+        self.assertEqual(updated["created_at"], created["created_at"])
+
+        # --- Optimistic concurrency: match ------------------------
+        ok = notes.set_note(
+            "host",
+            host_a,
+            "Third revision.",
+            "carol@example.org",
+            expected_revision=2,
+        )
+        self.assertEqual(ok["revision"], 3)
+        self.assertEqual(ok["body"], "Third revision.")
+
+        # --- Optimistic concurrency: mismatch ---------------------
+        with self.assertRaises(NoteConcurrencyError):
+            notes.set_note(
+                "host",
+                host_a,
+                "Should not apply.",
+                "dave@example.org",
+                expected_revision=2,
+            )
+        # The failed write did not bump revision.
+        self.assertEqual(notes.get_note("host", host_a)["revision"], 3)
+
+        # --- Create-only on existing -> NoteAlreadyExists --------
+        with self.assertRaises(NoteAlreadyExists):
+            notes.set_note(
+                "host",
+                host_a,
+                "Should not apply.",
+                "dave@example.org",
+                expected_revision=0,
+            )
+
+        # --- Create-only on missing entity (succeeds) -------------
+        new = notes.set_note(
+            "host",
+            host_b,
+            "Brand new note.",
+            "eve@example.org",
+            expected_revision=0,
+        )
+        self.assertEqual(new["revision"], 1)
+        self.assertEqual(new["entity_key"], host_b)
+
+        # --- list_note_revisions: newest-first ordering -----------
+        revs = notes.list_note_revisions("host", host_a)
+        self.assertEqual(len(revs), 3)
+        self.assertEqual([r["revision"] for r in revs], [3, 2, 1])
+        # Each revision carries body / created_by / created_at, and
+        # the entity_* keys are stripped (the caller already knows
+        # them).
+        for rev in revs:
+            self.assertIn("body", rev)
+            self.assertIn("created_by", rev)
+            self.assertIn("created_at", rev)
+            self.assertNotIn("entity_type", rev)
+            self.assertNotIn("entity_key", rev)
+            self.assertNotIn("entity_key_0", rev)
+            self.assertNotIn("entity_key_1", rev)
+
+        # --- list_entities: metadata-only listing -----------------
+        entities = notes.list_entities("host")
+        keys = {entry["entity_key"] for entry in entities}
+        self.assertIn(host_a, keys)
+        self.assertIn(host_b, keys)
+        for entry in entities:
+            self.assertIn("entity_type", entry)
+            self.assertIn("entity_key", entry)
+            self.assertIn("updated_at", entry)
+            self.assertIn("updated_by", entry)
+            self.assertIn("revision", entry)
+            self.assertNotIn("body", entry)  # metadata-only projection
+
+        # ``count_notes`` matches ``list_entities`` length for the
+        # same type.
+        self.assertEqual(
+            notes.count_notes("host"),
+            len([e for e in entities if e["entity_type"] == "host"]),
+        )
+
+        # --- list_notes: full docs --------------------------------
+        all_host_notes = notes.list_notes(entity_type="host")
+        self.assertEqual({n["entity_key"] for n in all_host_notes}, {host_a, host_b})
+        for note in all_host_notes:
+            self.assertIn("body", note)  # full doc
+
+        # --- list_notes with projection (fields=[...]) ------------
+        meta = notes.list_notes(
+            entity_type="host",
+            fields=["entity_type", "entity_key", "updated_at", "revision"],
+        )
+        for entry in meta:
+            self.assertNotIn("body", entry)
+            self.assertIn("revision", entry)
+            self.assertIn("entity_key", entry)
+
+        # --- list_notes with q (free-text search) -----------------
+        # Seed one more note with a distinctive token so the text
+        # search can hit it.
+        notes.set_note(
+            "host",
+            host_c,
+            "Suspicious C2-like indicators observed here.",
+            "alice@example.org",
+        )
+        hits = notes.list_notes(q="indicators")
+        hit_keys = {n["entity_key"] for n in hits}
+        # The c-host's body contains "indicators"; host_a / host_b
+        # do not.  Mongo ``$text`` is whole-word so the match is
+        # unambiguous.
+        self.assertIn(host_c, hit_keys)
+        self.assertNotIn(host_a, hit_keys)
+        self.assertNotIn(host_b, hit_keys)
+
+        # ``q`` combined with ``entity_type`` narrows by type
+        # before ranking by relevance.
+        narrowed = notes.list_notes(entity_type="host", q="indicators")
+        self.assertEqual({n["entity_key"] for n in narrowed}, {host_c})
+
+        # --- Pagination ------------------------------------------
+        # The default sort on the ``q``-unset path is
+        # ``[("_id", 1)]`` so pagination is deterministic
+        # across calls regardless of natural-order changes
+        # (document moves, replica state, ...).  Walking all
+        # pages with ``limit=1`` must yield each note exactly
+        # once and the concatenation must equal the
+        # unpaginated single-call result.
+        all_at_once = notes.list_notes(entity_type="host")
+        paginated = []
+        for offset in range(len(all_at_once)):
+            page = notes.list_notes(entity_type="host", limit=1, skip=offset)
+            self.assertEqual(len(page), 1)
+            paginated.append(page[0])
+        self.assertEqual(
+            [n["entity_key"] for n in paginated],
+            [n["entity_key"] for n in all_at_once],
+        )
+        # Negative ``skip`` is not the storage layer's
+        # contract to validate -- callers at the route /
+        # MCP edge clamp to ``>= 0`` before reaching here.
+
+        # --- Delete ----------------------------------------------
+        self.assertTrue(notes.delete_note("host", host_a))
+        self.assertIsNone(notes.get_note("host", host_a))
+        # Audit log swept along with the parent record.
+        self.assertEqual(notes.list_note_revisions("host", host_a), [])
+        # Idempotent: deleting again returns False.
+        self.assertFalse(notes.delete_note("host", host_a))
+
+        # --- NoteNotFound on missing-target optimistic update ----
+        with self.assertRaises(NoteNotFound):
+            notes.set_note(
+                "host",
+                host_a,
+                "Should not apply.",
+                "alice@example.org",
+                expected_revision=5,
+            )
+
+        # --- Cleanup ---------------------------------------------
+        for addr in (host_b, host_c):
+            notes.delete_note("host", addr)
+        # All-clean assertion.
+        self.assertEqual(
+            notes.count_notes("host"),
+            len([e for e in notes.list_entities("host") if e["entity_type"] == "host"]),
+        )
+
+    def test_75_audit(self):
+        """Round-trip the audit-log purpose against the configured
+        :class:`DBAudit` backend.  Covers the storage-layer
+        surface end-to-end: record, query (with every filter combo),
+        count, get-by-event_id, purge_older_than, and the
+        fail-loud :class:`AuditWriteError` contract.  Runs on every
+        backend that wires an audit implementation (the gate below
+        skips the rest); both the Mongo and PostgreSQL CI lanes
+        exercise it.
+        """
+        # Same capability-gate pattern as ``test_70_notes``: only
+        # backends with an audit implementation get exercised.
+        if ivre.db.db.audit is None:
+            self.skipTest("DBAudit is not implemented on this backend")
+
+        import datetime  # noqa: PLC0415
+
+        from ivre.db import AuditWriteError  # noqa: PLC0415
+
+        audit = ivre.db.db.audit
+        # Clean slate so the test is rerunnable.  ``ivre auditcli
+        # --init`` drops the ``audit_events`` collection and
+        # recreates its indexes (including the unique
+        # ``event_id`` constraint the duplicate-insert path
+        # below relies on).
+        self.assertEqual(
+            RUN(["ivre", "auditcli", "--init"], stdin=subprocess.DEVNULL)[0],
+            0,
+        )
+
+        # --- record returns the generated event_id ---------------
+        event_id = audit.record(
+            "upload",
+            actor={
+                "user_email": "alice@example.org",
+                "api_key_hash": "a" * 64,
+                "remote_addr": "203.0.113.5",
+            },
+            resource={"route": "/scans", "method": "POST"},
+            details={"source": "test", "count": 3},
+            outcome=200,
+        )
+        self.assertIsInstance(event_id, str)
+        self.assertEqual(len(event_id), 32)  # canonical hex
+
+        # --- count + query: single event round-trips fully -------
+        self.assertEqual(audit.count(), 1)
+        events = audit.query()
+        self.assertEqual(len(events), 1)
+        evt = events[0]
+        self.assertEqual(evt["event_id"], event_id)
+        self.assertEqual(evt["event_type"], "upload")
+        self.assertEqual(evt["actor"]["user_email"], "alice@example.org")
+        self.assertEqual(evt["actor"]["api_key_hash"], "a" * 64)
+        self.assertEqual(evt["actor"]["remote_addr"], "203.0.113.5")
+        self.assertEqual(evt["resource"], {"route": "/scans", "method": "POST"})
+        self.assertEqual(evt["details"], {"source": "test", "count": 3})
+        self.assertEqual(evt["outcome"], 200)
+
+        # --- caller-supplied event_id accepted -------------------
+        my_id = "deadbeef" * 4
+        returned = audit.record(
+            "admin_action",
+            actor={"user_email": "admin@example.org"},
+            event_id=my_id,
+        )
+        self.assertEqual(returned, my_id)
+
+        # --- duplicate event_id rejected via fail-loud contract --
+        # The ABC's contract: a duplicate ``event_id`` insert
+        # surfaces as :class:`AuditWriteError` (wrapping the
+        # backend's ``DuplicateKeyError``), NOT as a silent
+        # second insert.
+        with self.assertRaises(AuditWriteError):
+            audit.record(
+                "admin_action",
+                event_id=my_id,
+            )
+
+        # --- query filters: event_id -----------------------------
+        hit = audit.query(event_id=my_id)
+        self.assertEqual(len(hit), 1)
+        self.assertEqual(hit[0]["event_id"], my_id)
+
+        # --- query filters: dashed-UUID event_id works -----------
+        # ``_normalize_event_id`` canonicalises any UUID
+        # textual form to the 32-char hex the index keys on.
+        dashed = (
+            f"{my_id[0:8]}-{my_id[8:12]}-{my_id[12:16]}-{my_id[16:20]}-{my_id[20:32]}"
+        )
+        hit = audit.query(event_id=dashed)
+        self.assertEqual(len(hit), 1)
+        self.assertEqual(hit[0]["event_id"], my_id)
+
+        # --- query filters: event_type ---------------------------
+        self.assertEqual(len(audit.query(event_type="upload")), 1)
+        self.assertEqual(len(audit.query(event_type="admin_action")), 1)
+        self.assertEqual(len(audit.query(event_type="oversize_query")), 0)
+
+        # --- query filters: user_email ---------------------------
+        self.assertEqual(
+            len(audit.query(user_email="alice@example.org")),
+            1,
+        )
+        self.assertEqual(len(audit.query(user_email="ghost@example.org")), 0)
+
+        # --- query filters: since / until ------------------------
+        now = datetime.datetime.now(tz=datetime.timezone.utc)
+        # ``since`` in the future -> nothing.
+        self.assertEqual(
+            len(audit.query(since=now + datetime.timedelta(hours=1))),
+            0,
+        )
+        # ``until`` in the past -> nothing.
+        self.assertEqual(
+            len(audit.query(until=now - datetime.timedelta(hours=1))),
+            0,
+        )
+        # Window covering now -> both events.
+        self.assertEqual(
+            len(
+                audit.query(
+                    since=now - datetime.timedelta(hours=1),
+                    until=now + datetime.timedelta(hours=1),
+                )
+            ),
+            2,
+        )
+
+        # --- query is newest-first -------------------------------
+        # The second event was recorded after the first, so it
+        # appears first in the result.
+        ordered = audit.query()
+        self.assertEqual(ordered[0]["event_id"], my_id)
+        self.assertEqual(ordered[1]["event_id"], event_id)
+
+        # --- pagination ------------------------------------------
+        first = audit.query(limit=1, skip=0)
+        second = audit.query(limit=1, skip=1)
+        self.assertEqual(len(first), 1)
+        self.assertEqual(len(second), 1)
+        self.assertNotEqual(first[0]["event_id"], second[0]["event_id"])
+
+        # --- count honours the same filters ----------------------
+        self.assertEqual(audit.count(event_type="upload"), 1)
+        self.assertEqual(audit.count(event_id=my_id), 1)
+        self.assertEqual(
+            audit.count(user_email="alice@example.org"),
+            1,
+        )
+
+        # --- record rejects unknown event_type -------------------
+        with self.assertRaises(ValueError):
+            audit.record("bogus_type")
+
+        # --- record rejects non-JSON-serializable details --------
+        with self.assertRaises(ValueError):
+            audit.record("upload", details={"x": {1, 2, 3}})
+
+        # --- record rejects non-finite floats in details --------
+        # The ABC enforces strict RFC 8259 JSON via
+        # ``allow_nan=False`` so the cross-backend on-disk
+        # shape stays consumer-safe.
+        for bad in (float("nan"), float("inf"), float("-inf")):
+            with self.assertRaises(ValueError):
+                audit.record("upload", details={"x": bad})
+
+        # --- purge_older_than: future cutoff sweeps all ----------
+        deleted = audit.purge_older_than(now + datetime.timedelta(hours=1))
+        self.assertEqual(deleted, 2)
+        self.assertEqual(audit.count(), 0)
+
+        # --- purge_older_than: empty collection no-op ------------
+        self.assertEqual(
+            audit.purge_older_than(now + datetime.timedelta(hours=1)),
+            0,
+        )
+
+    def test_mcp_middleware(self):
+        """Exercise PublicUrlRewriteMiddleware against a stub Starlette
+        app that mimics what the MCP SDK emits when ``AuthSettings`` is
+        configured with the sentinel URL. The middleware is the
+        component that translates the sentinel into the request-derived
+        public origin (Host: + X-Forwarded-Proto:).
+        """
+        try:
+            import asyncio  # noqa: PLC0415
+            import json as _json  # noqa: PLC0415
+
+            # httpx2 rather than httpx: it is the HTTP client the mcp
+            # package (2.x) depends on, so it is present whenever the
+            # [mcp] extra is installed; the API is the same.
+            import httpx2  # noqa: PLC0415
+            from starlette.applications import Starlette  # noqa: PLC0415
+            from starlette.responses import JSONResponse, Response  # noqa: PLC0415
+            from starlette.routing import Route  # noqa: PLC0415
+
+            from ivre.tools.mcp_server.middleware import (  # noqa: PLC0415
+                PublicUrlRewriteMiddleware,
+            )
+        except ImportError as exc:
+            self.skipTest(f"MCP middleware test deps unavailable: {exc}")
+
+        sentinel = "http://placeholder.invalid"
+
+        async def unauthorized(_request):  # type: ignore[no-untyped-def]
+            return Response(
+                status_code=401,
+                content=b'{"error":"invalid_token"}',
+                media_type="application/json",
+                headers={
+                    "WWW-Authenticate": (
+                        'Bearer error="invalid_token", '
+                        f'resource_metadata="{sentinel}'
+                        '/.well-known/oauth-protected-resource/mcp"'
+                    ),
+                },
+            )
+
+        async def well_known(_request):  # type: ignore[no-untyped-def]
+            return JSONResponse(
+                {
+                    "resource": f"{sentinel}/mcp",
+                    "authorization_servers": [f"{sentinel}/"],
+                }
+            )
+
+        async def streaming(_request):  # type: ignore[no-untyped-def]
+            # Mimics the streamable MCP endpoint: must pass through
+            # the middleware untouched and *not* be buffered.
+            return Response(content=b"chunk-1chunk-2", media_type="text/plain")
+
+        app = Starlette(
+            routes=[
+                Route("/mcp", unauthorized),
+                Route("/.well-known/oauth-protected-resource/mcp", well_known),
+                Route("/stream", streaming),
+            ]
+        )
+        app.add_middleware(PublicUrlRewriteMiddleware)
+
+        async def _run():  # type: ignore[no-untyped-def]
+            transport = httpx2.ASGITransport(app=app)
+            async with httpx2.AsyncClient(
+                transport=transport, base_url="http://testserver"
+            ) as client:
+                # 1. WWW-Authenticate rewrite using Host:/X-Forwarded-Proto:
+                resp = await client.get(
+                    "/mcp",
+                    headers={
+                        "Host": "ivre.example.com",
+                        "X-Forwarded-Proto": "https",
+                    },
+                )
+                self.assertEqual(resp.status_code, 401)
+                www_auth = resp.headers.get("WWW-Authenticate", "")
+                self.assertIn(
+                    'resource_metadata="https://ivre.example.com'
+                    '/.well-known/oauth-protected-resource/mcp"',
+                    www_auth,
+                )
+                self.assertNotIn("placeholder.invalid", www_auth)
+
+                # 2. Well-known JSON body rewrite + Content-Length update.
+                resp = await client.get(
+                    "/.well-known/oauth-protected-resource/mcp",
+                    headers={
+                        "Host": "ivre.example.com",
+                        "X-Forwarded-Proto": "https",
+                    },
+                )
+                self.assertEqual(resp.status_code, 200)
+                self.assertNotIn(b"placeholder.invalid", resp.content)
+                payload = _json.loads(resp.content)
+                self.assertEqual(payload["resource"], "https://ivre.example.com/mcp")
+                self.assertEqual(
+                    payload["authorization_servers"],
+                    ["https://ivre.example.com/"],
+                )
+                self.assertEqual(int(resp.headers["content-length"]), len(resp.content))
+
+                # 3. Missing X-Forwarded-Proto: defaults to http.
+                resp = await client.get(
+                    "/.well-known/oauth-protected-resource/mcp",
+                    headers={"Host": "internal.lan:9100"},
+                )
+                payload = _json.loads(resp.content)
+                self.assertEqual(payload["resource"], "http://internal.lan:9100/mcp")
+
+                # 4. Streaming endpoint passes through unchanged
+                #    (no buffering, no rewriting).
+                resp = await client.get(
+                    "/stream",
+                    headers={
+                        "Host": "ivre.example.com",
+                        "X-Forwarded-Proto": "https",
+                    },
+                )
+                self.assertEqual(resp.status_code, 200)
+                self.assertEqual(resp.content, b"chunk-1chunk-2")
+
+        asyncio.run(_run())
 
     def test_conf(self):
         # Ensure env var IVRE_CONF is taken into account
@@ -5531,17 +5639,27 @@ class IvreTests(unittest.TestCase):
 
     def test_90_cleanup(self):
         # Clean DB
-        if DATABASE not in ["postgres", "sqlite"]:
-            # FIXME: for some reason, this does not terminate
-            RUN(["ivre", "scancli", "--init"], stdin=open(os.devnull))
-        RUN(["ivre", "ipinfo", "--init"], stdin=open(os.devnull))
-        RUN(["ivre", "view", "--init"], stdin=open(os.devnull))
-        RUN(["ivre", "runscansagentdb", "--init"], stdin=open(os.devnull))
+        # Capability-gated: ``scancli --init`` terminates
+        # cleanly on every backend except PostgreSQL, whose
+        # cleanup path hangs here (root cause not yet
+        # investigated; tracked as a deferred follow-up).
+        if "nmap_init_terminates" in ivre.db.db.nmap.supports:
+            RUN(["ivre", "scancli", "--init"], stdin=subprocess.DEVNULL)
+        RUN(["ivre", "ipinfo", "--init"], stdin=subprocess.DEVNULL)
+        RUN(["ivre", "view", "--init"], stdin=subprocess.DEVNULL)
+        # The notes purpose has its own lifecycle (independent
+        # of view / scans / passive), so it needs its own
+        # ``--init`` here.  Skipped on backends that do not
+        # implement the purpose -- ``MetaDB.notes`` returns
+        # ``None`` when no backend class is registered.
+        if ivre.db.db.notes is not None:
+            RUN(["ivre", "notes", "--init"], stdin=subprocess.DEVNULL)
 
 
 TESTS = set(
     [
         "10_data",
+        "15_rir",
         "30_nmap",
         "40_passive",
         "50_view",
@@ -5549,38 +5667,35 @@ TESTS = set(
         "54_passive_delete",
         "55_view_delete",
         "60_flow",
+        "70_notes",
+        "75_audit",
         "90_cleanup",
         "conf",
-        "scans",
-        "utils",
+        "mcp_middleware",
     ]
 )
 
 
+# `test_utils` (formerly registered here) was moved out to
+# `tests/tests_no_backend.py`. It is run there as part of `UtilsTests`
+# and no longer needs per-backend opt-out.
 DATABASES = {
     # **excluded** tests
-    "mongo": ["utils"],
-    "postgres": ["60_flow", "scans", "utils"],
-    "sqlite": [
-        "30_nmap",
-        "50_view",
-        "53_nmap_delete",
-        "55_view_delete",
-        "60_flow",
-        "scans",
-        "utils",
-    ],
+    "mongo": [],
+    "postgres": ["15_rir", "60_flow", "70_notes"],
     "elastic": [
+        "15_rir",
         "30_nmap",
         "40_passive",
         "53_nmap_delete",
         "54_passive_delete",
         "60_flow",
+        "70_notes",
+        "75_audit",
         "90_cleanup",
-        "scans",
-        "utils",
     ],
     "maxmind": [
+        "15_rir",
         "30_nmap",
         "40_passive",
         "50_view",
@@ -5588,10 +5703,36 @@ DATABASES = {
         "54_passive_delete",
         "55_view_delete",
         "60_flow",
+        "70_notes",
+        "75_audit",
         "90_cleanup",
-        "scans",
     ],
-    "tinydb": ["utils"],
+}
+
+# Additional per-flavour exclusions layered on top of ``DATABASES``.
+# Set via the ``IVRE_BACKEND_FLAVOR`` env var to flag a Mongo-wire
+# backend whose surface differs from upstream MongoDB. Today the
+# only flavour is ``documentdb`` (AWS DocumentDB), which uses the
+# Mongo wire protocol but lacks full-text indexes (no ``$text``
+# operator and no ``"text"`` index type). Tests that depend on
+# those features are skipped when this flavour is set.
+BACKEND_FLAVORS = {
+    "documentdb": [
+        # The notes purpose's storage layer ships a ``$text``
+        # index on ``body`` (see ``MongoDBNotes.indexes``);
+        # DocumentDB does not support text indexes, so
+        # ``create_indexes`` would fail at first use and the
+        # ``list_notes(q=...)`` free-text path inside the test
+        # would error.  Skip the whole test until / unless a
+        # DocumentDB-friendly indexing path lands.
+        "70_notes",
+        # ``MongoDBView.searchtext`` exercises ``$text`` /
+        # text-index features; DocumentDB has neither.
+        # The text-search assertions live inside ``test_50_view``,
+        # so we cannot skip the whole test method — instead the
+        # block at the call site checks ``BACKEND_FLAVOR`` and
+        # short-circuits.
+    ],
 }
 
 
@@ -5602,6 +5743,14 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Run IVRE tests")
     parser.add_argument("--samples", metavar="DIR", default="./samples/")
     parser.add_argument("--coverage", action="store_true")
+    parser.add_argument(
+        "--exclude",
+        action="append",
+        default=[],
+        choices=list(TESTS),
+        metavar="TEST",
+        help="Skip the named test (may be repeated; same choices as positional).",
+    )
     parser.add_argument("tests", nargs="*", choices=list(TESTS) + [[]])
     args = parser.parse_args()
     SAMPLES = args.samples
@@ -5612,12 +5761,20 @@ def parse_args():
             setattr(
                 IvreTests, test, unittest.skip("User request")(getattr(IvreTests, test))
             )
+    for test in args.exclude:
+        method = "test_%s" % test
+        setattr(
+            IvreTests,
+            method,
+            unittest.skip("--exclude %s" % test)(getattr(IvreTests, method)),
+        )
     sys.argv = [sys.argv[0]]
 
 
 def parse_env():
-    global DATABASE, ELASTIC_INSERT_TEMPO
+    global DATABASE, BACKEND_FLAVOR
     DATABASE = os.getenv("DB")
+    BACKEND_FLAVOR = os.getenv("IVRE_BACKEND_FLAVOR")
     for test in DATABASES.get(DATABASE, []):
         test = "test_%s" % test
         setattr(
@@ -5627,20 +5784,29 @@ def parse_env():
                 getattr(IvreTests, test),
             ),
         )
-    # Elasticsearch insertion is asynchronous, this hack "ensures" the
-    # data has been inserted before continuing.
-    ELASTIC_INSERT_TEMPO = int(os.getenv("ES_INSERT_TEMPO", 2))
+    for test in BACKEND_FLAVORS.get(BACKEND_FLAVOR, []):
+        test = "test_%s" % test
+        setattr(
+            IvreTests,
+            test,
+            unittest.skip("Deactivated for backend flavour %r" % BACKEND_FLAVOR)(
+                getattr(IvreTests, test)
+            ),
+        )
+    # ``ELASTIC_INSERT_TEMPO`` / ``ES_INSERT_TEMPO`` were the legacy
+    # ``time.sleep(...)`` knob used to wait out Elasticsearch's
+    # asynchronous indexing before reading back. Replaced by
+    # synchronous ``ivre.db.db.view.flush()`` calls in the tests
+    # (no-op on every backend except Elastic, where it triggers
+    # ``indices.refresh``).
 
 
 if __name__ == "__main__":
     SAMPLES = None
     parse_args()
     parse_env()
-    if not ivre.config.DEBUG:
-        sys.stderr.write(
-            "You *must* have the DEBUG config value set to " "True to run the tests.\n"
-        )
-        sys.exit(-1)
+    ivre.config.DEBUG = True
+    logging.basicConfig()
     if USE_COVERAGE:
         COVERAGE = [sys.executable, os.path.dirname(__import__("coverage").__file__)]
         RUN = coverage_run

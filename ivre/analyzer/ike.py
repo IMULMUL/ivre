@@ -1,7 +1,7 @@
 #! /usr/bin/env python
 
 # This file is part of IVRE.
-# Copyright 2011 - 2021 Pierre LALET <pierre@droids-corp.org>
+# Copyright 2011 - 2024 Pierre LALET <pierre@droids-corp.org>
 #
 # IVRE is free software: you can redistribute it and/or modify it
 # under the terms of the GNU General Public License as published by
@@ -18,20 +18,19 @@
 
 
 import struct
-from typing import Any, Dict, Tuple, Union, cast
-
+from typing import Any, cast
 
 from ivre.types import NmapServiceMatch
 from ivre.types.active import NmapPort
-from ivre.utils import find_ike_vendor_id, encode_hex
+from ivre.utils import encode_hex, find_ike_vendor_id
 
 
-class Values(Dict[int, str]):
+class Values(dict[int, str]):
     def __getitem__(self, item: int) -> str:
         try:
             return super().__getitem__(item)
         except KeyError:
-            return "UNKNOWN-%d" % item
+            return f"UNKNOWN-{item}"
 
 
 class NumValues:
@@ -102,7 +101,7 @@ NOTIFICATION = Values(
 
 
 # https://www.iana.org/assignments/ipsec-registry/ipsec-registry.xhtml#ipsec-registry-2
-TRANSFORM_VALUES: Dict[int, Tuple[str, Union[Values, NumValues]]] = {
+TRANSFORM_VALUES: dict[int, tuple[str, Values | NumValues]] = {
     # https://www.iana.org/assignments/ipsec-registry/ipsec-registry.xhtml#ipsec-registry-4
     1: (
         "Encryption",
@@ -223,12 +222,12 @@ TRANSFORM_VALUES: Dict[int, Tuple[str, Union[Values, NumValues]]] = {
 
 
 def info_from_notification(
-    payload: bytes, _: NmapServiceMatch, output: Dict[str, Any]
+    payload: bytes, _: NmapServiceMatch, output: dict[str, Any]
 ) -> None:
     payload_len = len(payload)
     if payload_len < 12:
         output.setdefault("protocol", []).append(
-            "ISAKMP: Notification payload to short (%d bytes)" % payload_len
+            f"ISAKMP: Notification payload to short ({payload_len} bytes)"
         )
         return
     output.update(
@@ -242,7 +241,7 @@ def info_from_notification(
 
 
 def info_from_vendorid(
-    payload: bytes, service: NmapServiceMatch, output: Dict[str, Any]
+    payload: bytes, service: NmapServiceMatch, output: dict[str, Any]
 ) -> None:
     name = find_ike_vendor_id(payload[4:])
     if name is not None:
@@ -341,11 +340,11 @@ def info_from_vendorid(
     output.setdefault("vendor_ids", []).append(entry)
 
 
-def info_from_sa(payload: bytes, _: NmapServiceMatch, output: Dict[str, Any]) -> None:
+def info_from_sa(payload: bytes, _: NmapServiceMatch, output: dict[str, Any]) -> None:
     payload_len = len(payload)
     if payload_len < 20:
         output.setdefault("protocol", []).append(
-            "ISAKMP: SA payload to short (%d bytes)" % payload_len
+            f"ISAKMP: SA payload to short ({payload_len} bytes)"
         )
         return
     output.update(
@@ -370,7 +369,7 @@ def info_from_sa(payload: bytes, _: NmapServiceMatch, output: Dict[str, Any]) ->
                 value_length = value
                 if value_length > len(data):
                     output.setdefault("protocol", []).append(
-                        "invalid transform length: %d" % value_length
+                        f"invalid transform length: {value_length}"
                     )
                     break
                 value = 0
@@ -379,7 +378,7 @@ def info_from_sa(payload: bytes, _: NmapServiceMatch, output: Dict[str, Any]) ->
             try:
                 transf_type, value_decoder = TRANSFORM_VALUES[transf_type]
             except KeyError:
-                transf_type = "UNKNOWN-%d" % transf_type
+                transf_type = f"UNKNOWN-{transf_type}"
             else:
                 value = value_decoder[value]
             transform[transf_type] = value
@@ -387,7 +386,7 @@ def info_from_sa(payload: bytes, _: NmapServiceMatch, output: Dict[str, Any]) ->
             output.setdefault("transforms", []).append(transform)
     if payload:
         output.setdefault("protocol", []).append(
-            "unexpected payload in transforms: %r" % payload
+            f"unexpected payload in transforms: {payload!r}"
         )
 
 
@@ -400,7 +399,7 @@ PAYLOADS = {
 
 def analyze_ike_payload(payload: bytes, probe: str = "ike") -> NmapPort:
     service: NmapServiceMatch = {}
-    output: Dict[str, Any] = {}
+    output: dict[str, Any] = {}
     if probe == "ike-ipsec-nat-t":
         if payload.startswith(b"\x00\x00\x00\x00"):
             payload = payload[4:]
@@ -411,15 +410,11 @@ def analyze_ike_payload(payload: bytes, probe: str = "ike") -> NmapPort:
     payload_len = len(payload)
     if payload_len < 28:
         return {}
+    if not payload.startswith(b"\x00\x11\x22\x33"):
+        return {}
     payload_len_proto = struct.unpack(">I", payload[24:28])[0]
     if payload_len < payload_len_proto:
-        output.setdefault("protocol", []).append(
-            "ISAKMP: missing data (%d bytes, should be %d)"
-            % (
-                payload_len,
-                payload_len_proto,
-            )
-        )
+        return {}
     payload_type = payload[16]
     payload = payload[28:]
     while payload_type and len(payload) >= 4:
@@ -438,17 +433,14 @@ def analyze_ike_payload(payload: bytes, probe: str = "ike") -> NmapPort:
         txtoutput.append("Transforms:")
         for tr in output["transforms"]:
             txtoutput.append(
-                "  - %s"
-                % ", ".join(
-                    "%s: %s" % (key, value) for key, value in sorted(tr.items())
-                )
+                f"  - {', '.join(f'{key}: {value}' for key, value in sorted(tr.items()))}"
             )
     if "vendor_ids" in output:
         txtoutput.append("Vendor IDs:")
         for vid in output["vendor_ids"]:
-            txtoutput.append("  - %s" % vid.get("name", vid["value"]))
+            txtoutput.append(f"  - {vid.get('name', vid['value'])}")
     if "notification_type" in output:
-        txtoutput.append("Notification: %s" % output["notification_type"])
+        txtoutput.append(f"Notification: {output['notification_type']}")
     # sth identified, let's assume it was correct
     result: NmapPort = {
         "service_name": "isakmp",

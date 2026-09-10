@@ -1,8 +1,7 @@
 #! /usr/bin/env python
-# -*- coding: utf-8 -*-
 
 # This file is part of IVRE.
-# Copyright 2011 - 2021 Pierre LALET <pierre@droids-corp.org>
+# Copyright 2011 - 2026 Pierre LALET <pierre@droids-corp.org>
 #
 # IVRE is free software: you can redistribute it and/or modify it
 # under the terms of the GNU General Public License as published by
@@ -22,30 +21,34 @@ information about IP addresses (mostly from Maxmind GeoIP files).
 
 """
 
+from __future__ import annotations  # needed for flake8
 
-import codecs
 import csv
 import os.path
 import sys
 import tarfile
-from typing import Any, Callable, Dict, Generator, Iterable, List, Optional, Tuple
-from urllib.request import build_opener
+import time
 import zipfile
+from collections.abc import Callable, Generator, Iterable
+from shutil import copyfileobj
+from typing import Any
+from urllib.error import HTTPError
+from urllib.request import build_opener
 
-
-from ivre import VERSION, utils, config
+from ivre import VERSION, config, utils
 
 
 def bgp_raw_to_csv(fname: str, outname: str) -> None:
     cur = None
     assert config.GEOIP_PATH is not None
-    with open(os.path.join(config.GEOIP_PATH, fname), "rb") as fdesc, open(
-        os.path.join(config.GEOIP_PATH, outname), "w"
-    ) as out:
+    with (
+        open(os.path.join(config.GEOIP_PATH, fname), "rb") as fdesc,
+        open(os.path.join(config.GEOIP_PATH, outname), "w", encoding="utf8") as out,
+    ):
         for line in fdesc:
             start, stop = (
                 utils.ip2int(elt)
-                for elt in utils.net2range(line[:-1].split(None, 1)[0])
+                for elt in utils.net2range(line[:-1].decode().split(None, 1)[0])
             )
             if cur:
                 if start >= cur[0] and stop <= cur[1]:
@@ -65,61 +68,60 @@ def bgp_raw_to_csv(fname: str, outname: str) -> None:
                 if stop == cur[0] + 1:
                     cur = (start, cur[1])
                     continue
-                out.write("%d,%d\n" % cur)
+                out.write(f"{cur[0]},{cur[1]}\n")
             cur = (start, stop)
         if cur:
-            out.write("%d,%d\n" % cur)
+            out.write(f"{cur[0]},{cur[1]}\n")
 
 
 def unzip_all(
     fname: str,
-    cond: Optional[Callable[[zipfile.ZipInfo], bool]] = None,
-    clean: bool = True,
+    cond: Callable[[zipfile.ZipInfo], bool] | None = None,
 ) -> None:
     assert config.GEOIP_PATH is not None
     with zipfile.ZipFile(os.path.join(config.GEOIP_PATH, fname)) as zdesc:
         for filedesc in zdesc.infolist():
             if cond and not cond(filedesc):
                 continue
-            with open(
-                os.path.join(config.GEOIP_PATH, os.path.basename(filedesc.filename)),
-                "wb",
-            ) as wdesc:
-                wdesc.write(zdesc.read(filedesc))
-    if clean:
-        os.unlink(os.path.join(config.GEOIP_PATH, fname))
+            with (
+                zdesc.open(filedesc) as rdesc,
+                open(
+                    os.path.join(
+                        config.GEOIP_PATH, os.path.basename(filedesc.filename)
+                    ),
+                    "wb",
+                ) as wdesc,
+            ):
+                copyfileobj(rdesc, wdesc)
 
 
-def gunzip(fname: str, clean: bool = True) -> None:
+def gunzip(fname: str) -> None:
     if not fname.endswith(".gz"):
         raise Exception('filename should end with ".gz"')
     assert config.GEOIP_PATH is not None
-    with utils.open_file(os.path.join(config.GEOIP_PATH, fname)) as inp:
-        with open(os.path.join(config.GEOIP_PATH, fname[:-3]), "wb") as outp:
-            outp.write(inp.read())
-    if clean:
-        os.unlink(os.path.join(config.GEOIP_PATH, fname))
+    with (
+        utils.open_file(os.path.join(config.GEOIP_PATH, fname)) as inp,
+        open(os.path.join(config.GEOIP_PATH, fname[:-3]), "wb") as outp,
+    ):
+        copyfileobj(inp, outp)
 
 
 def untar_all(
     fname: str,
-    cond: Optional[Callable[[tarfile.TarInfo], bool]] = None,
-    clean: bool = True,
+    cond: Callable[[tarfile.TarInfo], bool] | None = None,
 ) -> None:
     assert config.GEOIP_PATH is not None
     with tarfile.TarFile(os.path.join(config.GEOIP_PATH, fname)) as tdesc:
         for filedesc in tdesc:
             if cond and not cond(filedesc):
                 continue
-            with open(
-                os.path.join(config.GEOIP_PATH, os.path.basename(filedesc.name)), "wb"
-            ) as wdesc:
+            target = os.path.join(config.GEOIP_PATH, os.path.basename(filedesc.name))
+            with open(target, "wb") as wdesc:
                 rdesc = tdesc.extractfile(filedesc)
                 if rdesc is None:
                     continue
-                wdesc.write(rdesc.read())
-    if clean:
-        os.unlink(os.path.join(config.GEOIP_PATH, fname))
+                copyfileobj(rdesc, wdesc)
+            os.utime(target, (filedesc.mtime, filedesc.mtime))
 
 
 def rename(src: str, dst: str) -> None:
@@ -129,104 +131,133 @@ def rename(src: str, dst: str) -> None:
     )
 
 
-PARSERS: List[Tuple[Callable, List[str], Dict[str, Any]]] = [
-    (
-        unzip_all,
-        ["GeoLite2-City-CSV.zip"],
-        {"cond": lambda fdesc: fdesc.filename.endswith(".csv")},
-    ),
-    (
-        unzip_all,
-        ["GeoLite2-Country-CSV.zip"],
-        {"cond": lambda fdesc: fdesc.filename.endswith(".csv")},
-    ),
-    (
-        unzip_all,
-        ["GeoLite2-ASN-CSV.zip"],
-        {"cond": lambda fdesc: fdesc.filename.endswith(".csv")},
-    ),
-    (gunzip, ["GeoLite2-City.tar.gz"], {}),
-    (
-        untar_all,
-        ["GeoLite2-City.tar"],
-        {"cond": lambda fdesc: fdesc.name.endswith(".mmdb")},
-    ),
-    (gunzip, ["GeoLite2-Country.tar.gz"], {}),
-    (
-        untar_all,
-        ["GeoLite2-Country.tar"],
-        {"cond": lambda fdesc: fdesc.name.endswith(".mmdb")},
-    ),
-    (gunzip, ["GeoLite2-ASN.tar.gz"], {}),
-    (
-        untar_all,
-        ["GeoLite2-ASN.tar"],
-        {"cond": lambda fdesc: fdesc.name.endswith(".mmdb")},
-    ),
-    (gunzip, ["GeoLite2-dumps.tar.gz"], {}),
-    (
-        untar_all,
-        ["GeoLite2-dumps.tar"],
-        {"cond": lambda fdesc: fdesc.name.endswith(".csv")},
-    ),
-    (bgp_raw_to_csv, ["BGP.raw", "BGP.csv"], {}),
-]
+PARSERS: dict[str, list[tuple[Callable, list[str], dict[str, Any]]]] = {
+    "GeoLite2-City-CSV.zip": [
+        (
+            unzip_all,
+            ["GeoLite2-City-CSV.zip"],
+            {"cond": lambda fdesc: fdesc.filename.endswith(".csv")},
+        )
+    ],
+    "GeoLite2-Country-CSV.zip": [
+        (
+            unzip_all,
+            ["GeoLite2-Country-CSV.zip"],
+            {"cond": lambda fdesc: fdesc.filename.endswith(".csv")},
+        )
+    ],
+    "GeoLite2-ASN-CSV.zip": [
+        (
+            unzip_all,
+            ["GeoLite2-ASN-CSV.zip"],
+            {"cond": lambda fdesc: fdesc.filename.endswith(".csv")},
+        )
+    ],
+    "GeoLite2-City.tar.gz": [
+        (gunzip, ["GeoLite2-City.tar.gz"], {}),
+        (
+            untar_all,
+            ["GeoLite2-City.tar"],
+            {"cond": lambda fdesc: fdesc.name.endswith(".mmdb")},
+        ),
+    ],
+    "GeoLite2-Country.tar.gz": [
+        (gunzip, ["GeoLite2-Country.tar.gz"], {}),
+        (
+            untar_all,
+            ["GeoLite2-Country.tar"],
+            {"cond": lambda fdesc: fdesc.name.endswith(".mmdb")},
+        ),
+    ],
+    "GeoLite2-ASN.tar.gz": [
+        (gunzip, ["GeoLite2-ASN.tar.gz"], {}),
+        (
+            untar_all,
+            ["GeoLite2-ASN.tar"],
+            {"cond": lambda fdesc: fdesc.name.endswith(".mmdb")},
+        ),
+    ],
+    "GeoLite2-dumps.tar.gz": [
+        (gunzip, ["GeoLite2-dumps.tar.gz"], {}),
+        (
+            untar_all,
+            ["GeoLite2-dumps.tar"],
+            {"cond": lambda fdesc: fdesc.name.endswith(".csv")},
+        ),
+    ],
+    "BGP.raw": [(bgp_raw_to_csv, ["BGP.raw", "BGP.csv"], {})],
+}
 
 
 def download_all(verbose: bool = False) -> None:
     assert config.GEOIP_PATH is not None
     utils.makedirs(config.GEOIP_PATH)
     opener = build_opener()
-    opener.addheaders = [("User-agent", "IVRE/%s +https://ivre.rocks/" % VERSION)]
+    new_files = set()
     for fname, url in config.IPDATA_URLS.items():
+        opener.addheaders = [("User-Agent", f"IVRE/{VERSION} +https://ivre.rocks/")]
         if url is None:
             if not fname.startswith("GeoLite2-"):
                 continue
             if fname.startswith("GeoLite2-dumps."):
                 continue
             basename, ext = fname.split(".", 1)
-            url = (
-                "https://download.maxmind.com/app/geoip_download?"
-                "edition_id=%s&suffix=%s&license_key=%s"
-                % (
-                    basename,
-                    ext,
-                    config.MAXMIND_LICENSE_KEY,
+            url = f"https://download.maxmind.com/app/geoip_download?edition_id={basename}&suffix={ext}&license_key={config.MAXMIND_LICENSE_KEY}"
+        outfile = os.path.join(config.GEOIP_PATH, fname)
+        try:
+            outstat = os.stat(outfile)
+        except FileNotFoundError:
+            pass
+        else:
+            opener.addheaders.append(
+                (
+                    "If-Modified-Since",
+                    time.strftime(
+                        "%a, %d %b %Y %H:%M:%S GMT", time.gmtime(outstat.st_mtime)
+                    ),
                 )
             )
-        outfile = os.path.join(config.GEOIP_PATH, fname)
         if verbose:
-            sys.stdout.write("Downloading %s to %s: " % (url, outfile))
+            sys.stdout.write(f"Downloading {url} to {outfile}: ")
             sys.stdout.flush()
-        with open(outfile, "wb") as wdesc:
-            udesc = opener.open(url)
-            wdesc.write(udesc.read())
-            if verbose:
-                sys.stdout.write("done.\n")
+        try:
+            with opener.open(url) as udesc, open(outfile, "wb") as wdesc:
+                copyfileobj(udesc, wdesc)
+        except HTTPError as exc:
+            if exc.status == 304:
+                if verbose:
+                    sys.stdout.write("already downloaded.\n")
+                continue
+            raise
+        new_files.add(fname)
+        if verbose:
+            sys.stdout.write("done.\n")
     if verbose:
         sys.stdout.write("Unpacking: ")
         sys.stdout.flush()
-    for func, args, kargs in PARSERS:
-        try:
-            func(*args, **kargs)
-        except Exception:
-            utils.LOGGER.warning(
-                "A parser failed: %s(%s, %s)",
-                func.__name__,
-                ", ".join(args),
-                ", ".join("%s=%r" % k_v for k_v in kargs.items()),
-                exc_info=True,
-            )
+    for fname in new_files:
+        for func, args, kargs in PARSERS.get(fname, []):
+            print(f"{func!r}(*{args!r}, **{kargs!r})")
+            try:
+                func(*args, **kargs)
+            except Exception:
+                utils.LOGGER.warning(
+                    "A parser failed: %s(%s, %s)",
+                    func.__name__,
+                    ", ".join(args),
+                    ", ".join(f"{k}={v!r}" for k, v in kargs.items()),
+                    exc_info=True,
+                )
     if verbose:
         sys.stdout.write("done.\n")
 
 
 def locids_by_country(country_code: str) -> Generator[int, None, None]:
     assert config.GEOIP_PATH is not None
-    with codecs.open(
+    with open(
         os.path.join(
             config.GEOIP_PATH,
-            "GeoLite2-Country-Locations-%s.csv" % config.GEOIP_LANG,
+            f"GeoLite2-Country-Locations-{config.GEOIP_LANG}.csv",
         ),
         encoding="utf-8",
     ) as fdesc:
@@ -238,10 +269,10 @@ def locids_by_country(country_code: str) -> Generator[int, None, None]:
 
 def locids_by_city(country_code: str, city_name: str) -> Generator[int, None, None]:
     assert config.GEOIP_PATH is not None
-    with codecs.open(
+    with open(
         os.path.join(
             config.GEOIP_PATH,
-            "GeoLite2-City-Locations-%s.csv" % config.GEOIP_LANG,
+            f"GeoLite2-City-Locations-{config.GEOIP_LANG}.csv",
         ),
         encoding="utf-8",
     ) as fdesc:
@@ -257,10 +288,10 @@ def locids_by_city(country_code: str, city_name: str) -> Generator[int, None, No
 
 def locids_by_region(country_code: str, reg_code: str) -> Generator[int, None, None]:
     assert config.GEOIP_PATH is not None
-    with codecs.open(
+    with open(
         os.path.join(
             config.GEOIP_PATH,
-            "GeoLite2-City-Locations-%s.csv" % config.GEOIP_LANG,
+            f"GeoLite2-City-Locations-{config.GEOIP_LANG}.csv",
         ),
         encoding="utf-8",
     ) as fdesc:
@@ -274,12 +305,12 @@ def locids_by_region(country_code: str, reg_code: str) -> Generator[int, None, N
 
 
 class IPRanges:
-    def __init__(self, ranges: Optional[Iterable[Tuple[int, int]]] = None) -> None:
+    def __init__(self, ranges: Iterable[tuple[int, int]] | None = None) -> None:
         """ranges must be given in the "correct" order *and* not
         overlap.
 
         """
-        self.ranges: Dict[int, Tuple[int, int]] = {}
+        self.ranges: dict[int, tuple[int, int]] = {}
         self.length = 0
         if ranges is not None:
             for rnge in ranges:
@@ -290,7 +321,7 @@ class IPRanges:
         self.ranges[self.length] = (start, length)
         self.length += int(length)  # in case it's a long
 
-    def union(self, *others: "IPRanges") -> "IPRanges":
+    def union(self, *others: IPRanges) -> IPRanges:
         res = IPRanges()
         gens = [self.iter_int_ranges()] + [o.iter_int_ranges() for o in others]
         curs = []
@@ -342,20 +373,19 @@ class IPRanges:
             res.append(*cur_range)
         return res
 
-    def iter_int_ranges(self) -> Generator[Tuple[int, int], None, None]:
+    def iter_int_ranges(self) -> Generator[tuple[int, int], None, None]:
         for start, length in sorted(self.ranges.values()):
             yield start, start + length - 1
 
-    def iter_ranges(self) -> Generator[Tuple[str, str], None, None]:
+    def iter_ranges(self) -> Generator[tuple[str, str], None, None]:
         for start, length in sorted(self.ranges.values()):
             yield utils.int2ip(start), utils.int2ip(start + length - 1)
 
     def iter_nets(self) -> Generator[str, None, None]:
         for start, length in sorted(self.ranges.values()):
-            for net in utils.range2nets(
+            yield from utils.range2nets(
                 (utils.int2ip(start), utils.int2ip(start + length - 1))
-            ):
-                yield net
+            )
 
     def iter_addrs(self) -> Generator[str, None, None]:
         for start, length in sorted(self.ranges.values()):
@@ -374,14 +404,14 @@ class IPRanges:
         raise IndexError("index out of range")
 
 
-ConditionCallback = Callable[[List[str]], bool]
+ConditionCallback = Callable[[list[str]], bool]
 
 
 def _get_by_data(
     datafile: str, condition: ConditionCallback
-) -> Generator[Tuple[int, int], None, None]:
+) -> Generator[tuple[int, int], None, None]:
     assert config.GEOIP_PATH is not None
-    with open(os.path.join(config.GEOIP_PATH, datafile)) as fdesc:
+    with open(os.path.join(config.GEOIP_PATH, datafile), encoding="utf8") as fdesc:
         for line in fdesc:
             line_parsed = line[:-1].split(",")
             if condition(line_parsed):

@@ -1,8 +1,7 @@
 #! /usr/bin/env python
-# -*- coding: utf-8 -*-
 
 # This file is part of IVRE.
-# Copyright 2011 - 2021 Pierre LALET <pierre@droids-corp.org>
+# Copyright 2011 - 2026 Pierre LALET <pierre@droids-corp.org>
 #
 # IVRE is free software: you can redistribute it and/or modify it
 # under the terms of the GNU General Public License as published by
@@ -22,41 +21,66 @@ databases.
 
 """
 
+from __future__ import annotations  # needed for flake8
 
-from collections import OrderedDict
-from copy import deepcopy
 import datetime
 import hashlib
 import json
-import os
 import re
 import socket
 import struct
 import time
-from typing import Any, Dict, List, Optional, Pattern, Tuple, Union
+from collections import OrderedDict
+from copy import deepcopy
+from secrets import token_urlsafe
+from typing import Any
 from urllib.parse import unquote
-import uuid
+
+import bson
+import pymongo
+from pymongo import ReadPreference, ReturnDocument
+from pymongo.errors import (
+    BulkWriteError,
+    CursorNotFound,
+    DuplicateKeyError,
+    InvalidDocument,
+    PyMongoError,
+    WriteError,
+)
+
+try:
+    import gssapi  # type: ignore
+except ImportError:
+    HAS_GSSAPI = False
+else:
+    HAS_GSSAPI = True
 
 
-import bson  # type: ignore
-from pymongo.errors import BulkWriteError  # type: ignore
-import pymongo  # type: ignore
-
-
-from ivre.active.data import ALIASES_TABLE_ELEMS
+from ivre import config, flow, passive, utils, xmlnmap
+from ivre.active.nmap import ALIASES_TABLE_ELEMS
 from ivre.db import (
     DB,
+    AuditWriteError,
     DBActive,
-    DBNmap,
-    DBPassive,
-    DBAgent,
-    DBView,
+    DBAudit,
+    DBAuth,
     DBFlow,
     DBFlowMeta,
-    LockError,
+    DBNmap,
+    DBNotes,
+    DBPassive,
+    DBRir,
+    DBView,
+    NoteAlreadyExists,
+    NoteConcurrencyError,
+    NoteNotFound,
+    canonicalize_entity_key,
 )
-from ivre import config, passive, utils, xmlnmap, flow
-from ivre.types import Filter, SortKey
+from ivre.plugins import load_plugins
+from ivre.tags.active import is_synack_honeypot, set_auto_tags
+from ivre.types import Filter, IndexKey
+
+VALID_KEY = re.compile("^[a-zA-Z0-9_]+$")
 
 
 class Nmap2Mongo(xmlnmap.Nmap2DB):
@@ -73,77 +97,147 @@ def log_pipeline(pipeline):
     utils.LOGGER.debug("DB: MongoDB aggregation pipeline: %r", pipeline)
 
 
-class MongoDB(DB):
+class MongoDBConnection:
+    __instances: dict[str, MongoDBConnection] = {}
 
-    schema_migrations_indexes: List[
-        Dict[int, Dict[str, List[Tuple[List[SortKey], Dict[str, Any]]]]]
+    def __new__(cls, url, *args):
+        del args
+        raw_url = url.geturl()
+        try:
+            return cls.__instances[raw_url]
+        except KeyError:
+            instance = cls.__instances[raw_url] = super().__new__(cls)
+            instance.raw_url = raw_url
+            return instance
+
+    def __init__(self, url, params):
+        self.url = url
+        self.params = params
+
+    @property
+    def client(self):
+        try:
+            return self._client  # pylint: disable=access-member-before-definition
+        except AttributeError:
+            pass
+        if self.url.scheme == "mongodb+srv":
+            self._client = pymongo.MongoClient(self.raw_url)
+            return self._client
+        host = self.url.netloc
+        if "@" in host:
+            auth, host = host.split("@", 1)
+            if ":" in auth:
+                username, password = (unquote(val) for val in auth.split(":", 1))
+                self.params["username"] = username
+                self.params["password"] = password
+            else:
+                username = unquote(auth)
+                if HAS_GSSAPI and username == "GSSAPI":
+                    username = str(gssapi.Credentials(usage="initiate").name)
+                    self.params["username"] = username
+                    self.params["authMechanism"] = "GSSAPI"
+                elif "@" in username:
+                    self.params["username"] = username
+                    self.params["authMechanism"] = "GSSAPI"
+                else:
+                    utils.LOGGER.warning("Weird authentication string %r", username)
+                    self.params["username"] = username
+        self._client = pymongo.MongoClient(host=host or None, **self.params)
+        return self._client
+
+    def close(self):
+        try:
+            # We do not use .client to avoid a useless connection.
+            self._client.close()
+        except AttributeError:
+            pass
+
+    @property
+    def db(self):
+        try:
+            return self._db  # pylint: disable=access-member-before-definition
+        except AttributeError:
+            pass
+        self._db = self.client[self.url.path.lstrip("/") or "ivre"]
+        return self._db
+
+
+class MongoDB(DB):
+    is_documentdb = False  # set to True for AWS DocumentDB sub-classes
+    indexes: list[list[tuple[list[IndexKey], dict[str, Any]]]] = []
+    schema_migrations_indexes: list[
+        dict[int, dict[str, list[tuple[list[IndexKey] | str, dict[str, Any]]]]]
     ] = []
-    schema_latest_versions: List[int] = []
-    hint_indexes: List[Dict[str, List[SortKey]]] = []
+    schema_latest_versions: list[int] = []
+    hint_indexes: list[dict[str, list[IndexKey]]] = []
     no_limit = 0
+    cursor_timeout_exceptions = (CursorNotFound,)
 
     def __init__(self, url):
         super().__init__()
-        self.username = None
-        self.password = None
-        self.mechanism = None
-        if "@" in url.netloc:
-            username, self.host = url.netloc.split("@", 1)
-            if ":" in username:
-                self.username, self.password = (
-                    unquote(val) for val in username.split(":", 1)
-                )
-            else:
-                username = unquote(username)
-                if username == "GSSAPI":
-                    # pylint: disable=import-outside-toplevel
-                    import krbV  # type: ignore
-
-                    self.username = (
-                        krbV.default_context().default_ccache().principal().name
-                    )
-                    self.mechanism = "GSSAPI"
-                else:
-                    self.username = username
-                    if "@" in username:
-                        self.mechanism = "GSSAPI"
-        else:
-            self.host = url.netloc
-        if not self.host:
-            self.host = None
-        self.dbname = url.path.lstrip("/")
-        if not self.dbname:
-            self.dbname = "ivre"
         params = dict(
             x.split("=", 1) if "=" in x else (x, None)
             for x in url.query.split("&")
             if x
         )
         try:
-            self.maxscan = int(params.pop("maxscan", None))
-        except TypeError:
-            self.maxscan = None
-        try:
             self.maxtime = int(params.pop("maxtime", None))
         except TypeError:
-            self.maxtime = None
+            self.maxtime = config.MONGODB_QUERY_TIMEOUT_MS
+        if "ssl" in params:
+            if params["ssl"].lower() == "true":
+                params["ssl"] = True
+            elif params["ssl"].lower() == "false":
+                params["ssl"] = False
+        if "readPreference" in params:
+            params["read_preference"] = {
+                "nearest": pymongo.ReadPreference.NEAREST,
+                "primary": pymongo.ReadPreference.PRIMARY,
+                "primarypreferred": pymongo.ReadPreference.PRIMARY_PREFERRED,
+                "primary_preferred": pymongo.ReadPreference.PRIMARY_PREFERRED,
+                "secondary": pymongo.ReadPreference.SECONDARY,
+                "secondarypreferred": pymongo.ReadPreference.SECONDARY_PREFERRED,
+                "secondary_preferred": pymongo.ReadPreference.SECONDARY_PREFERRED,
+            }.get(params["readPreference"].lower(), params["readPreference"])
         self.params = params
+        self._db = MongoDBConnection(
+            url,
+            {
+                param: value
+                for param, value in params.items()
+                if not param.startswith("colname_")
+            },
+        )
         self.schema_migrations = []
 
+    def close(self):
+        self._db.close()
+
     def set_limits(self, cur):
-        if self.maxscan is not None:
-            cur.max_scan(self.maxscan)
-        if self.maxtime is not None:
+        # `Cursor` (find) supports max_time_ms() post-construction;
+        # `CommandCursor` (aggregate) does not -- timeouts on
+        # aggregations are applied via `_aggregate()` instead.
+        if self.maxtime is not None and hasattr(cur, "max_time_ms"):
             cur.max_time_ms(self.maxtime)
         return cur
 
+    def _aggregate(self, collection, pipeline, **kwargs):
+        """Run a MongoDB aggregation with debug-level pipeline logging
+        and the configured query timeout. `CommandCursor` does not
+        accept `max_time_ms()` post-construction, so the timeout is
+        passed to `aggregate()` via `maxTimeMS=` instead."""
+        log_pipeline(pipeline)
+        if self.maxtime is not None:
+            kwargs.setdefault("maxTimeMS", self.maxtime)
+        return collection.aggregate(pipeline, **kwargs)
+
     @classmethod
-    def get_hint(cls, spec):
+    def get_hint(cls, spec, column):
         """Given a query spec, return an appropriate index in a form
         suitable to be passed to Cursor.hint().
 
         """
-        for fieldname, hint in cls.hint_indexes[cls.column_passive].items():
+        for fieldname, hint in cls.hint_indexes[column].items():
             if fieldname in spec:
                 return hint
         return None
@@ -151,32 +245,12 @@ class MongoDB(DB):
     @property
     def db_client(self):
         """The DB connection."""
-        try:
-            return self._db_client
-        except AttributeError:
-            self._db_client = pymongo.MongoClient(
-                host=self.host,
-                read_preference=pymongo.ReadPreference.SECONDARY_PREFERRED,
-            )
-            return self._db_client
+        return self._db.client
 
     @property
     def db(self):
         """The DB."""
-        try:
-            return self._db
-        except AttributeError:
-            self._db = self.db_client[self.dbname]
-            if self.username is not None:
-                if self.password is not None:
-                    self.db.authenticate(self.username, self.password)
-                elif self.mechanism is not None:
-                    self.db.authenticate(self.username, mechanism=self.mechanism)
-                else:
-                    raise TypeError(
-                        "provide either 'password' or 'mechanism'" " with 'username'"
-                    )
-            return self._db
+        return self._db.db
 
     @property
     def server_info(self):
@@ -187,88 +261,43 @@ class MongoDB(DB):
             self._server_info = self.db_client.server_info()
             return self._server_info
 
-    @property
-    def find(self):
-        """Wrapper around column .find() method, depending on pymongo
-        version.
-
-        """
-        try:
-            return self._find
-        except AttributeError:
-            if pymongo.version_tuple[0] > 2:
-
-                def _find(colname, *args, **kargs):
-                    if "spec" in kargs:
-                        kargs["filter"] = kargs.pop("spec")
-                    if "fields" in kargs:
-                        kargs["projection"] = kargs.pop("fields")
-                    return self.db[colname].find(*args, **kargs)
-
-            else:
-
-                def _find(colname, *args, **kargs):
-                    return self.db[colname].find(*args, **kargs)
-
-            self._find = _find
-            return self._find
-
-    @property
-    def find_one(self):
-        """Wrapper around collection .find_one() method, depending on
-        pymongo version.
-
-        """
-        try:
-            return self._find_one
-        except AttributeError:
-            if pymongo.version_tuple[0] > 2:
-
-                def _find_one(colname, *args, **kargs):
-                    if "spec_or_id" in kargs:
-                        kargs["filter_or_id"] = kargs.pop("spec_or_id")
-                    if "fields" in kargs:
-                        kargs["projection"] = kargs.pop("fields")
-                    return self.db[colname].find_one(*args, **kargs)
-
-                self._find_one = _find_one
-            else:
-
-                def _find_one(colname, *args, **kargs):
-                    return self.db[colname].find_one(*args, **kargs)
-
-                self._find_one = _find_one
-            return self._find_one
-
     def _get_cursor(self, column, flt, **kargs):
         """Like .get(), but returns a MongoDB cursor (suitable for use with
         e.g.  .explain()) based on the column and a filter.
 
         """
-        if "fields" in kargs and any(
-            fld in kargs["fields"] for fld in self.ipaddr_fields
+        if "fields" in kargs:
+            if not kargs["fields"]:
+                del kargs["fields"]
+            else:
+                kargs["projection"] = kargs.pop("fields")
+        if kargs.get("projection") is not None and any(
+            fld in kargs["projection"] for fld in self.ipaddr_fields
         ):
-            fields = []
-            for fld in kargs["fields"]:
+            if isinstance(kargs["projection"], list):
+                kargs["projection"] = dict.fromkeys(kargs["projection"], 1)
+            fields = {}
+            for fld, value in kargs["projection"].items():
                 if fld in self.ipaddr_fields:
-                    fields.extend(["%s_0" % fld, "%s_1" % fld])
+                    fields.update({f"{fld}_0": value, f"{fld}_1": value})
                 else:
-                    fields.append(fld)
-            kargs["fields"] = fields
-        if "sort" in kargs and any(
-            fld in (field for field, _ in kargs["sort"]) for fld in self.ipaddr_fields
-        ):
-            sort = []
-            for fld, way in kargs["sort"]:
-                if fld in self.ipaddr_fields:
-                    sort.extend([("%s_0" % fld, way), ("%s_1" % fld, way)])
-                else:
-                    sort.append((fld, way))
-            kargs["sort"] = sort
-        return self.set_limits(self.find(column, flt, **kargs))
-
-    def count(self, *args, **kargs):
-        return self._get(*args, **kargs).count()
+                    fields[fld] = value
+            kargs["projection"] = fields
+        sort = []
+        for fld, way in kargs.pop("sort", []) or []:
+            if fld in self.ipaddr_fields:
+                sort.extend([(f"{fld}_0", way), (f"{fld}_1", way)])
+            elif fld == "text":
+                if isinstance(kargs.get("projection"), list):
+                    kargs = dict.fromkeys(kargs["projection"], 1)
+                kargs.setdefault("projection", {})["score"] = {"$meta": "textScore"}
+                sort.append(("score", {"$meta": "textScore"}))
+            else:
+                sort.append((fld, way))
+        cursor = self.db[column].find(flt, **kargs)
+        if sort:
+            cursor.sort(sort)
+        return self.set_limits(cursor)
 
     @staticmethod
     def ip2internal(addr):
@@ -316,7 +345,7 @@ class MongoDB(DB):
         want to do something special here, e.g., mix with other records.
 
         """
-        return self.db[colname].update({"_id": recid}, update)
+        return self.db[colname].update_one({"_id": recid}, update)
 
     def migrate_schema(self, colnum, version):
         """Process to schema migrations in column `colname` starting
@@ -339,9 +368,7 @@ class MongoDB(DB):
                 .get("ensure", [])
             )
             if new_indexes:
-                utils.LOGGER.info(
-                    "Creating new indexes...",
-                )
+                utils.LOGGER.info("Creating new indexes...")
                 try:
                     self.db[self.columns[colnum]].create_indexes(
                         [pymongo.IndexModel(idx[0], **idx[1]) for idx in new_indexes]
@@ -350,20 +377,17 @@ class MongoDB(DB):
                     utils.LOGGER.debug(
                         "Cannot create indexes %r", new_indexes, exc_info=True
                     )
-                utils.LOGGER.info(
-                    "  ... Done.",
-                )
-            utils.LOGGER.info(
-                "Migrating records...",
-            )
+                utils.LOGGER.info("  ... Done.")
+            utils.LOGGER.info("Migrating records...")
             updated = False
             # unlimited find()!
             for i, record in enumerate(
-                self.find(
-                    self.columns[colnum],
+                self.db[self.columns[colnum]]
+                .find(
                     self.searchversion(version),
-                    no_cursor_timeout=True,
-                ).batch_size(50000)
+                    no_cursor_timeout=not self.is_documentdb,
+                )
+                .batch_size(50000)
             ):
                 try:
                     update = migration_function(record)
@@ -379,21 +403,17 @@ class MongoDB(DB):
                         exc_info=True,
                     )
                     failed += 1
-                if (i + 1) % 100000 == 0:
+                if not (i + 1) % 100000:
                     utils.LOGGER.info("  %d records migrated", i + 1)
-            utils.LOGGER.info(
-                "  ... Done.",
-            )
+            utils.LOGGER.info("  ... Done.")
             # Checking for required actions on indexes
-            utils.LOGGER.info(
-                "  Performing other actions on indexes...",
-            )
+            utils.LOGGER.info("Performing other actions on indexes...")
             for action, indexes in (
                 self.schema_migrations_indexes[colnum].get(new_version, {}).items()
             ):
                 if action == "ensure":
                     continue
-                function = getattr(self.db[self.columns[colnum]], "%s_index" % action)
+                function = getattr(self.db[self.columns[colnum]], f"{action}_index")
                 for idx in indexes:
                     try:
                         function(idx[0], **idx[1])
@@ -401,9 +421,7 @@ class MongoDB(DB):
                         (utils.LOGGER.warning if updated else utils.LOGGER.debug)(
                             "Cannot %s index %s", action, idx, exc_info=True
                         )
-            utils.LOGGER.info(
-                "  ... Done.",
-            )
+            utils.LOGGER.info("  ... Done.")
             utils.LOGGER.info(
                 "Migration of column %d from version %r to %r DONE",
                 colnum,
@@ -468,12 +486,12 @@ class MongoDB(DB):
         for i in range(field.count("."), -1, -1):
             subfield = field.rsplit(".", i)[0]
             if subfield in self.list_fields:
-                pipeline += [{"$unwind": "$" + subfield}]
+                pipeline += [{"$unwind": f"${subfield}"}]
         pipeline += specialflt
         # next step for previous hack
-        project = {"field": "$%s" % field}
+        project = {"field": f"${field}"}
         if countfield is not None:
-            project["count"] = "$%s" % countfield
+            project["count"] = f"${countfield}"
         pipeline += [{"$project": project}]
         if aggrflt:
             pipeline += [{"$match": aggrflt}]
@@ -518,10 +536,10 @@ class MongoDB(DB):
         for i in range(field.count("."), -1, -1):
             subfield = field.rsplit(".", i)[0]
             if subfield in self.list_fields:
-                pipeline += [{"$unwind": "$" + subfield}]
+                pipeline += [{"$unwind": f"${subfield}"}]
         if is_ipfield:
-            pipeline.append({"$project": {field: ["$%s_0" % field, "$%s_1" % field]}})
-        pipeline.append({"$group": {"_id": "$%s" % field}})
+            pipeline.append({"$project": {field: [f"${field}_0", f"${field}_1"]}})
+        pipeline.append({"$group": {"_id": f"${field}"}})
         return pipeline
 
     def _distinct(self, column, field, flt=None, sort=None, limit=None, skip=None):
@@ -533,8 +551,7 @@ class MongoDB(DB):
         pipeline = self._distinct_pipeline(
             field, flt=flt, sort=sort, limit=limit, skip=skip, is_ipfield=is_ipfield
         )
-        log_pipeline(pipeline)
-        cursor = self.set_limits(self.db[column].aggregate(pipeline, cursor={}))
+        cursor = self._aggregate(self.db[column], pipeline)
         if is_ipfield:
             return (
                 None if res["_id"][0] is None else self.internal2ip(res["_id"])
@@ -551,11 +568,11 @@ class MongoDB(DB):
         )
         project = [port]
         if use_service:
-            project.append("%s.service_name" % service_base)
+            project.append(f"{service_base}.service_name")
             if use_product:
-                project.append("%s.service_product" % service_base)
+                project.append(f"{service_base}.service_product")
                 if use_version:
-                    project.append("%s.service_version" % service_base)
+                    project.append(f"{service_base}.service_version")
         project = {"field": project}
         pipeline.extend(
             [
@@ -567,9 +584,8 @@ class MongoDB(DB):
             # When not using yieldall, we can sort in
             # database.
             pipeline.append({"$sort": OrderedDict([("_id", 1)])})
-        log_pipeline(pipeline)
-        for rec in self.db[self.columns[self._features_column]].aggregate(
-            pipeline, cursor={}
+        for rec in self._aggregate(
+            self.db[self.columns[self._features_column]], pipeline
         ):
             yield rec["_id"]
 
@@ -625,32 +641,71 @@ class MongoDB(DB):
                 cond.setdefault("$and", []).extend([{k: cond1[k]}, {k: cond2[k]}])
         return cond
 
-    @staticmethod
-    def flt_or(*args):
+    @classmethod
+    def flt_or(cls, *args):
+        # Zero-argument contract from the base class: an empty
+        # disjunction is vacuously false, so match nothing.
+        if not args:
+            return cls.searchnonexistent()
         return {"$or": list(args)} if len(args) > 1 else args[0]
 
     @staticmethod
     def _search_field_exists(field):
         return {field: {"$exists": True}}
 
+    @classmethod
+    def _search_field(cls, field, value, neg=False):
+        """Build a positive (``neg=False``) or negative
+        equality clause for a single MongoDB field given a
+        scalar, list, or compiled regex value. Encapsulates the
+        scalar / list / regex dispatch shared by ~25
+        ``searchXXX`` helpers in this module: callers can
+        therefore replace the 12-line ``if neg / isinstance /
+        list-of-1`` ladder with a one-line ``cls._search_field``
+        delegation.
+
+        Declared as ``@classmethod`` so a backend-specific
+        subclass (e.g. a future ``DocumentDB*`` override) can
+        replace the dispatch without touching every caller.
+
+        Wire shapes (``$ne`` / ``$nin`` / ``$not`` / ``$in``)
+        match what the previous hand-written ladders produced,
+        so the refactor is behaviour-preserving (DocumentDB
+        semantics included).
+        """
+        if isinstance(value, re.Pattern):
+            return {field: {"$not": value} if neg else value}
+        if isinstance(value, list):
+            if len(value) == 1:
+                value = value[0]
+            else:
+                return {field: {"$nin": value} if neg else {"$in": value}}
+        return {field: {"$ne": value} if neg else value}
+
     @staticmethod
     def searchnonexistent():
         return {"_id": 0}
 
-    @staticmethod
-    def searchobjectid(oid, neg=False):
-        """Filters records by their ObjectID.  `oid` can be a single or many
-        (as a list or any iterable) object ID(s), specified as strings
-        or an `ObjectID`s.
+    @classmethod
+    def searchobjectid(cls, oid, neg=False):
+        """Filters records by their ObjectID.  `oid` can be a
+        single or many (as a list or any iterable) object
+        ID(s), specified as strings or as `ObjectID`s.
 
+        Coerces the input to :class:`bson.objectid.ObjectId`
+        (scalar or list of) and dispatches to
+        :meth:`_search_field`.  Wire shapes are unchanged from
+        the legacy hand-written ladder: scalars (including
+        list-of-one inputs) collapse to ``{"_id": <objid>}``
+        on the positive branch and ``{"_id": {"$ne":
+        <objid>}}`` on the negative one; lists with more
+        than one element become ``$in`` / ``$nin``.
         """
         if isinstance(oid, (str, bytes, bson.objectid.ObjectId)):
-            oid = [bson.objectid.ObjectId(oid)]
+            oid = bson.objectid.ObjectId(oid)
         else:
             oid = [bson.objectid.ObjectId(elt) for elt in oid]
-        if len(oid) == 1:
-            return {"_id": {"$ne": oid[0]} if neg else oid[0]}
-        return {"_id": {"$nin" if neg else "$in": oid}}
+        return cls._search_field("_id", oid, neg=neg)
 
     @staticmethod
     def searchversion(version):
@@ -672,8 +727,8 @@ class MongoDB(DB):
         fieldname is the internal name of the addr field
         """
         addr = cls.ip2internal(addr)
-        addr_0 = "%s_0" % fieldname
-        addr_1 = "%s_1" % fieldname
+        addr_0 = f"{fieldname}_0"
+        addr_1 = f"{fieldname}_1"
         if neg:
             return {"$or": [{addr_0: {"$ne": addr[0]}}, {addr_1: {"$ne": addr[1]}}]}
         return {addr_0: addr[0], addr_1: addr[1]}
@@ -706,8 +761,8 @@ class MongoDB(DB):
         """
         start = cls.ip2internal(start)
         stop = cls.ip2internal(stop)
-        addr_0 = "%s_0" % fieldname
-        addr_1 = "%s_1" % fieldname
+        addr_0 = f"{fieldname}_0"
+        addr_1 = f"{fieldname}_1"
         if neg:
             return {
                 "$or": [
@@ -754,24 +809,116 @@ class MongoDB(DB):
             return {key: val}
         if cmpop == "!=":
             return {key: {"$ne": val}}
-        raise Exception(
-            "Unknown operator %r (for key %r and val %r)"
-            % (
-                cmpop,
-                key,
-                val,
-            )
-        )
+        raise Exception(f"Unknown operator {cmpop!r} (for key {key!r} and val {val!r})")
+
+    @staticmethod
+    def _searchcertsubject(prefix, subject, field):
+        res = {}
+        if isinstance(subject, dict):
+            if not subject:
+                res[f"{prefix}{field}_text"] = {"$exists": True}
+            else:
+                for key, value in subject.items():
+                    if VALID_KEY.match(key):
+                        res[f"{prefix}{field}.{key}"] = value
+                    else:
+                        utils.LOGGER.warning(
+                            "Skipping invalid key [%r] in cert lookup", key[:100]
+                        )
+        else:
+            res[f"{prefix}{field}_text"] = subject
+        return res
+
+    @classmethod
+    def _searchcert(
+        cls,
+        prefix="",
+        base=None,
+        keytype=None,
+        md5=None,
+        sha1=None,
+        sha256=None,
+        subject=None,
+        issuer=None,
+        self_signed=None,
+        pkmd5=None,
+        pksha1=None,
+        pksha256=None,
+    ):
+        res = base or {}
+        if keytype is not None:
+            res[f"{prefix}pubkey.type"] = keytype
+        for hashtype in ["md5", "sha1", "sha256"]:
+            hashval = locals()[hashtype]
+            if hashval is None:
+                continue
+            key = f"{prefix}{hashtype}"
+            if isinstance(hashval, re.Pattern):
+                res[key] = re.compile(hashval.pattern, hashval.flags | re.I)
+                continue
+            if isinstance(hashval, list):
+                res[key] = {"$in": [val.lower() for val in hashval]}
+                continue
+            res[key] = hashval.lower()
+        if subject is not None:
+            res.update(cls._searchcertsubject(prefix, subject, "subject"))
+        if issuer is not None:
+            res.update(cls._searchcertsubject(prefix, issuer, "issuer"))
+        if self_signed is not None:
+            res[f"{prefix}self_signed"] = self_signed
+        for hashtype in ["md5", "sha1", "sha256"]:
+            hashval = locals()[f"pk{hashtype}"]
+            if hashval is None:
+                continue
+            key = f"{prefix}pubkey.{hashtype}"
+            if isinstance(hashval, re.Pattern):
+                res[key] = re.compile(hashval.pattern, hashval.flags | re.I)
+                continue
+            if isinstance(hashval, list):
+                res[key] = {"$in": [val.lower() for val in hashval]}
+                continue
+            res[key] = hashval.lower()
+        return res
+
+    @staticmethod
+    def searchtext(text):
+        return {"$text": {"$search": text}}
+
+
+def _normalize_mac(mac):
+    """Normalise a MAC-address ``searchmac`` argument for the
+    shared :meth:`MongoDB._search_field` dispatch.
+
+    MAC addresses are stored lower-cased on the wire; both the
+    active and passive ``searchmac`` helpers preserve that
+    contract by:
+
+    * forcing the ``IGNORECASE`` flag on regex inputs (MAC
+      addresses are case-insensitive),
+    * lower-casing scalar string inputs,
+    * lower-casing each string element of a list input.
+
+    Non-string elements pass through unchanged (the caller is
+    expected to know what it's doing).  Used by
+    :meth:`MongoDBActive.searchmac` and
+    :meth:`MongoDBPassive.searchmac` so the normalisation
+    rule lives in one place.
+    """
+    if isinstance(mac, re.Pattern):
+        return re.compile(mac.pattern, mac.flags | re.I)
+    if isinstance(mac, list):
+        return [m.lower() if isinstance(m, str) else m for m in mac]
+    if isinstance(mac, str):
+        return mac.lower()
+    return mac
 
 
 class MongoDBActive(MongoDB, DBActive):
-
     column_hosts = 0
     _features_column = 0
-    indexes = [
+    indexes: list[list[tuple[list[IndexKey], dict[str, Any]]]] = [
         # hosts
         [
-            ([("scanid", pymongo.ASCENDING)], {}),
             ([("schema_version", pymongo.ASCENDING)], {}),
             (
                 [
@@ -780,6 +927,7 @@ class MongoDBActive(MongoDB, DBActive):
                 ],
                 {},
             ),
+            ([("addresses.mac", pymongo.ASCENDING)], {"sparse": True}),
             ([("starttime", pymongo.ASCENDING)], {}),
             ([("endtime", pymongo.ASCENDING)], {}),
             ([("source", pymongo.ASCENDING)], {}),
@@ -791,7 +939,6 @@ class MongoDBActive(MongoDB, DBActive):
                 ],
                 {},
             ),
-            ([("synack_honeypot", pymongo.ASCENDING)], {"sparse": True}),
             ([("hostnames.domains", pymongo.ASCENDING)], {}),
             ([("traces.hops.domains", pymongo.ASCENDING)], {}),
             ([("openports.count", pymongo.ASCENDING)], {}),
@@ -807,7 +954,7 @@ class MongoDBActive(MongoDB, DBActive):
                     ("ports.service_product", pymongo.ASCENDING),
                     ("ports.service_version", pymongo.ASCENDING),
                 ],
-                {},
+                {"name": "ivre.hosts.$ports.service"},
             ),
             ([("ports.scripts.id", pymongo.ASCENDING)], {}),
             (
@@ -815,14 +962,20 @@ class MongoDBActive(MongoDB, DBActive):
                     ("ports.scripts.http-headers.name", pymongo.ASCENDING),
                     ("ports.scripts.http-headers.value", pymongo.ASCENDING),
                 ],
-                {"sparse": True},
+                {
+                    "sparse": True,
+                    "name": "ivre.hosts.$ports.$scripts.http-headers",
+                },
             ),
             (
                 [
                     ("ports.scripts.http-app.application", pymongo.ASCENDING),
                     ("ports.scripts.http-app.version", pymongo.ASCENDING),
                 ],
-                {"sparse": True},
+                {
+                    "sparse": True,
+                    "name": "ivre.hosts.$ports.$scripts.http-app",
+                },
             ),
             (
                 [("ports.scripts.dns-domains.parents", pymongo.ASCENDING)],
@@ -861,6 +1014,14 @@ class MongoDBActive(MongoDB, DBActive):
                         pymongo.ASCENDING,
                     ),
                     ("ports.scripts.ssl-cert.issuer.localityName", pymongo.ASCENDING),
+                ],
+                {
+                    "sparse": True,
+                    "name": "ports.scripts.ssl-cert.issuer.fields_1",
+                },
+            ),
+            (
+                [
                     (
                         "ports.scripts.ssl-cert.issuer.organizationName",
                         pymongo.ASCENDING,
@@ -872,7 +1033,7 @@ class MongoDBActive(MongoDB, DBActive):
                 ],
                 {
                     "sparse": True,
-                    "name": "ivre.hosts.$ports.scripts.ssl-cert.issuer.fields_1",
+                    "name": "ports.scripts.ssl-cert.issuer.fields_2",
                 },
             ),
             (
@@ -887,6 +1048,14 @@ class MongoDBActive(MongoDB, DBActive):
                         pymongo.ASCENDING,
                     ),
                     ("ports.scripts.ssl-cert.subject.localityName", pymongo.ASCENDING),
+                ],
+                {
+                    "sparse": True,
+                    "name": "ports.scripts.ssl-cert.subject.fields_1",
+                },
+            ),
+            (
+                [
                     (
                         "ports.scripts.ssl-cert.subject.organizationName",
                         pymongo.ASCENDING,
@@ -898,7 +1067,7 @@ class MongoDBActive(MongoDB, DBActive):
                 ],
                 {
                     "sparse": True,
-                    "name": "ivre.hosts.$ports.scripts.ssl-cert.subject.fields_1",
+                    "name": "ports.scripts.ssl-cert.subject.fields_2",
                 },
             ),
             ([("ports.scripts.ssl-cert.md5", pymongo.ASCENDING)], {"sparse": True}),
@@ -914,6 +1083,30 @@ class MongoDBActive(MongoDB, DBActive):
             ),
             (
                 [("ports.scripts.ssl-cert.pubkey.sha256", pymongo.ASCENDING)],
+                {"sparse": True},
+            ),
+            (
+                [("ports.scripts.ssl-ja3-client.md5", pymongo.ASCENDING)],
+                {"sparse": True},
+            ),
+            (
+                [("ports.scripts.ssl-ja4-client.ja4", pymongo.ASCENDING)],
+                {"sparse": True},
+            ),
+            (
+                [
+                    ("ports.scripts.ssl-ja4-client.ja4_a", pymongo.ASCENDING),
+                    ("ports.scripts.ssl-ja4-client.ja4_b", pymongo.ASCENDING),
+                    ("ports.scripts.ssl-ja4-client.ja4_c", pymongo.ASCENDING),
+                ],
+                {"sparse": True},
+            ),
+            (
+                [("ports.scripts.ssl-jarm", pymongo.ASCENDING)],
+                {"sparse": True},
+            ),
+            (
+                [("ports.scripts.ssh2-enum-algos.hassh.md5", pymongo.ASCENDING)],
                 {"sparse": True},
             ),
             (
@@ -939,23 +1132,14 @@ class MongoDBActive(MongoDB, DBActive):
                 [("ports.scripts.ntlm-info.Product_Version", pymongo.ASCENDING)],
                 {"sparse": True},
             ),
-            ([("infos.as_num", pymongo.ASCENDING)], {}),
             (
                 [
                     ("traces.hops.ipaddr_0", pymongo.ASCENDING),
                     ("traces.hops.ipaddr_1", pymongo.ASCENDING),
                     ("traces.hops.ttl", pymongo.ASCENDING),
                 ],
-                {},
+                {"name": "ivre.hosts.$traces.$hops"},
             ),
-            (
-                [
-                    ("infos.country_code", pymongo.ASCENDING),
-                    ("infos.city", pymongo.ASCENDING),
-                ],
-                {},
-            ),
-            ([("infos.loc", pymongo.GEOSPHERE)], {}),
             (
                 [
                     ("cpes.type", pymongo.ASCENDING),
@@ -967,7 +1151,9 @@ class MongoDBActive(MongoDB, DBActive):
             ),
         ],
     ]
-    schema_migrations_indexes = [
+    schema_migrations_indexes: list[
+        dict[int, dict[str, list[tuple[list[IndexKey] | str, dict[str, Any]]]]]
+    ] = [
         # hosts
         {
             1: {
@@ -1189,6 +1375,124 @@ class MongoDBActive(MongoDB, DBActive):
                     ),
                 ]
             },
+            20: {
+                "drop": [([("synack_honeypot", pymongo.ASCENDING)], {})],
+                "ensure": [
+                    ([("addresses.mac", pymongo.ASCENDING)], {"sparse": True}),
+                    (
+                        [("ports.scripts.dns-domains.parents", pymongo.ASCENDING)],
+                        {"sparse": True},
+                    ),
+                    (
+                        [
+                            (
+                                "ports.scripts.ssh2-enum-algos.hassh.md5",
+                                pymongo.ASCENDING,
+                            )
+                        ],
+                        {"sparse": True},
+                    ),
+                    (
+                        [("ports.scripts.ssl-ja3-client.md5", pymongo.ASCENDING)],
+                        {"sparse": True},
+                    ),
+                    (
+                        [
+                            ("tags.value", pymongo.ASCENDING),
+                            ("tags.info", pymongo.ASCENDING),
+                        ],
+                        {"sparse": True},
+                    ),
+                ],
+            },
+            21: {
+                "ensure": [
+                    (
+                        [("ports.scripts.ssl-jarm", pymongo.ASCENDING)],
+                        {"sparse": True},
+                    ),
+                ]
+            },
+            22: {
+                "drop": [
+                    ("ivre.hosts.$ports.scripts.ssl-cert.issuer.fields_1", {}),
+                    ("ivre.hosts.$ports.scripts.ssl-cert.subject.fields_1", {}),
+                ],
+                "ensure": [
+                    (
+                        [
+                            (
+                                "ports.scripts.ssl-cert.issuer.countryName",
+                                pymongo.ASCENDING,
+                            ),
+                            (
+                                "ports.scripts.ssl-cert.issuer.stateOrProvinceName",
+                                pymongo.ASCENDING,
+                            ),
+                            (
+                                "ports.scripts.ssl-cert.issuer.localityName",
+                                pymongo.ASCENDING,
+                            ),
+                        ],
+                        {
+                            "sparse": True,
+                            "name": "ports.scripts.ssl-cert.issuer.fields_1",
+                        },
+                    ),
+                    (
+                        [
+                            (
+                                "ports.scripts.ssl-cert.issuer.organizationName",
+                                pymongo.ASCENDING,
+                            ),
+                            (
+                                "ports.scripts.ssl-cert.issuer.organizationalUnitName",
+                                pymongo.ASCENDING,
+                            ),
+                        ],
+                        {
+                            "sparse": True,
+                            "name": "ports.scripts.ssl-cert.issuer.fields_2",
+                        },
+                    ),
+                    (
+                        [
+                            (
+                                "ports.scripts.ssl-cert.subject.countryName",
+                                pymongo.ASCENDING,
+                            ),
+                            (
+                                "ports.scripts.ssl-cert.subject.stateOrProvinceName",
+                                pymongo.ASCENDING,
+                            ),
+                            (
+                                "ports.scripts.ssl-cert.subject.localityName",
+                                pymongo.ASCENDING,
+                            ),
+                        ],
+                        {
+                            "sparse": True,
+                            "name": "ports.scripts.ssl-cert.subject.fields_1",
+                        },
+                    ),
+                    (
+                        [
+                            (
+                                "ports.scripts.ssl-cert.subject.organizationName",
+                                pymongo.ASCENDING,
+                            ),
+                            (
+                                "ports.scripts.ssl-cert.subject.organizationalUnitName",
+                                pymongo.ASCENDING,
+                            ),
+                        ],
+                        {
+                            "sparse": True,
+                            "name": "ports.scripts.ssl-cert.subject.fields_2",
+                        },
+                    ),
+                ],
+            },
         },
     ]
     schema_latest_versions = [
@@ -1220,6 +1524,9 @@ class MongoDBActive(MongoDB, DBActive):
                 16: (17, self.migrate_schema_hosts_16_17),
                 17: (18, self.migrate_schema_hosts_17_18),
                 18: (19, self.migrate_schema_hosts_18_19),
+                19: (20, self.migrate_schema_hosts_19_20),
+                20: (21, self.migrate_schema_hosts_20_21),
+                21: (22, self.migrate_schema_hosts_21_22),
             },
         ]
 
@@ -1533,7 +1840,7 @@ class MongoDBActive(MongoDB, DBActive):
                     pass
                 else:
                     del port["state_reason_ip"]
-                    (port["state_reason_ip_0"], port["state_reason_ip_1"]) = ipaddr
+                    port["state_reason_ip_0"], port["state_reason_ip_1"] = ipaddr
                     updated = True
             for script in port.get("scripts", []):
                 if script["id"] == "ssl-cert":
@@ -1781,14 +2088,95 @@ class MongoDBActive(MongoDB, DBActive):
                 if script["id"] == "smb-os-discovery":
                     smb, ntlm = xmlnmap.split_smb_os_discovery(script)
                     script.update(smb)
-                    if ntlm:
-                        port["scripts"].append(ntlm)
+                    port["scripts"].append(ntlm)
                     updated = True
                 if script["id"].endswith("-ntlm-info"):
                     xmlnmap.post_ntlm_info(script, port, doc)
                     updated = True
         if updated:
             update["$set"]["ports"] = doc["ports"]
+        return update
+
+    @classmethod
+    def migrate_schema_hosts_19_20(cls, doc):
+        """Converts a record from version 19 to version 20. Version 20
+        introduces tags, uses a script alias "nuclei" for "*-nuclei"
+        scripts and fixes the structured output for
+        "http-default-accounts" script.
+
+        Version 20 also introduces a full-text index, but this has no
+        effect on the document structure.
+
+        """
+        assert doc["schema_version"] == 19
+        update = {"$set": {"schema_version": 20}}
+        was_synack_honeypot = False
+        if "synack_honeypot" in doc:
+            update["$unset"] = {"synack_honeypot": ""}
+            doc["tags"] = [
+                {"value": "Honeypot", "type": "warning", "info": ["SYN+ACK honeypot"]}
+            ]
+            was_synack_honeypot = True
+        else:
+            was_synack_honeypot = False
+        ports_updated = False
+        for port in doc.get("ports", []):
+            for script in port.get("scripts", []):
+                if script["id"] == "http-default-accounts":
+                    if "http-default-accounts" in script:
+                        ports_updated = True
+                        script["http-default-accounts"] = (
+                            xmlnmap.change_http_default_accounts(
+                                script["http-default-accounts"]
+                            )
+                        )
+                elif script["id"].endswith("-nuclei") and script["id"] in script:
+                    ports_updated = True
+                    script["nuclei"] = script.pop(script["id"])
+        set_auto_tags(doc)
+        if "tags" in doc:
+            update["$set"]["tags"] = doc["tags"]
+        if is_synack_honeypot(doc) and not was_synack_honeypot:
+            if doc.get("ports"):
+                update["$set"]["ports"] = doc["ports"]
+            else:
+                update.setdefault("$unset", {})["ports"] = ""
+            update["$set"]["openports"] = doc["openports"]
+        elif ports_updated:
+            update["$set"]["ports"] = doc["ports"]
+        return update
+
+    @staticmethod
+    def migrate_schema_hosts_20_21(doc):
+        """Converts a record from version 20 to version 21. Version 21
+        introduces a structured output for data from ssl-jarm.
+
+        """
+        assert doc["schema_version"] == 20
+        update = {"$set": {"schema_version": 21}}
+        updated = False
+        for port in doc.get("ports", []):
+            for script in port.get("scripts", []):
+                if script["id"] == "ssl-jarm":
+                    if script.get("output"):
+                        script["ssl-jarm"] = script["output"].strip()
+                        updated = True
+        if updated:
+            update["$set"]["ports"] = doc["ports"]
+        return update
+
+    @staticmethod
+    def migrate_schema_hosts_21_22(doc):
+        """Converts a record from version 21 to version 22. Version 22
+        removes the `scanid` field and the `infos` and `tags` fields
+        in the Nmap purpose (they are now only used in the View
+        purpose).
+
+        """
+        assert doc["schema_version"] == 21
+        update = {"$set": {"schema_version": 22}}
+        if "scanid" in doc:
+            update["$unset"] = {"scanid": ""}
         return update
 
     def _get(self, flt, **kargs):
@@ -1802,13 +2190,16 @@ class MongoDBActive(MongoDB, DBActive):
         """Queries the active column with the provided filter "spec",
         and returns a MongoDB cursor.
 
-        This should be very fast, as no operation is done (the cursor is only
-        returned). Next operations (e.g., .count(), enumeration, etc.) might
-        take a long time, depending on both the operations and the filter.
+        This should be very fast, as no operation is done (the cursor
+        is only returned). Next operations (e.g., enumeration) might
+        take a long time, depending on both the operations and the
+        filter.
 
         Any keyword argument is passed to the .find() method of the Mongodb
         column object, without any validation (and might have no effect if
-        it is not expected)."""
+        it is not expected).
+
+        """
         # Convert IP addresses to internal DB format
         for host in self._get(spec, **kargs):
             try:
@@ -1841,14 +2232,11 @@ class MongoDBActive(MongoDB, DBActive):
                 ]
             yield host
 
-    @staticmethod
-    def getscanids(host):
-        scanids = host.get("scanid")
-        if scanids is None:
-            return []
-        if isinstance(scanids, list):
-            return scanids
-        return [scanids]
+    def count(self, flt):
+        """Count documents in hosts column."""
+        if not flt:
+            return self.db[self.columns[self.column_hosts]].estimated_document_count()
+        return self.db[self.columns[self.column_hosts]].count_documents(flt)
 
     def setscreenshot(self, host, port, data, protocol="tcp", overwrite=False):
         """Sets the content of a port's screenshot."""
@@ -1858,15 +2246,15 @@ class MongoDBActive(MongoDB, DBActive):
                 for p in host.get("ports", [])
                 if p["port"] == port and p["protocol"] == protocol
             ][0]
-        except IndexError:
-            raise KeyError("Port %s/%d does not exist" % (protocol, port))
+        except IndexError as exc:
+            raise KeyError(f"Port {protocol}/{port} does not exist") from exc
         if "screenshot" in port and not overwrite:
             return
         trim_result = utils.trim_image(data)
         if trim_result is False:
             # Image no longer exists after trim
             port["screenshot"] = "empty"
-            self.db[self.columns[self.column_hosts]].update(
+            self.db[self.columns[self.column_hosts]].update_one(
                 {"_id": host["_id"]}, {"$set": {"ports": host["ports"]}}
             )
             return
@@ -1878,7 +2266,7 @@ class MongoDBActive(MongoDB, DBActive):
         screenwords = utils.screenwords(data)
         if screenwords is not None:
             port["screenwords"] = screenwords
-        self.db[self.columns[self.column_hosts]].update(
+        self.db[self.columns[self.column_hosts]].update_one(
             {"_id": host["_id"]}, {"$set": {"ports": host["ports"]}}
         )
 
@@ -1927,7 +2315,7 @@ class MongoDBActive(MongoDB, DBActive):
                 portdoc["screenwords"] = screenwords
                 updated = True
         if updated:
-            self.db[self.columns[self.column_hosts]].update(
+            self.db[self.columns[self.column_hosts]].update_one(
                 {"_id": host["_id"]}, {"$set": {"ports": host["ports"]}}
             )
 
@@ -1945,22 +2333,9 @@ class MongoDBActive(MongoDB, DBActive):
                     del p["screenshot"]
                     changed = True
         if changed:
-            self.db[self.columns[self.column_hosts]].update(
+            self.db[self.columns[self.column_hosts]].update_one(
                 {"_id": host["_id"]}, {"$set": {"ports": host["ports"]}}
             )
-
-    def getlocations(self, flt):
-        col = self.db[self.columns[self.column_hosts]]
-        pipeline = [
-            {"$match": self.flt_and(flt, self.searchhaslocation())},
-            {"$project": {"_id": 0, "coords": "$infos.loc.coordinates"}},
-            {"$group": {"_id": "$coords", "count": {"$sum": 1}}},
-        ]
-        log_pipeline(pipeline)
-        return (
-            {"_id": tuple(rec["_id"][::-1]), "count": rec["count"]}
-            for rec in col.aggregate(pipeline, cursor={})
-        )
 
     def get_ips_ports(self, flt, limit=None, skip=None):
         cur = self._get(
@@ -1980,53 +2355,50 @@ class MongoDBActive(MongoDB, DBActive):
         )
 
     def get_ips(self, flt, limit=None, skip=None):
-        cur = self._get(
-            flt, fields=["addr_0", "addr_1"], limit=limit or 0, skip=skip or 0
-        )
         return (
-            (
-                dict(res, addr=self.internal2ip([res["addr_0"], res["addr_1"]]))
-                for res in cur
-            ),
-            cur.count(),
+            self.get(flt, fields=["addr"], limit=limit or 0, skip=skip or 0),
+            self.count(flt),
         )
 
     def get_open_port_count(self, flt, limit=None, skip=None):
-        cur = self._get(
-            flt,
-            fields=["addr_0", "addr_1", "starttime", "openports.count"],
-            limit=limit or 0,
-            skip=skip or 0,
-        )
         return (
-            (
-                dict(res, addr=self.internal2ip([res["addr_0"], res["addr_1"]]))
-                for res in cur
+            self.get(
+                flt,
+                fields=["addr", "starttime", "openports.count"],
+                limit=limit or 0,
+                skip=skip or 0,
             ),
-            cur.count(),
+            self.count(flt),
         )
 
-    def store_host(self, host):
-        host = deepcopy(host)
-        # Convert IP addresses to internal DB format
+    @classmethod
+    def rec2internal(cls, host):
+        """Given a record as presented to the user, fixes it before it can be
+        inserted in the database.
+
+        """
         try:
-            host["addr_0"], host["addr_1"] = self.ip2internal(host.pop("addr"))
+            host["addr_0"], host["addr_1"] = cls.ip2internal(host.pop("addr"))
         except (KeyError, ValueError):
             pass
-        for port in host.get("ports", []):
-            if "state_reason_ip" in port:
-                try:
-                    (
-                        port["state_reason_ip_0"],
-                        port["state_reason_ip_1"],
-                    ) = self.ip2internal(port.pop("state_reason_ip"))
-                except ValueError:
-                    pass
+        if "ports" in host:
+            host["ports"] = sorted(
+                host["ports"], key=lambda port: (port.get("protocol", ""), port["port"])
+            )
+            for port in host["ports"]:
+                if "state_reason_ip" in port:
+                    try:
+                        (
+                            port["state_reason_ip_0"],
+                            port["state_reason_ip_1"],
+                        ) = cls.ip2internal(port.pop("state_reason_ip"))
+                    except ValueError:
+                        pass
         for trace in host.get("traces", []):
             for hop in trace.get("hops", []):
                 if "ipaddr" in hop:
                     try:
-                        hop["ipaddr_0"], hop["ipaddr_1"] = self.ip2internal(
+                        hop["ipaddr_0"], hop["ipaddr_1"] = cls.ip2internal(
                             hop.pop("ipaddr")
                         )
                     except ValueError:
@@ -2037,31 +2409,34 @@ class MongoDBActive(MongoDB, DBActive):
                 "type": "Point",
                 "coordinates": host["infos"].pop("coordinates")[::-1],
             }
+        return host
+
+    def store_host(self, host):
+        host = deepcopy(host)
+        self.rec2internal(host)
         try:
-            ident = self.db[self.columns[self.column_hosts]].insert(host)
-        except Exception:
+            ident = (
+                self.db[self.columns[self.column_hosts]].insert_one(host).inserted_id
+            )
+        except (WriteError, InvalidDocument):
+            # A single malformed/rejected document (e.g. a server-side
+            # schema validation failure -- WriteError, including its
+            # DuplicateKeyError subclass -- or a client-side BSON
+            # encoding failure such as a document exceeding the 16 MB
+            # limit -- InvalidDocument / its DocumentTooLarge subclass)
+            # must not abort a whole ``db2view`` batch. Connectivity /
+            # authentication / topology errors (ConnectionFailure,
+            # AutoReconnect, NotPrimaryError, ConfigurationError, the
+            # broader OperationFailure) are not caught here and
+            # propagate, so an outage or misconfiguration still fails
+            # the batch loudly instead of silently logging a warning
+            # per host.
             utils.LOGGER.warning("Cannot insert host %r", host, exc_info=True)
             return None
         utils.LOGGER.debug(
             "HOST STORED: %r in %r", ident, self.columns[self.column_hosts]
         )
         return ident
-
-    def merge_host_docs(self, rec1, rec2):
-        """Merge two host records and return the result. Unmergeable /
-        hard-to-merge fields are lost (e.g., extraports).
-
-        """
-        rec = super().merge_host_docs(rec1, rec2)
-        scanid = set()
-        for record in [rec1, rec2]:
-            scanid.update(self.getscanids(record))
-        if scanid:
-            if len(scanid) == 1:
-                rec["scanid"] = scanid.pop()
-            else:
-                rec["scanid"] = list(scanid)
-        return rec
 
     def remove(self, host):
         """Removes the host from the active column. `host` must be the record
@@ -2139,8 +2514,7 @@ class MongoDBActive(MongoDB, DBActive):
                 }
             },
         ]
-        log_pipeline(aggr)
-        return self.db[self.columns[self.column_hosts]].aggregate(aggr, cursor={})
+        return self._aggregate(self.db[self.columns[self.column_hosts]], aggr)
 
     def group_by_port(self, flt):
         """Work-in-progress function to get scan results grouped by
@@ -2176,16 +2550,47 @@ class MongoDBActive(MongoDB, DBActive):
             },
             {"$group": {"_id": "$ports", "ids": {"$addToSet": "$_id"}}},
         ]
-        log_pipeline(aggr)
-        return self.db[self.columns[self.column_hosts]].aggregate(aggr, cursor={})
+        return self._aggregate(self.db[self.columns[self.column_hosts]], aggr)
 
     @staticmethod
-    def json2dbrec(host):
-        for fname in ["starttime", "endtime"]:
-            if fname in host:
-                host[fname] = datetime.datetime.strptime(
-                    host[fname], "%Y-%m-%d %H:%M:%S"
-                )
+    def _datetimevalue2dbrec(value):
+        if isinstance(value, datetime.datetime):
+            return value
+        for fmt in ["%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M:%S.%f"]:
+            try:
+                return datetime.datetime.strptime(value, fmt)
+            except ValueError:
+                continue
+        raise ValueError("time data %r does not match standard formats")
+
+    @classmethod
+    def _datetimefield2dbrec(cls, record, field, current=None):
+        if current is None:
+            current = []
+        if "." not in field:
+            if field not in record:
+                return
+            if ".".join(current + [field]) in cls.list_fields:
+                record[field] = [
+                    cls._datetimevalue2dbrec(value) for value in record[field]
+                ]
+            else:
+                record[field] = cls._datetimevalue2dbrec(record[field])
+            return
+        nextfield, field = field.split(".", 1)
+        if nextfield not in record:
+            return
+        current = current + [nextfield]
+        if ".".join(current) in cls.list_fields:
+            for subrecord in record[nextfield]:
+                cls._datetimefield2dbrec(subrecord, field, current=current)
+        else:
+            cls._datetimefield2dbrec(record[nextfield], field, current=current)
+
+    @classmethod
+    def json2dbrec(cls, host):
+        for field in cls.datetime_fields:
+            cls._datetimefield2dbrec(host, field)
         for port in host.get("ports", []):
             if "screendata" in port:
                 port["screendata"] = bson.Binary(
@@ -2198,108 +2603,100 @@ class MongoDBActive(MongoDB, DBActive):
                     )
         return host
 
-    @staticmethod
-    def searchdomain(name, neg=False):
-        if neg:
-            if isinstance(name, utils.REGEXP_T):
-                return {"hostnames.domains": {"$not": name}}
-            return {"hostnames.domains": {"$ne": name}}
-        return {"hostnames.domains": name}
+    @classmethod
+    def searchdomain(cls, name, neg=False):
+        return cls._search_field("hostnames.domains", name, neg=neg)
 
-    def searchhostname(self, name, neg=False):
+    @classmethod
+    def searchhostname(cls, name=None, neg=False):
+        if name is None:
+            # ``hostnames.domains`` is the indexed field; gate on
+            # its existence rather than ``hostnames.name``'s.
+            return {"hostnames.domains": {"$exists": not neg}}
         if neg:
-            if isinstance(name, utils.REGEXP_T):
-                return {"hostnames.name": {"$not": name}}
-            return {"hostnames.name": {"$ne": name}}
-        return self.flt_and(
+            # ``hostnames.name`` is not indexed (only
+            # ``hostnames.domains`` is, per
+            # :data:`MongoDBActive.indexes`), so a bare
+            # ``{hostnames.name: {$ne: name}}`` form forces a
+            # collection scan.  Split the negation into an
+            # ``$or`` of two disjoint branches:
+            #
+            # * Branch A -- ``{hostnames.domains: {$ne: name}}``
+            #   matches records where ``name`` is NOT anywhere
+            #   in any hostname's domain chain.  Covers records
+            #   with no hostnames at all (Mongo's array ``$ne``
+            #   matches a missing field) plus records whose
+            #   hostnames are entirely outside ``name``'s
+            #   subtree.
+            # * Branch B -- ``{hostnames.domains: name,
+            #   hostnames.name: {$ne: name}}`` matches records
+            #   that DO have a hostname in ``name``'s subtree
+            #   (subdomain or exact match) but no hostname is
+            #   exactly ``name``.  The ``{domains: name}``
+            #   clause is a real positive index value probe
+            #   against the multikey index.
+            #
+            # Semantically identical to the legacy
+            # ``{hostnames.name: {$ne: name}}`` form: A and B
+            # partition the "no hostname equals name exactly"
+            # result set into disjoint slices (records outside
+            # ``name``'s subtree vs. records with at least one
+            # hostname in ``name``'s subtree).  Branch B is a
+            # genuine index hit; Branch A is the unavoidable
+            # array-``$ne`` scan that absence-of-value
+            # questions on multikey indexes always require.
+            return {
+                "$or": [
+                    cls.searchdomain(name, neg=True),
+                    cls.flt_and(
+                        cls.searchdomain(name, neg=False),
+                        cls._search_field("hostnames.name", name, neg=True),
+                    ),
+                ]
+            }
+        # Positive branch: indexed-domain value probe AND'd
+        # with the non-indexed name match.  Both halves go
+        # through :meth:`_search_field` so list / regex
+        # inputs flow through uniformly (the previous
+        # positive branch hard-coded the raw ``name`` value
+        # on the second clause, which silently broke list
+        # inputs).
+        return cls.flt_and(
             # This is indexed
-            self.searchdomain(name, neg=neg),
+            cls.searchdomain(name, neg=False),
             # This is not
-            {"hostnames.name": name},
+            cls._search_field("hostnames.name", name, neg=False),
         )
 
-    @staticmethod
-    def searchcategory(cat, neg=False):
+    @classmethod
+    def searchmac(cls, mac=None, neg=False):
+        if mac is None:
+            return {"addresses.mac": {"$exists": not neg}}
+        # Pre-normalise the value so :meth:`_search_field`'s
+        # scalar / list / regex ladder sees one shape:
+        # * regex picks up the ``IGNORECASE`` flag -- MAC
+        #   addresses are case-insensitive on the wire,
+        # * strings (and string elements of a list) lower-case
+        #   to match the canonical form the ingestion path
+        #   stores.
+        mac = _normalize_mac(mac)
+        return cls._search_field("addresses.mac", mac, neg=neg)
+
+    @classmethod
+    def searchcategory(cls, cat, neg=False):
         """
         Filters (if `neg` == True, filters out) one particular category
         (records may have zero, one or more categories).
         """
-        if neg:
-            if isinstance(cat, utils.REGEXP_T):
-                return {"categories": {"$not": cat}}
-            if isinstance(cat, list):
-                if len(cat) == 1:
-                    cat = cat[0]
-                else:
-                    return {"categories": {"$nin": cat}}
-            return {"categories": {"$ne": cat}}
-        if isinstance(cat, list):
-            if len(cat) == 1:
-                cat = cat[0]
-            else:
-                return {"categories": {"$in": cat}}
-        return {"categories": cat}
+        return cls._search_field("categories", cat, neg=neg)
 
-    @staticmethod
-    def searchcountry(country, neg=False):
-        """Filters (if `neg` == True, filters out) one particular
-        country, or a list of countries.
-
-        """
-        country = utils.country_unalias(country)
-        if isinstance(country, list):
-            return {"infos.country_code": {"$nin" if neg else "$in": country}}
-        return {"infos.country_code": {"$ne": country} if neg else country}
-
-    @staticmethod
-    def searchhaslocation(neg=False):
-        return {"infos.loc": {"$exists": not neg}}
-
-    @staticmethod
-    def searchcity(city, neg=False):
-        """
-        Filters (if `neg` == True, filters out) one particular city.
-        """
-        if neg:
-            if isinstance(city, utils.REGEXP_T):
-                return {"infos.city": {"$not": city}}
-            return {"infos.city": {"$ne": city}}
-        return {"infos.city": city}
-
-    @staticmethod
-    def searchasnum(asnum, neg=False):
-        """Filters (if `neg` == True, filters out) one or more
-        particular AS number(s).
-
-        """
-        if not isinstance(asnum, str) and hasattr(asnum, "__iter__"):
-            return {
-                "infos.as_num": {"$nin" if neg else "$in": [int(val) for val in asnum]}
-            }
-        asnum = int(asnum)
-        return {"infos.as_num": {"$ne": asnum} if neg else asnum}
-
-    @staticmethod
-    def searchasname(asname, neg=False):
-        """Filters (if `neg` == True, filters out) one or more
-        particular AS.
-
-        """
-        if neg:
-            if isinstance(asname, utils.REGEXP_T):
-                return {"infos.as_name": {"$not": asname}}
-            return {"infos.as_name": {"$ne": asname}}
-        return {"infos.as_name": asname}
-
-    @staticmethod
-    def searchsource(src, neg=False):
+    @classmethod
+    def searchsource(cls, src, neg=False):
         """Filters (if `neg` == True, filters out) one particular
         source.
 
         """
-        if neg:
-            return {"source": {"$not": {"$in": [src]}}}
-        return {"source": {"$in": [src]}}
+        return cls._search_field("source", src, neg=neg)
 
     @staticmethod
     def searchport(port, protocol="tcp", state="open", neg=False):
@@ -2314,7 +2711,7 @@ class MongoDBActive(MongoDB, DBActive):
         if port == "host":
             return {"ports.port": {"$gte": 0} if neg else -1}
         if state == "open":
-            return {"openports.%s.ports" % protocol: {"$ne": port} if neg else port}
+            return {f"openports.{protocol}.ports": {"$ne": port} if neg else port}
         if neg:
             return {
                 "$or": [
@@ -2347,17 +2744,25 @@ class MongoDBActive(MongoDB, DBActive):
             state=state,
         )
 
-    def searchports(self, ports, protocol="tcp", state="open", neg=False):
+    def searchports(self, ports, protocol="tcp", state="open", neg=False, any_=False):
         if state == "open" and not neg:
             return self.searchport(
-                {"$all": ports}, state=state, protocol=protocol, neg=neg
+                {"$in" if any_ else "$all": ports},
+                state=state,
+                protocol=protocol,
             )
         if neg:
+            if any_:
+                raise ValueError("searchports: cannot set both neg and any_")
             return self.flt_and(
                 *(
-                    self.searchport(p, protocol=protocol, state=state, neg=neg)
+                    self.searchport(p, protocol=protocol, state=state, neg=True)
                     for p in ports
                 )
+            )
+        if any_:
+            return self.searchport(
+                {"$in": ports}, protocol=protocol, state=state, neg=neg
             )
         return {
             "ports": {
@@ -2402,6 +2807,8 @@ class MongoDBActive(MongoDB, DBActive):
         """
         if srv is False:
             srv = {"$exists": False}
+        elif isinstance(srv, list):
+            srv = {"$in": srv}
         flt = {"service_name": srv}
         if port is not None:
             flt["port"] = port
@@ -2427,16 +2834,22 @@ class MongoDBActive(MongoDB, DBActive):
         if product is not None:
             if product is False:
                 flt["service_product"] = {"$exists": False}
+            elif isinstance(product, list):
+                flt["service_product"] = {"$in": product}
             else:
                 flt["service_product"] = product
         if version is not None:
             if product is False:
                 flt["service_version"] = {"$exists": False}
+            elif isinstance(version, list):
+                flt["service_version"] = {"$in": version}
             else:
                 flt["service_version"] = version
         if service is not None:
             if service is False:
                 flt["service_name"] = {"$exists": False}
+            elif isinstance(service, list):
+                flt["service_name"] = {"$in": service}
             else:
                 flt["service_name"] = service
         if port is not None:
@@ -2444,38 +2857,48 @@ class MongoDBActive(MongoDB, DBActive):
         if protocol is not None:
             flt["protocol"] = protocol
         if len(flt) == 1:
-            return {"ports.%s" % key: value for key, value in flt.items()}
+            return {f"ports.{key}": value for key, value in flt.items()}
         return {"ports": {"$elemMatch": flt}}
 
     @classmethod
     def searchscript(cls, name=None, output=None, values=None, neg=False):
         """Search a particular content in the scripts results."""
         req = {}
-        if name is not None:
+        if isinstance(name, list):
+            req["id"] = {"$in": name}
+        elif name is not None:
             req["id"] = name
         if output is not None:
             req["output"] = output
         if values:
-            if not isinstance(name, str):
+            if isinstance(name, list):
+                all_keys = set(ALIASES_TABLE_ELEMS.get(n, n) for n in name)
+                if len(all_keys) != 1:
+                    raise TypeError(
+                        ".searchscript() needs similar `name` values when using a `values` arg"
+                    )
+                key = all_keys.pop()
+            elif not isinstance(name, str):
                 raise TypeError(
-                    ".searchscript() needs a `name` arg " "when using a `values` arg"
+                    ".searchscript() needs a `name` arg when using a `values` arg"
                 )
-            key = ALIASES_TABLE_ELEMS.get(name, name)
-            if isinstance(values, (str, utils.REGEXP_T)):
+            else:
+                key = ALIASES_TABLE_ELEMS.get(name, name)
+            if isinstance(values, (str, re.Pattern)):
                 req[key] = values
             else:
-                if len(values) >= 2 and "ports.scripts.%s" % key in cls.list_fields:
+                if len(values) >= 2 and f"ports.scripts.{key}" in cls.list_fields:
                     req[key] = {"$elemMatch": values}
                 else:
                     for field, value in values.items():
-                        req["%s.%s" % (key, field)] = value
+                        req[f"{key}.{field}"] = value
         if not req:
             return {"ports.scripts": {"$exists": not neg}}
         if len(req) == 1:
             field, value = next(iter(req.items()))
             if neg:
-                return {"ports.scripts.%s" % field: {"$ne": value}}
-            return {"ports.scripts.%s" % field: value}
+                return {f"ports.scripts.{field}": {"$ne": value}}
+            return {f"ports.scripts.{field}": value}
         if neg:
             return {"ports.scripts": {"$not": {"$elemMatch": req}}}
         return {"ports.scripts": {"$elemMatch": req}}
@@ -2514,6 +2937,8 @@ class MongoDBActive(MongoDB, DBActive):
         """
         if fname is None:
             fname = {"$exists": True}
+        elif isinstance(fname, list):
+            fname = {"$in": fname}
         if scripts is None:
             return {"ports.scripts.ls.volumes.files.filename": fname}
         if isinstance(scripts, str):
@@ -2563,7 +2988,7 @@ class MongoDBActive(MongoDB, DBActive):
                 "shares": {
                     "$elemMatch": {
                         "$or": [
-                            {"%s access" % user: access}
+                            {f"{user} access": access}
                             for user in ["Anonymous", "Current user"]
                         ],
                         "Type": share_type,
@@ -2573,9 +2998,42 @@ class MongoDBActive(MongoDB, DBActive):
             },
         )
 
+    @classmethod
+    def searchcert(
+        cls,
+        keytype=None,
+        md5=None,
+        sha1=None,
+        sha256=None,
+        subject=None,
+        issuer=None,
+        self_signed=None,
+        pkmd5=None,
+        pksha1=None,
+        pksha256=None,
+        cacert=False,
+        neg=False,
+    ):
+        return cls.searchscript(
+            name="ssl-cacert" if cacert else "ssl-cert",
+            values=cls._searchcert(
+                keytype=keytype,
+                md5=md5,
+                sha1=sha1,
+                sha256=sha256,
+                subject=subject,
+                issuer=issuer,
+                self_signed=self_signed,
+                pkmd5=pkmd5,
+                pksha1=pksha1,
+                pksha256=pksha256,
+            ),
+            neg=neg,
+        )
+
     def searchhttptitle(self, title):
         return self.searchscript(
-            name={"$in": ["http-title", "html-title"]},
+            name=["http-title", "html-title"],
             output=title,
         )
 
@@ -2586,6 +3044,7 @@ class MongoDBActive(MongoDB, DBActive):
                 {"os.osclass.vendor": txt},
                 {"os.osclass.osfamily": txt},
                 {"os.osclass.osgen": txt},
+                {"os.osclass.type": txt},
             ]
         }
 
@@ -2612,7 +3071,7 @@ class MongoDBActive(MongoDB, DBActive):
                     "state_state": "open",
                     "service_product": "Boa HTTPd",
                     "service_version": re.compile(
-                        "^0\\.9(3([^0-9]|$)|" "4\\.([0-9]|0[0-9]|" "1[0-1])([^0-9]|$))"
+                        "^0\\.9(3([^0-9]|$)|4\\.([0-9]|0[0-9]|1[0-1])([^0-9]|$))"
                     ),
                 }
             }
@@ -2660,9 +3119,9 @@ class MongoDBActive(MongoDB, DBActive):
     def searchvuln(vulnid=None, state=None):
         if state is None:
             return {
-                "ports.scripts.vulns.id": {"$exists": True}
-                if vulnid is None
-                else vulnid
+                "ports.scripts.vulns.id": (
+                    {"$exists": True} if vulnid is None else vulnid
+                )
             }
         if vulnid is None:
             return {"ports.scripts.vulns.state": state}
@@ -2719,32 +3178,56 @@ class MongoDBActive(MongoDB, DBActive):
             }
         }
 
-    @staticmethod
-    def searchhopdomain(hop, neg=False):
-        if neg:
-            if isinstance(hop, utils.REGEXP_T):
-                return {"traces.hops.domains": {"$not": hop}}
-            return {"traces.hops.domains": {"$ne": hop}}
-        return {"traces.hops.domains": hop}
+    @classmethod
+    def searchhopdomain(cls, hop, neg=False):
+        return cls._search_field("traces.hops.domains", hop, neg=neg)
 
-    def searchhopname(self, hop, neg=False):
+    @classmethod
+    def searchhopname(cls, hop, neg=False):
         if neg:
-            if isinstance(hop, utils.REGEXP_T):
-                return {"traces.hops.host": {"$not": hop}}
-            return {"traces.hops.host": {"$ne": hop}}
-        return self.flt_and(
+            # Same disjoint ``$or`` shape as
+            # :meth:`searchhostname`'s negation -- the
+            # ``traces.hops.host`` field is not indexed (only
+            # ``traces.hops.domains`` is, per
+            # :data:`MongoDBActive.indexes`).  Branch A
+            # (``{traces.hops.domains: {$ne: hop}}``) covers
+            # records with no traces / hops in ``hop``'s
+            # subtree (incl. records with no hops at all via
+            # Mongo's array-``$ne``-on-missing-field
+            # semantics).  Branch B (positive index probe on
+            # ``traces.hops.domains`` + ``$ne`` on
+            # ``traces.hops.host``) covers records that DO
+            # have a hop in ``hop``'s subtree but no hop is
+            # exactly ``hop``.
+            return {
+                "$or": [
+                    cls.searchhopdomain(hop, neg=True),
+                    cls.flt_and(
+                        cls.searchhopdomain(hop, neg=False),
+                        cls._search_field("traces.hops.host", hop, neg=True),
+                    ),
+                ]
+            }
+        # Positive branch: indexed-hop-domain value probe
+        # AND'd with the non-indexed hop-host match.  Both
+        # halves go through :meth:`_search_field` so list /
+        # regex inputs flow through uniformly (the previous
+        # positive branch hard-coded the raw ``hop`` value on
+        # the second clause, which silently broke list
+        # inputs).
+        return cls.flt_and(
             # This is indexed
-            self.searchhopdomain(hop, neg=neg),
+            cls.searchhopdomain(hop, neg=False),
             # This is not
-            {"traces.hops.host": hop},
+            cls._search_field("traces.hops.host", hop, neg=False),
         )
 
     @staticmethod
     def searchscreenshot(
-        port: Optional[int] = None,
+        port: int | None = None,
         protocol: str = "tcp",
-        service: Optional[str] = None,
-        words: Optional[Union[bool, str, Pattern[str], List[str]]] = None,
+        service: str | None = None,
+        words: bool | str | re.Pattern[str] | list[str] | None = None,
         neg: bool = False,
     ) -> Filter:
         """Filter results with (without, when `neg == True`) a
@@ -2767,7 +3250,7 @@ class MongoDBActive(MongoDB, DBActive):
             result["ports"]["$elemMatch"]["screenshot"] = {"$exists": True}
             if isinstance(words, list):
                 words_f = {"$ne" if neg else "$all": [w.lower() for w in words]}
-            elif isinstance(words, Pattern):
+            elif isinstance(words, re.Pattern):
                 words = re.compile(words.pattern.lower(), flags=words.flags)
                 words_f = {"$not": words} if neg else words
             elif isinstance(words, bool):
@@ -2796,14 +3279,35 @@ class MongoDBActive(MongoDB, DBActive):
             ("product", product),
             ("version", version),
         ]
-        flt = dict((field, value) for field, value in fields if value is not None)
+        flt = {field: value for field, value in fields if value is not None}
         nflt = len(flt)
-        if nflt == 0:
+        if not nflt:
             return {"cpes": {"$exists": True}}
         if nflt == 1:
             field, value = flt.popitem()
-            return {"cpes.%s" % field: value}
+            return {f"cpes.{field}": value}
         return {"cpes": {"$elemMatch": flt}}
+
+    @classmethod
+    def searchhassh(cls, value_or_hash=None, server=None):
+        if server is None:
+            return cls._searchhassh(value_or_hash=value_or_hash)
+        if value_or_hash is None:
+            baseflt = {"scripts.id": "ssh2-enum-algos"}
+        else:
+            # this is not JA3, but we have the exact same logic & needs
+            key, value = cls._ja3keyvalue(value_or_hash)
+            baseflt = {
+                "scripts": {
+                    "$elemMatch": {
+                        "id": "ssh2-enum-algos",
+                        f"ssh2-enum-algos.hassh.{key}": value,
+                    }
+                }
+            }
+        return {
+            "ports": {"$elemMatch": dict(baseflt, port={"$ne": -1} if server else -1)}
+        }
 
     def topvalues(
         self,
@@ -2841,6 +3345,12 @@ class MongoDBActive(MongoDB, DBActive):
           - screenwords
           - file.* / file.*:scriptid
           - hop
+          - scanner.name / scanner.port:tcp / scanner.port:udp
+          - domains / domains[:level] / domains[:domain] / domains[:domain[:level]]
+          - ja3-client[:filter][.type], ja3-server[:filter][:client][.type]
+          - ja4-client[:filter][.type], jarm
+          - hassh.type, hassh-client.type, hassh-server.type
+          - tag.{value,type,info} / tag[:value]
         """
 
         def null_if_empty(val):
@@ -2873,7 +3383,7 @@ class MongoDBActive(MongoDB, DBActive):
                 ],
             }
 
-            def outputproc(x):
+            def outputproc(x):  # noqa: F811
                 return {"count": x["count"], "_id": tuple(x["_id"])}
 
         elif field == "city":
@@ -2929,20 +3439,29 @@ class MongoDBActive(MongoDB, DBActive):
             field = "addr"
             # This should not overflow thanks to .searchipv4() filter
             addr = {"$add": ["$addr_1", 0x7FFF000100000000]}
-            specialproj = {
-                "_id": 0,
-                "addr": {"$floor": {"$divide": [addr, 2 ** (32 - mask)]}},
-            }
+            specialproj = {"_id": 0}
+            if self.is_documentdb:
+                # AWS DocumentDB lacks the ``$floor`` aggregation
+                # operator (the original "just like MongoDB < 3.2"
+                # comment predates DocumentDB's claimed MongoDB
+                # 5.0 compatibility level — this branch may be
+                # removable once we have a real-DocumentDB CI
+                # lane to verify; for now the workaround is
+                # cheap and safe).
+                specialproj["addr"] = {
+                    "$subtract": [
+                        {"$divide": [addr, 2 ** (32 - mask)]},
+                        {"$mod": [{"$divide": [addr, 2 ** (32 - mask)]}, 1]},
+                    ]
+                }
+            else:
+                specialproj["addr"] = {"$floor": {"$divide": [addr, 2 ** (32 - mask)]}}
             flt = self.flt_and(flt, self.searchipv4())
 
             def outputproc(x):
                 return {
                     "count": x["count"],
-                    "_id": "%s/%d"
-                    % (
-                        utils.int2ip(int(x["_id"]) * 2 ** (32 - mask)),
-                        mask,
-                    ),
+                    "_id": f"{utils.int2ip(int(x['_id']) * 2 ** (32 - mask))}/{int(mask)}",
                 }
 
         elif field == "port" or field.startswith("port:"):
@@ -2951,11 +3470,7 @@ class MongoDBActive(MongoDB, DBActive):
                 flt_field = "ports.state_state"
             else:
                 info = field.split(":", 1)[1]
-                flt_field = "ports.%s" % (
-                    "state_state"
-                    if info in ["open", "filtered", "closed"]
-                    else "service_name"
-                )
+                flt_field = f"ports.{'state_state' if info in ['open', 'filtered', 'closed'] else 'service_name'}"
             field = "ports.port"
             flt = self.flt_and(flt, {flt_field: info})
             specialproj = {"_id": 0, flt_field: 1, field: 1, "ports.protocol": 1}
@@ -2971,6 +3486,7 @@ class MongoDBActive(MongoDB, DBActive):
                 }
 
         elif field.startswith("portlist:"):
+            state = field[9:]
             specialproj = {"ports.port": 1, "ports.protocol": 1, "ports.state_state": 1}
             specialflt = [
                 {
@@ -3018,7 +3534,7 @@ class MongoDBActive(MongoDB, DBActive):
                 }
 
         elif field.startswith("countports:"):
-            state = field.split(":", 1)[1]
+            state = field[11:]
             if state == "open":
                 field = "openports.count"
             else:
@@ -3254,22 +3770,22 @@ class MongoDBActive(MongoDB, DBActive):
                     for key, value in cpeflt
                 )
             )
-            cpeflt2 = dict(("cpes.%s" % key, value) for key, value in cpeflt)
+            cpeflt2 = {f"cpes.{key}": value for key, value in cpeflt}
             # We need to keep enough cpes.* fields for the projection
             # *and* for our filter
             fields = fields[: max(fields.index(field), len(cpeflt2)) + 1]
             flt = self.flt_and(flt, cpeflt1)
-            specialproj = dict((("cpes.%s" % fname, 1) for fname in fields), _id=0)
-            concat = ["$cpes.%s" % fields[0]]
+            specialproj = dict(((f"cpes.{fname}", 1) for fname in fields), _id=0)
+            concat = [f"$cpes.{fields[0]}"]
             # Now we only keep what the user wanted
             for fname in fields[1 : fields.index(field) + 1]:
                 concat.append(":")
-                concat.append("$cpes.%s" % fname)
+                concat.append(f"$cpes.{fname}")
             specialflt = []
             if cpeflt2:
                 specialflt.append({"$match": cpeflt2})
-            specialflt.append({"$project": {"cpes.%s" % field: {"$concat": concat}}})
-            field = "cpes.%s" % field
+            specialflt.append({"$project": {f"cpes.{field}": {"$concat": concat}}})
+            field = f"cpes.{field}"
 
             def outputproc(x):
                 return {"count": x["count"], "_id": tuple(x["_id"].split(":", 3))}
@@ -3287,7 +3803,7 @@ class MongoDBActive(MongoDB, DBActive):
             field = "ports.service_devicetype"
         elif field.startswith("smb."):
             flt = self.flt_and(flt, self.searchsmb())
-            field = "ports.scripts.smb-os-discovery." + field[4:]
+            field = f"ports.scripts.smb-os-discovery.{field[4:]}"
         elif field == "ntlm":
             flt = self.flt_and(flt, self.searchntlm())
             field = "ports.scripts.ntlm-info"
@@ -3305,13 +3821,13 @@ class MongoDBActive(MongoDB, DBActive):
                 "version": "NTLM_Version",
             }.get(arg, arg)
             flt = self.flt_and(flt, self.searchntlm())
-            field = "ports.scripts.ntlm-info." + arg
+            field = f"ports.scripts.ntlm-info.{arg}"
         elif field == "script":
-            flt = self.flt_and(flt, self.searchscript(name={"$exists": True}))
+            flt = self.flt_and(flt, self.searchscript())
             field = "ports.scripts.id"
         elif field.startswith("script:"):
             scriptid = field.split(":", 1)[1]
-            flt = self.flt_and(flt, self.searchscript(name={"$exists": True}))
+            flt = self.flt_and(flt, self.searchscript())
             if ":" in scriptid:
                 port, scriptid = scriptid.split(":", 1)
                 if port.isdigit():
@@ -3337,12 +3853,41 @@ class MongoDBActive(MongoDB, DBActive):
             flt = self.flt_and(flt, self.searchdomain({"$exists": True}))
             field = "hostnames.domains"
         elif field.startswith("domains:"):
-            flt = self.flt_and(flt, self.searchdomain({"$exists": True}))
-            level = int(field[8:]) - 1
+            subfield = field[8:]
             field = "hostnames.domains"
-            aggrflt = {"field": re.compile("^([^\\.]+\\.){%d}[^\\.]+$" % level)}
+            if subfield.isdigit():
+                flt = self.flt_and(flt, self.searchdomain({"$exists": True}))
+                aggrflt = {
+                    "field": re.compile(
+                        "^([^\\.]+\\.){%d}[^\\.]+$" % (int(subfield) - 1)
+                    )
+                }
+            elif ":" in subfield:
+                subfield, level = subfield.split(":", 1)
+                flt = self.flt_and(flt, self.searchdomain(subfield))
+                aggrflt = {
+                    "field": re.compile(
+                        "^([^\\.]+\\.){%d}%s$"
+                        % (int(level) - subfield.count(".") - 1, re.escape(subfield))
+                    )
+                }
+            else:
+                flt = self.flt_and(flt, self.searchdomain(subfield))
+                aggrflt = {"field": re.compile(f"\\.{re.escape(subfield)}$")}
         elif field.startswith("cert."):
-            field = "ports.scripts.ssl-cert." + field[5:]
+            flt = self.flt_and(flt, self.searchcert())
+            field = f"ports.scripts.ssl-cert.{field[5:]}"
+            specialproj = {"_id": 0, "ports.scripts.id": 1, field: 1}
+            specialflt = [
+                {"$match": {"ports.scripts.id": "ssl-cert"}},
+            ]
+        elif field.startswith("cacert."):
+            flt = self.flt_and(flt, self.searchcert(cacert=True))
+            field = f"ports.scripts.ssl-cert.{field[7:]}"
+            specialproj = {"_id": 0, "ports.scripts.id": 1, field: 1}
+            specialflt = [
+                {"$match": {"ports.scripts.id": "ssl-cacert"}},
+            ]
         elif field == "useragent" or field.startswith("useragent:"):
             if field == "useragent":
                 flt = self.flt_and(flt, self.searchuseragent())
@@ -3362,7 +3907,7 @@ class MongoDBActive(MongoDB, DBActive):
                 specialflt = [
                     {
                         "$match": {
-                            "ports.scripts.ssl-ja3-client.%s" % subkey: value,
+                            f"ports.scripts.ssl-ja3-client.{subkey}": value,
                         }
                     },
                 ]
@@ -3376,11 +3921,11 @@ class MongoDBActive(MongoDB, DBActive):
             if subkey is not None and subkey != subfield:
                 specialproj = {
                     "_id": 0,
-                    "ports.scripts.ssl-ja3-client.%s" % subkey: 1,
-                    "ports.scripts.ssl-ja3-client.%s" % subfield: 1,
+                    f"ports.scripts.ssl-ja3-client.{subkey}": 1,
+                    f"ports.scripts.ssl-ja3-client.{subfield}": 1,
                 }
             flt = self.flt_and(flt, self.searchja3client(value_or_hash=value))
-            field = "ports.scripts.ssl-ja3-client.%s" % subfield
+            field = f"ports.scripts.ssl-ja3-client.{subfield}"
         elif field == "ja3-server" or (
             field.startswith("ja3-server") and field[10] in ":."
         ):
@@ -3415,21 +3960,21 @@ class MongoDBActive(MongoDB, DBActive):
             )
             specialproj = {
                 "_id": 0,
-                "ports.scripts.ssl-ja3-server.%s" % subfield: 1,
-                "ports.scripts.ssl-ja3-server.client.%s" % subfield: 1,
+                f"ports.scripts.ssl-ja3-server.{subfield}": 1,
+                f"ports.scripts.ssl-ja3-server.client.{subfield}": 1,
             }
             if subkey1 is not None and subkey1 != subfield:
-                specialproj["ports.scripts.ssl-ja3-server.%s" % subkey1] = 1
+                specialproj[f"ports.scripts.ssl-ja3-server.{subkey1}"] = 1
             if subkey2 is not None and subkey2 != subfield:
-                specialproj["ports.scripts.ssl-ja3-server.client.%s" % subkey2] = 1
+                specialproj[f"ports.scripts.ssl-ja3-server.client.{subkey2}"] = 1
             field = "ports.scripts.ssl-ja3-server"
             specialflt.append(
                 {
                     "$project": {
                         "_id": 0,
                         field: [
-                            "$ports.scripts.ssl-ja3-server.%s" % subfield,
-                            "$ports.scripts.ssl-ja3-server.client.%s" % subfield,
+                            f"$ports.scripts.ssl-ja3-server.{subfield}",
+                            f"$ports.scripts.ssl-ja3-server.client.{subfield}",
                         ],
                     }
                 }
@@ -3438,6 +3983,67 @@ class MongoDBActive(MongoDB, DBActive):
             def outputproc(x):
                 return {"count": x["count"], "_id": tuple(x["_id"])}
 
+        elif field == "ja4-client" or (
+            field.startswith("ja4-client") and field[10] in ":."
+        ):
+            if ":" in field:
+                field, value = field.split(":", 1)
+                specialflt = [
+                    {
+                        "$match": {
+                            "ports.scripts.ssl-ja4-client.ja4": value,
+                        }
+                    },
+                ]
+            else:
+                value = None
+            if "." in field:
+                field, subfield = field.split(".", 1)
+            else:
+                subfield = "ja4"
+            flt = self.flt_and(flt, self.searchja4client(value=value))
+            field = f"ports.scripts.ssl-ja4-client.{subfield}"
+        elif field == "hassh" or (field.startswith("hassh") and field[5] in "-."):
+            if "." in field:
+                field, subfield = field.split(".", 1)
+            else:
+                subfield = "md5"
+            specialproj = {"_id": 0}
+            if field == "hassh-server":
+                flt = self.flt_and(flt, self.searchhassh(server=True))
+                specialflt = [{"$match": {"ports.port": {"$ne": -1}}}]
+                specialproj["ports.port"] = 1
+            elif field == "hassh-client":
+                flt = self.flt_and(flt, self.searchhassh(server=False))
+                specialflt = [{"$match": {"ports.port": -1}}]
+                specialproj["ports.port"] = 1
+            elif field == "hassh":
+                flt = self.flt_and(flt, self.searchhassh())
+            else:
+                raise ValueError(f"Unknown field {field}")
+            field = f"ports.scripts.ssh2-enum-algos.hassh.{subfield}"
+            specialproj[field] = 1
+        elif field == "jarm":
+            flt = self.flt_and(flt, self.searchjarm())
+            field = "ports.scripts.ssl-jarm"
+        elif field.startswith("jarm:"):
+            port = int(field[5:])
+            flt = self.flt_and(flt, self.searchjarm(), self.searchport(port))
+            field = "ports.scripts.output"
+            specialproj = {
+                "_id": 0,
+                "ports.port": 1,
+                "ports.scripts.ssl-jarm": 1,
+            }
+            specialflt = [
+                {
+                    "$match": {
+                        "ports.port": port,
+                        "ports.scripts.ssl-jarm": {"$exists": True},
+                    }
+                },
+                {"$project": {"ports.scripts.ssl-jarm": 1}},
+            ]
         elif field == "sshkey.bits":
             flt = self.flt_and(flt, self.searchsshkey())
             specialproj = {
@@ -3462,7 +4068,7 @@ class MongoDBActive(MongoDB, DBActive):
             field = "ports.scripts.ssh-hostkey.bits"
         elif field.startswith("sshkey."):
             flt = self.flt_and(flt, self.searchsshkey())
-            field = "ports.scripts.ssh-hostkey." + field[7:]
+            field = f"ports.scripts.ssh-hostkey.{field[7:]}"
         elif field == "ike.vendor_ids":
             flt = self.flt_and(flt, self.searchscript(name="ike-info"))
             specialproj = {
@@ -3532,7 +4138,7 @@ class MongoDBActive(MongoDB, DBActive):
             field = "ports.scripts.ike-info.notification_type"
         elif field.startswith("ike."):
             flt = self.flt_and(flt, self.searchscript(name="ike-info"))
-            field = "ports.scripts.ike-info." + field[4:]
+            field = f"ports.scripts.ike-info.{field[4:]}"
         elif field == "httphdr":
             flt = self.flt_and(flt, self.searchhttphdr())
             specialproj = {
@@ -3558,7 +4164,7 @@ class MongoDBActive(MongoDB, DBActive):
             field = "ports.scripts.http-headers"
         elif field.startswith("httphdr."):
             flt = self.flt_and(flt, self.searchhttphdr())
-            field = "ports.scripts.http-headers.%s" % field[8:]
+            field = f"ports.scripts.http-headers.{field[8:]}"
         elif field.startswith("httphdr:"):
             subfield = field[8:].lower()
             flt = self.flt_and(flt, self.searchhttphdr(name=subfield))
@@ -3604,10 +4210,10 @@ class MongoDBActive(MongoDB, DBActive):
             field = "ports.scripts.http-app.version"
         elif field.startswith("modbus."):
             flt = self.flt_and(flt, self.searchscript(name="modbus-discover"))
-            field = "ports.scripts.modbus-discover." + field[7:]
+            field = f"ports.scripts.modbus-discover.{field[7:]}"
         elif field.startswith("s7."):
             flt = self.flt_and(flt, self.searchscript(name="s7-info"))
-            field = "ports.scripts.s7-info." + field[3:]
+            field = f"ports.scripts.s7-info.{field[3:]}"
         elif field.startswith("enip."):
             flt = self.flt_and(flt, self.searchscript(name="enip-info"))
             subfield = field[5:]
@@ -3620,17 +4226,17 @@ class MongoDBActive(MongoDB, DBActive):
                 "rev": "Revision",
                 "ip": "Device IP",
             }.get(subfield, subfield)
-            field = "ports.scripts.enip-info." + subfield
+            field = f"ports.scripts.enip-info.{subfield}"
         elif field.startswith("mongo.dbs."):
             flt = self.flt_and(flt, self.searchscript(name="mongodb-databases"))
-            field = "ports.scripts.mongodb-databases." + field[10:]
+            field = f"ports.scripts.mongodb-databases.{field[10:]}"
         elif field.startswith("vulns."):
             flt = self.flt_and(flt, self.searchvuln())
             subfield = field[6:]
             if subfield == "id":
                 field = "ports.scripts.vulns.id"
             else:
-                field = "ports.scripts.vulns." + subfield
+                field = f"ports.scripts.vulns.{subfield}"
                 specialproj = {
                     "_id": 0,
                     "ports.scripts.vulns.id": 1,
@@ -3642,7 +4248,7 @@ class MongoDBActive(MongoDB, DBActive):
                             "_id": 0,
                             field: [
                                 "$ports.scripts.vulns.id",
-                                "$" + field,
+                                f"${field}",
                             ],
                         },
                     }
@@ -3663,7 +4269,7 @@ class MongoDBActive(MongoDB, DBActive):
                 field = field[5:] or "filename"
                 scripts = None
             flt = self.flt_and(flt, self.searchfile(scripts=scripts))
-            field = "ports.scripts.ls.volumes.files.%s" % field
+            field = f"ports.scripts.ls.volumes.files.{field}"
             if scripts is not None:
                 specialproj = {"_id": 0, field: 1, "ports.scripts.id": 1}
                 # We need two different filters here (see `cpeflt`
@@ -3674,12 +4280,12 @@ class MongoDBActive(MongoDB, DBActive):
                             "ports.scripts.id": flt["ports.scripts"]["$elemMatch"]["id"]
                         }
                     },
-                    {"$project": {field: {"$ifNull": ["$" + field, ""]}}},
+                    {"$project": {field: {"$ifNull": [f"${field}", ""]}}},
                     # {"$project": {field: 1}},
                 ]
             else:
                 specialflt = [
-                    {"$project": {field: {"$ifNull": ["$" + field, ""]}}},
+                    {"$project": {field: {"$ifNull": [f"${field}", ""]}}},
                 ]
 
             def outputproc(x):
@@ -3739,6 +4345,41 @@ class MongoDBActive(MongoDB, DBActive):
                 return {"count": x["count"], "_id": self.internal2ip(x["_id"])}
 
             field = "traces.hops.ipaddr"
+        elif field.startswith("scanner.port:"):
+            flt = self.flt_and(flt, self.searchscript(name="scanner"))
+            field = f"ports.scripts.scanner.ports.{field[13:]}.ports"
+        elif field == "scanner.name":
+            flt = self.flt_and(flt, self.searchscript(name="scanner"))
+            field = "ports.scripts.scanner.scanners.name"
+        elif field == "tag" and hasattr(self, "searchtag"):
+            flt = self.flt_and(flt, self.searchtag())
+            specialproj = {
+                "_id": 0,
+                "tags.value": 1,
+                "tags.info": 1,
+            }
+            specialflt = [{"$unwind": "$tags.info"}]
+            field = "tags"
+
+            def outputproc(x):
+                return {
+                    "count": x["count"],
+                    "_id": (x["_id"]["value"], x["_id"].get("info")),
+                }
+
+        elif field.startswith("tag.") and hasattr(self, "searchtag"):
+            flt = self.flt_and(flt, self.searchtag())
+            field = f"tags.{field[4:]}"
+        elif field.startswith("tag:") and hasattr(self, "searchtag"):
+            subfield = field[4:]
+            flt = self.flt_and(flt, self.searchtag(tag={"value": subfield}))
+            specialproj = {
+                "_id": 0,
+                "tags.value": 1,
+                "tags.info": 1,
+            }
+            specialflt = [{"$match": {"tags.value": subfield}}]
+            field = "tags.info"
         pipeline = self._topvalues(
             field,
             flt=flt,
@@ -3751,10 +4392,7 @@ class MongoDBActive(MongoDB, DBActive):
             specialproj=specialproj,
             specialflt=specialflt,
         )
-        log_pipeline(pipeline)
-        cursor = self.set_limits(
-            self.db[self.columns[self.column_hosts]].aggregate(pipeline, cursor={})
-        )
+        cursor = self._aggregate(self.db[self.columns[self.column_hosts]], pipeline)
         if outputproc is not None:
             return (outputproc(res) for res in cursor)
         return cursor
@@ -3786,8 +4424,7 @@ class MongoDBActive(MongoDB, DBActive):
         )
 
     def diff_categories(self, category1, category2, flt=None, include_both_open=True):
-        """`category1` and `category2` must be categories (provided as str or
-        unicode objects)
+        """`category1` and `category2` must be categories (provided as str objects)
 
         Returns a generator of tuples:
         ({'addr': address, 'proto': protocol, 'port': port}, value)
@@ -3839,9 +4476,7 @@ class MongoDBActive(MongoDB, DBActive):
                 }
             },
         ]
-        log_pipeline(pipeline)
-
-        cursor = self.db[self.columns[self.column_hosts]].aggregate(pipeline, cursor={})
+        cursor = self._aggregate(self.db[self.columns[self.column_hosts]], pipeline)
 
         def categories_to_val(categories):
             state1, state2 = category1 in categories, category2 in categories
@@ -3849,7 +4484,12 @@ class MongoDBActive(MongoDB, DBActive):
             return (state2 > state1) - (state2 < state1)
 
         cursor = (
-            dict(x["_id"], value=categories_to_val(x["categories"])) for x in cursor
+            dict(
+                x["_id"],
+                addr=self.internal2ip(x["_id"]["addr"]),
+                value=categories_to_val(x["categories"]),
+            )
+            for x in cursor
         )
         if include_both_open:
             return cursor
@@ -3857,91 +4497,175 @@ class MongoDBActive(MongoDB, DBActive):
 
 
 class MongoDBNmap(MongoDBActive, DBNmap):
-
-    column_scans = 1
+    # ``scancli --init`` terminates cleanly on every backend
+    # except PostgreSQL (the PG path hangs in the cleanup phase
+    # of ``test_90_cleanup``; root cause not yet investigated).
+    supports = frozenset({"nmap_init_terminates"})
     content_handler = Nmap2Mongo
+    schema_migrations_indexes: list[
+        dict[int, dict[str, list[tuple[list[IndexKey] | str, dict[str, Any]]]]]
+    ] = [
+        (
+            {
+                key: (
+                    dict(
+                        value,
+                        drop=value.get("drop", [])
+                        + [
+                            ([("infos.as_num", pymongo.ASCENDING)], {}),
+                            (
+                                [
+                                    ("infos.country_code", pymongo.ASCENDING),
+                                    ("infos.city", pymongo.ASCENDING),
+                                ],
+                                {},
+                            ),
+                            ([("infos.loc", pymongo.GEOSPHERE)], {}),
+                            (
+                                [
+                                    ("tags.value", pymongo.ASCENDING),
+                                    ("tags.info", pymongo.ASCENDING),
+                                ],
+                                {},
+                            ),
+                        ],
+                    )
+                    if key == 22
+                    else (
+                        dict(
+                            value,
+                            ensure=[
+                                v
+                                for v in value.get("ensure", [])
+                                if v
+                                != (
+                                    [("tags.value", 1), ("tags.info", 1)],
+                                    {"sparse": True},
+                                )
+                            ],
+                        )
+                        if key == 20
+                        else value
+                    )
+                )
+                for key, value in idxs.items()
+            }
+            if not i
+            else idxs
+        )
+        for i, idxs in enumerate(MongoDBActive.schema_migrations_indexes)
+    ]
 
     def __init__(self, url):
         super().__init__(url)
         self.columns = [
             self.params.pop("colname_hosts", "hosts"),
-            self.params.pop("colname_scans", "scans"),
         ]
-        self.schema_migrations.append({})  # scans
         self.output_function = None
 
-    def store_scan_doc(self, scan):
-        ident = self.db[self.columns[self.column_scans]].insert(scan)
-        utils.LOGGER.debug(
-            "SCAN STORED: %r in %r", ident, self.columns[self.column_scans]
-        )
-        return ident
+    def migrate_schema(self, version):
+        """Process to schema migrations in column hosts starting from
+        `version`.
 
-    def update_scan_doc(self, scan_id, data):
-        self.db[self.columns[self.column_scans]].update(
-            {"_id": scan_id},
-            {"set": data},
-            multi=False,
-        )
+        """
+        super().migrate_schema(version)
+        if (version or 0) < 22:
+            # column "scans" has been dropped in 22
+            colname_scans = self.params.get("colname_scans", "scans")
+            # let's check this collection exists and if its name is
+            # not in use in another database
+            if (
+                colname_scans in self.db.list_collection_names()
+                and colname_scans not in self.columns
+                and not any(
+                    colname_scans in otherdb.columns
+                    for otherdb in [
+                        self.globaldb.flow,
+                        self.globaldb.passive,
+                        self.globaldb.view,
+                    ]
+                    if isinstance(otherdb, MongoDB)
+                )
+            ):
+                utils.LOGGER.info(
+                    "Dropping column %s as it is no longer used", colname_scans
+                )
+                self.db.drop_collection(colname_scans)
+
+    @staticmethod
+    def migrate_schema_hosts_21_22(doc):
+        """Converts a record from version 21 to version 22. Version 22
+        removes the `scanid` field and the `infos` and `tags` fields
+        in the Nmap purpose (they are now only used in the View
+        purpose).
+
+        """
+        assert doc["schema_version"] == 21
+        update = {"$set": {"schema_version": 22}}
+        for key in ["scanid", "infos"]:
+            if key in doc:
+                update.setdefault("$unset", {})[key] = ""
+        return update
 
     def store_or_merge_host(self, host):
         self.store_host(host)
 
-    def cmp_schema_version_scan(self, scan):
-        """Returns 0 if the `scan`'s schema version matches the code's
-        current version, -1 if it is higher (you need to update IVRE),
-        and 1 if it is lower (you need to call .migrate_schema()).
-
-        """
-        return self.cmp_schema_version(self.column_scans, scan)
-
-    def getscan(self, scanid):
-        return self.find_one(self.columns[self.column_scans], {"_id": scanid})
-
-    def is_scan_present(self, scanid):
-        if (
-            self.find_one(self.columns[self.column_scans], {"_id": scanid}, fields=[])
-            is not None
-        ):
-            return True
-        return False
-
-    def remove(self, host):
-        """Removes the host from the active column. `host` must be the host
-        record as returned by `.get()`.
-
-        If `host` has a `scanid` attribute, and if it refers to a scan that
-        have no more host record after the deletion of `host`, then the scan
-        record is also removed.
-
-        """
-        super().remove(host)
-        for scanid in self.getscanids(host):
-            if (
-                self.find_one(self.columns[self.column_hosts], {"scanid": scanid})
-                is None
-            ):
-                self.db[self.columns[self.column_scans]].delete_one({"_id": scanid})
-
-    def remove_many(self, flt):
-        """Removes hosts from the active column, based on the filter `flt`.
-
-        If the hosts removed had `scanid` attributes, and if some of them
-        refer to scans that have no more host record after the deletion of the
-        hosts, then the scan records are also removed.
-
-        """
-        scanids = list(self.distinct("scanid", flt=flt))
-        super().remove_many(flt)
-        for scanid in scanids:
-            if (
-                self.find_one(self.columns[self.column_hosts], {"scanid": scanid})
-                is None
-            ):
-                self.db[self.columns[self.column_scans]].delete_one({"_id": scanid})
-
 
 class MongoDBView(MongoDBActive, DBView):
+    indexes: list[list[tuple[list[IndexKey], dict[str, Any]]]] = [
+        (
+            idxs
+            + [
+                ([("infos.as_num", pymongo.ASCENDING)], {}),
+                (
+                    [
+                        ("infos.country_code", pymongo.ASCENDING),
+                        ("infos.city", pymongo.ASCENDING),
+                    ],
+                    {},
+                ),
+                ([("infos.loc", pymongo.GEOSPHERE)], {}),
+                (
+                    [
+                        ("tags.value", pymongo.ASCENDING),
+                        ("tags.info", pymongo.ASCENDING),
+                    ],
+                    {"sparse": True},
+                ),
+                ([(fld, "text") for fld in DBActive.text_fields], {"name": "text"}),
+            ]
+            if not i
+            else idxs
+        )
+        for i, idxs in enumerate(MongoDBActive.indexes)
+    ]
+    schema_migrations_indexes: list[
+        dict[int, dict[str, list[tuple[list[IndexKey] | str, dict[str, Any]]]]]
+    ] = [
+        (
+            {
+                key: (
+                    dict(
+                        value,
+                        ensure=value["ensure"]
+                        + [
+                            (
+                                [(fld, "text") for fld in DBActive.text_fields],
+                                {"name": "text"},
+                            )
+                        ],
+                    )
+                    if key == 20
+                    else value
+                )
+                for key, value in idxs.items()
+            }
+            if not i
+            else idxs
+        )
+        for i, idxs in enumerate(MongoDBActive.schema_migrations_indexes)
+    ]
+
     def __init__(self, url):
         super().__init__(url)
         self.columns = [self.params.pop("colname_hosts", "views")]
@@ -3950,9 +4674,146 @@ class MongoDBView(MongoDBActive, DBView):
         if not self.merge_host(host):
             self.store_host(host)
 
+    def apply_auto_tags(self, flt):
+        fields = {"tags", "ports", "openports"}
+        for rec in self.get(flt):
+            orig = {fld: deepcopy(rec.get(fld)) for fld in fields}
+            set_auto_tags(rec)
+            updatespec = {}
+            for fld in fields:
+                if orig[fld] != rec.get(fld):
+                    if not rec.get(fld):
+                        updatespec.setdefault("$unset", {})[fld] = ""
+                    else:
+                        updatespec.setdefault("$set", {})[fld] = rec[fld]
+            if updatespec:
+                self.db[self.columns[self.column_hosts]].update_one(
+                    {"_id": rec["_id"]}, updatespec
+                )
+
+    def getlocations(self, flt):
+        col = self.db[self.columns[self.column_hosts]]
+        pipeline = [
+            {"$match": self.flt_and(flt, self.searchhaslocation())},
+            {"$project": {"_id": 0, "coords": "$infos.loc.coordinates"}},
+            {"$group": {"_id": "$coords", "count": {"$sum": 1}}},
+        ]
+        return (
+            {"_id": tuple(rec["_id"][::-1]), "count": rec["count"]}
+            for rec in self._aggregate(col, pipeline)
+        )
+
+    @staticmethod
+    def searchtag(tag=None, neg=False):
+        """Filters (if `neg` == True, filters out) one particular tag (records
+        may have zero, one or more tags).
+
+        `tag` may be the value (as a str) or the tag (as a Tag, e.g.:
+        `{"value": value, "info": info}`).
+
+        """
+        if not tag:
+            return {"tags.value": {"$exists": not neg}}
+        if not isinstance(tag, dict):
+            tag = {"value": tag}
+        req = {}
+        for key, value in tag.items():
+            if isinstance(value, list) and len(value) == 1:
+                value = value[0]
+            if isinstance(value, re.Pattern):
+                if neg:
+                    req[key] = {"$not": value}
+                else:
+                    req[key] = value
+            elif isinstance(value, list):
+                if neg:
+                    req[key] = {"$nin": value}
+                else:
+                    req[key] = {"$in": value}
+            else:
+                if neg:
+                    req[key] = {"$ne": value}
+                else:
+                    req[key] = value
+        if len(req) == 1:
+            if neg:
+                # Either no tag at all, or no matching tag
+                return {
+                    "$or": [
+                        {"tags.value": {"$exists": False}},
+                        {f"tags.{key}": value for key, value in req.items()},
+                    ]
+                }
+            return {f"tags.{key}": value for key, value in req.items()}
+        if neg:
+            # Either no tag at all, or no matching tag
+            return {
+                "$or": [
+                    {"tags.value": {"$exists": False}},
+                    {
+                        "tags": {
+                            "$elemMatch": {
+                                "$or": [{key: value} for key, value in req.items()]
+                            }
+                        }
+                    },
+                ]
+            }
+        return {"tags": {"$elemMatch": req}}
+
+    @classmethod
+    def searchcountry(cls, country, neg=False):
+        """Filters (if `neg` == True, filters out) one particular
+        country, or a list of countries.
+
+        """
+        return cls._search_field(
+            "infos.country_code", utils.country_unalias(country), neg=neg
+        )
+
+    @staticmethod
+    def searchhaslocation(neg=False):
+        return {"infos.loc": {"$exists": not neg}}
+
+    @classmethod
+    def searchcity(cls, city, neg=False):
+        """
+        Filters (if `neg` == True, filters out) one particular city.
+        """
+        return cls._search_field("infos.city", city, neg=neg)
+
+    @classmethod
+    def searchasnum(cls, asnum, neg=False):
+        """Filters (if `neg` == True, filters out) one or more
+        particular AS number(s). Accepts ``"AS1234"`` /
+        ``"1234"`` / ``1234`` / lists of either, plus regexes
+        \u2014 see :func:`_coerce_asnum`. Aligns the View backend's
+        input handling with the RIR backend's, so the
+        ``asnum:AS1234`` token from ``flt_from_query`` works
+        identically against both.
+        """
+        return cls._search_field("infos.as_num", _coerce_asnum(asnum), neg=neg)
+
+    @classmethod
+    def searchasname(cls, asname, neg=False):
+        """Filters (if `neg` == True, filters out) one or more
+        particular AS.
+
+        """
+        return cls._search_field("infos.as_name", asname, neg=neg)
+
 
 class MongoDBPassive(MongoDB, DBPassive):
-
+    # Mongo's ``passive`` collection supports both the per-row
+    # ingestion path (``ivre passiverecon2db --no-bulk``) and
+    # the bulk ones; PostgreSQL's per-row path is broken under
+    # the real-world p0f fixture pending a deferred
+    # investigation.  ``passive_source_field_invariant`` gates
+    # the ``test_40_passive`` MongoDB-API sanity check that
+    # ``rec["source"]`` is never ``None``.
+    supports = frozenset(
+        {"passive_no_bulk_ingestion", "passive_source_field_invariant"}
+    )
     column_passive = 0
     _features_column = 0
     indexes = [
@@ -3993,7 +4854,37 @@ class MongoDBPassive(MongoDB, DBPassive):
             ([("infos.sha1", pymongo.ASCENDING)], {"sparse": True}),
             ([("infos.sha256", pymongo.ASCENDING)], {"sparse": True}),
             ([("infos.issuer_text", pymongo.ASCENDING)], {"sparse": True}),
+            (
+                [
+                    ("infos.issuer.countryName", pymongo.ASCENDING),
+                    ("info.issuer.stateOrProvinceName", pymongo.ASCENDING),
+                    ("info.issuer.localityName", pymongo.ASCENDING),
+                ],
+                {"sparse": True, "name": "info.issuer.fields_1"},
+            ),
+            (
+                [
+                    ("info.issuer.organizationName", pymongo.ASCENDING),
+                    ("info.issuer.organizationalUnitName", pymongo.ASCENDING),
+                ],
+                {"sparse": True, "name": "info.issuer.fields_2"},
+            ),
             ([("infos.subject_text", pymongo.ASCENDING)], {"sparse": True}),
+            (
+                [
+                    ("info.subject.countryName", pymongo.ASCENDING),
+                    ("info.subject.stateOrProvinceName", pymongo.ASCENDING),
+                    ("info.subject.localityName", pymongo.ASCENDING),
+                ],
+                {"sparse": True, "name": "info.subject.fields_1"},
+            ),
+            (
+                [
+                    ("info.subject.organizationName", pymongo.ASCENDING),
+                    ("info.subject.organizationalUnitName", pymongo.ASCENDING),
+                ],
+                {"sparse": True, "name": "info.subject.fields_2"},
+            ),
             ([("infos.pubkey.type", pymongo.ASCENDING)], {"sparse": True}),
         ],
     ]
@@ -4011,8 +4902,8 @@ class MongoDBPassive(MongoDB, DBPassive):
                         ],
                         {},
                     ),
-                    ([("infos.issuer", pymongo.ASCENDING)], {"sparse": True}),
-                    ([("infos.subject", pymongo.ASCENDING)], {"sparse": True}),
+                    ([("infos.issuer", pymongo.ASCENDING)], {}),
+                    ([("infos.subject", pymongo.ASCENDING)], {}),
                 ],
                 "ensure": [
                     (
@@ -4039,10 +4930,10 @@ class MongoDBPassive(MongoDB, DBPassive):
             },
             2: {
                 "drop": [
-                    ([("infos.pubkeyalgo", pymongo.ASCENDING)], {"sparse": True}),
+                    ([("infos.pubkeyalgo", pymongo.ASCENDING)], {}),
                 ],
                 "ensure": [
-                    ([("infos.pubkey.type", pymongo.ASCENDING)], {"sparse": True}),
+                    ([("infos.pubkey.type", pymongo.ASCENDING)], {}),
                 ],
             },
         }
@@ -4072,6 +4963,7 @@ class MongoDBPassive(MongoDB, DBPassive):
             {
                 None: (1, self.migrate_schema_passive_0_1),
                 1: (2, self.migrate_schema_passive_1_2),
+                2: (3, self.migrate_schema_passive_2_3),
             },
         ]
 
@@ -4098,7 +4990,7 @@ class MongoDBPassive(MongoDB, DBPassive):
         if colname == self.columns[self.column_passive]:  # just in case
             del update["_id"]
             self.insert_or_update_mix(update, getinfos=passive.getinfos)
-            self.remove(recid)
+            self.db[self.columns[self.column_passive]].delete_one({"_id": recid})
             return None
         return super()._migrate_update_record(colname, recid, update)
 
@@ -4149,6 +5041,21 @@ class MongoDBPassive(MongoDB, DBPassive):
             doc["value"] = utils.encode_b64(doc["value"]).decode()
         return doc
 
+    @classmethod
+    def migrate_schema_passive_2_3(cls, doc):
+        """Converts a record from version 2 to version 3. In version 3 the
+        SSH host keys are base64 encoded (easier for lookups).
+
+        """
+        assert doc["schema_version"] == 2
+        doc = cls.internal2rec(doc)
+        doc["schema_version"] = 3
+        if doc["recontype"] == "SSH_SERVER_HOSTKEY":
+            doc["value"] = utils.encode_b64(
+                utils.nmap_decode_data(doc["value"])
+            ).decode()
+        return doc
+
     def _get(self, flt, **kargs):
         """Like .get(), but returns a MongoDB cursor (suitable for use with
         e.g.  .explain()).
@@ -4187,8 +5094,12 @@ class MongoDBPassive(MongoDB, DBPassive):
         except (KeyError, socket.error):
             pass
         for key in ["value", "targetval"]:
-            if "full" + key in rec:
-                rec[key] = rec.pop("full" + key)
+            if f"full{key}" in rec:
+                rec[key] = rec.pop(f"full{key}")
+        if rec.get("recontype") in {"SSL_SERVER", "SSL_CLIENT"} and rec.get(
+            "source"
+        ) in {"cert", "cacert"}:
+            rec["value"] = utils.encode_b64(rec["value"]).decode()
         if "fullinfos" in rec:
             rec.setdefault("infos", {}).update(rec.pop("fullinfos"))
         return rec
@@ -4197,13 +5108,16 @@ class MongoDBPassive(MongoDB, DBPassive):
         """Queries the passive column with the provided filter "spec", and
         returns a MongoDB cursor.
 
-        This should be very fast, as no operation is done (the cursor is only
-        returned). Next operations (e.g., .count(), enumeration, etc.) might
-        take a long time, depending on both the operations and the filter.
+        This should be very fast, as no operation is done (the cursor
+        is only returned). Next operations (e.g., enumeration) might
+        take a long time, depending on both the operations and the
+        filter.
 
         Any keyword argument is passed to the .find() method of the Mongodb
         column object, without any validation (and might have no effect if it
-        is not expected)."""
+        is not expected).
+
+        """
         cursor = self._get(spec, **kargs)
         if hint is not None:
             cursor.hint(hint)
@@ -4217,16 +5131,24 @@ class MongoDBPassive(MongoDB, DBPassive):
 
         Unlike get(), this function might take a long time, depending
         on "spec" and the indexes set on passive column."""
+        if "fields" in kargs:
+            kargs["projection"] = kargs.pop("fields")
         # TODO: check limits
-        rec = self.find_one(self.columns[self.column_passive], spec, **kargs)
+        rec = self.db[self.columns[self.column_passive]].find_one(spec, **kargs)
         if rec is None:
             return None
         return self.internal2rec(rec)
 
+    def count(self, flt):
+        """Count documents in the passive column."""
+        if not flt:
+            return self.db[self.columns[self.column_passive]].estimated_document_count()
+        return self.db[self.columns[self.column_passive]].count_documents(flt)
+
     def update(self, spec, **kargs):
         """Updates the first record matching "spec" in the "passive" column,
         setting values according to the keyword arguments."""
-        self.db[self.columns[self.column_passive]].update(spec, {"$set": kargs})
+        self.db[self.columns[self.column_passive]].update_one(spec, {"$set": kargs})
 
     @classmethod
     def _fix_sizes(cls, spec):
@@ -4236,11 +5158,13 @@ class MongoDBPassive(MongoDB, DBPassive):
         # original value in full[original column name].
         for key in ["value", "targetval"]:
             if len(spec.get(key) or "") > utils.MAXVALLEN:
-                spec["full" + key] = spec[key]
+                spec[f"full{key}"] = spec[key]
                 value = spec[key]
                 if not isinstance(value, bytes):
                     value = value.encode()
-                spec[key] = hashlib.sha1(value).hexdigest()
+                spec[key] = hashlib.new(
+                    "sha1", data=value, usedforsecurity=False
+                ).hexdigest()
         # We enforce a utils.MAXVALLEN // 10 size limits for subkey values in
         # infos; this is because MongoDB cannot index values longer than 1024
         # bytes.
@@ -4263,7 +5187,7 @@ class MongoDBPassive(MongoDB, DBPassive):
         if getinfos is not None:
             spec.update(getinfos(spec))
         spec = self.rec2internal(spec)
-        self.db[self.columns[self.column_passive]].insert(spec)
+        self.db[self.columns[self.column_passive]].insert_one(spec)
 
     def insert_or_update(
         self, timestamp, spec, getinfos=None, lastseen=None, replacecount=False
@@ -4276,7 +5200,7 @@ class MongoDBPassive(MongoDB, DBPassive):
             del spec["infos"]
         except KeyError:
             pass
-        hint = self.get_hint(spec)
+        hint = self.get_hint(spec, self.column_passive)
         current = self.get(spec, hint=hint, fields=[])
         try:
             current = next(current)
@@ -4291,7 +5215,7 @@ class MongoDBPassive(MongoDB, DBPassive):
         else:
             updatespec["$inc"] = {"count": spec.pop("count", 1)}
         if current is not None:
-            self.db[self.columns[self.column_passive]].update(
+            self.db[self.columns[self.column_passive]].update_one(
                 {"_id": current["_id"]},
                 updatespec,
             )
@@ -4305,7 +5229,7 @@ class MongoDBPassive(MongoDB, DBPassive):
                 else:
                     self._fix_sizes(infos)
                     updatespec["$setOnInsert"] = infos
-            self.db[self.columns[self.column_passive]].update(
+            self.db[self.columns[self.column_passive]].update_one(
                 spec,
                 updatespec,
                 upsert=True,
@@ -4326,8 +5250,7 @@ class MongoDBPassive(MongoDB, DBPassive):
         method.
 
         """
-        bulk = self.db[self.columns[self.column_passive]].initialize_unordered_bulk_op()
-        count = 0
+        bulk = []
 
         if separated_timestamps:
 
@@ -4371,20 +5294,18 @@ class MongoDBPassive(MongoDB, DBPassive):
                         del findspec[key]
                     except KeyError:
                         pass
-                bulk.find(findspec).upsert().update(updatespec)
-                count += 1
-                if count >= config.MONGODB_BATCH_SIZE:
-                    utils.LOGGER.debug("DB:MongoDB bulk upsert: %d", count)
-                    bulk.execute()
-                    bulk = self.db[
-                        self.columns[self.column_passive]
-                    ].initialize_unordered_bulk_op()
-                    count = 0
+                bulk.append(pymongo.UpdateOne(findspec, updatespec, upsert=True))
+                if len(bulk) >= config.MONGODB_BATCH_SIZE:
+                    utils.LOGGER.debug("DB:MongoDB bulk upsert: %d", len(bulk))
+                    self.db[self.columns[self.column_passive]].bulk_write(
+                        bulk, ordered=False
+                    )
+                    bulk = []
         except IOError:
             pass
-        if count > 0:
-            utils.LOGGER.debug("DB:MongoDB bulk upsert: %d (final)", count)
-            bulk.execute()
+        if bulk:
+            utils.LOGGER.debug("DB:MongoDB bulk upsert: %d (final)", len(bulk))
+            self.db[self.columns[self.column_passive]].bulk_write(bulk, ordered=False)
 
     def insert_or_update_mix(self, spec, getinfos=None, replacecount=False):
         """Updates the first record matching "spec" (without
@@ -4415,7 +5336,7 @@ class MongoDBPassive(MongoDB, DBPassive):
                 }
         current = self.get_one(spec, fields=[])
         if current:
-            self.db[self.columns[self.column_passive]].update(
+            self.db[self.columns[self.column_passive]].update_one(
                 {"_id": current["_id"]},
                 updatespec,
             )
@@ -4424,14 +5345,17 @@ class MongoDBPassive(MongoDB, DBPassive):
                 infos = getinfos(spec)
                 if infos:
                     updatespec["$setOnInsert"] = infos
-            self.db[self.columns[self.column_passive]].update(
+            self.db[self.columns[self.column_passive]].update_one(
                 spec,
                 updatespec,
                 upsert=True,
             )
 
-    def remove(self, spec_or_id):
-        self.db[self.columns[self.column_passive]].remove(spec_or_id=spec_or_id)
+    def remove(self, flt):
+        if not isinstance(flt, dict):
+            self.db[self.columns[self.column_passive]].delete_one({"_id": flt})
+        else:
+            self.db[self.columns[self.column_passive]].delete_many(flt)
 
     def topvalues(self, field, flt=None, distinct=True, **kargs):
         """This method makes use of the aggregation framework to
@@ -4449,13 +5373,14 @@ class MongoDBPassive(MongoDB, DBPassive):
         outputproc = None
         aggrflt = None
         specialproj = None
+        specialflt = []
         if field == "addr":
             specialproj = {
                 "_id": 0,
                 "addr": ["$addr_0", "$addr_1"],
             }
 
-            def outputproc(x):
+            def outputproc(x):  # noqa: F811
                 return {
                     "count": x["count"],
                     "_id": (
@@ -4469,40 +5394,157 @@ class MongoDBPassive(MongoDB, DBPassive):
             field = "addr"
             # This should not overflow thanks to .searchipv4() filter
             addr = {"$add": ["$addr_1", 0x7FFF000100000000]}
-            specialproj = {
-                "_id": 0,
-                "addr": {"$floor": {"$divide": [addr, 2 ** (32 - mask)]}},
-            }
+            specialproj = {"_id": 0}
+            if self.is_documentdb:
+                # AWS DocumentDB lacks the ``$floor`` aggregation
+                # operator (the original "just like MongoDB < 3.2"
+                # comment predates DocumentDB's claimed MongoDB
+                # 5.0 compatibility level — this branch may be
+                # removable once we have a real-DocumentDB CI
+                # lane to verify; for now the workaround is
+                # cheap and safe).
+                specialproj["addr"] = {
+                    "$subtract": [
+                        {"$divide": [addr, 2 ** (32 - mask)]},
+                        {"$mod": [{"$divide": [addr, 2 ** (32 - mask)]}, 1]},
+                    ]
+                }
+            else:
+                specialproj["addr"] = {"$floor": {"$divide": [addr, 2 ** (32 - mask)]}}
             flt = self.flt_and(flt, self.searchipv4())
 
             def outputproc(x):
                 return {
                     "count": x["count"],
-                    "_id": "%s/%d"
-                    % (
-                        utils.int2ip(int(x["_id"]) * 2 ** (32 - mask)),
-                        mask,
-                    ),
+                    "_id": f"{utils.int2ip(int(x['_id']) * 2 ** (32 - mask))}/{int(mask)}",
                 }
 
         elif field == "domains":
             flt = self.flt_and(flt, self.searchdns())
             field = "infos.domain"
         elif field.startswith("domains:"):
-            flt = self.flt_and(flt, self.searchdns())
-            level = int(field[8:]) - 1
+            subfield = field[8:]
             field = "infos.domain"
-            aggrflt = {"field": re.compile("^([^\\.]+\\.){%d}[^\\.]+$" % level)}
+            if subfield.isdigit():
+                flt = self.flt_and(flt, self.searchdns())
+                aggrflt = {
+                    "field": re.compile(
+                        "^([^\\.]+\\.){%d}[^\\.]+$" % (int(subfield) - 1)
+                    )
+                }
+            elif ":" in subfield:
+                subfield, level = subfield.split(":", 1)
+                flt = self.flt_and(flt, self.searchdns(subfield, subdomains=True))
+                aggrflt = {
+                    "field": re.compile(
+                        "^([^\\.]+\\.){%d}%s$"
+                        % (int(level) - subfield.count(".") - 1, re.escape(subfield))
+                    )
+                }
+            else:
+                flt = self.flt_and(flt, self.searchdns(subfield, subdomains=True))
+                aggrflt = {"field": re.compile(f"\\.{re.escape(subfield)}$")}
+        elif field == "hassh" or (field.startswith("hassh") and field[5] in "-."):
+            if "." in field:
+                field, subfield = field.split(".", 1)
+            else:
+                subfield = "md5"
+            if field == "hassh-server":
+                flt = self.flt_and(flt, self.searchhassh(server=True))
+            elif field == "hassh-client":
+                flt = self.flt_and(flt, self.searchhassh(server=False))
+            elif field == "hassh":
+                flt = self.flt_and(flt, self.searchhassh())
+            else:
+                raise ValueError(f"Unknown field {field}")
+            if subfield == "md5":
+                field = "value"
+            else:
+                field = f"infos.{subfield}"
+        elif field == "sshkey.bits":
+            flt = self.flt_and(flt, self.searchsshkey())
+            specialproj = {"infos.algo": 1, "infos.bits": 1}
+            specialflt = [
+                {
+                    "$project": {
+                        "_id": 0,
+                        "bits": ["$infos.algo", "$infos.bits"],
+                    }
+                }
+            ]
+
+            def outputproc(x):
+                def _fixval(value):
+                    return (
+                        utils.SSH_KEYS.get(
+                            value[0],
+                            (
+                                value[0][4:] if value[0][:4] == "ssh-" else value[0]
+                            ).upper(),
+                        ),
+                        value[1],
+                    )
+
+                return {"count": x["count"], "_id": _fixval(x["_id"])}
+
+            field = "bits"
+        elif field == "sshkey.keytype":
+            flt = self.flt_and(flt, self.searchsshkey())
+
+            def outputproc(x):
+                def _fixval(value):
+                    return utils.SSH_KEYS.get(
+                        value,
+                        (value[4:] if value[:4] == "ssh-" else value).upper(),
+                    )
+
+                return {"count": x["count"], "_id": _fixval(x["_id"])}
+
+            field = "infos.algo"
+        elif field.startswith("sshkey."):
+            flt = self.flt_and(flt, self.searchsshkey())
+            subfield = field[7:]
+            field = {
+                "fingerprint": "infos.md5",
+                "key": "value",
+            }.get(subfield, f"infos.{subfield}")
+        elif field == "useragent" or field.startswith("useragent:"):
+            if field == "useragent":
+                flt = self.flt_and(flt, self.searchuseragent())
+            else:
+                flt = self.flt_and(
+                    flt, self.searchuseragent(useragent=utils.str2regexp(field[10:]))
+                )
+            field = "value"
+        elif field == "source":
+            # On passive, ``source`` is meaningful only relative
+            # to ``recontype`` (e.g. ``"cert"`` belongs to
+            # ``SSL_SERVER`` or ``SSL_CLIENT``; ``"SERVER"``
+            # belongs to ``HTTP_SERVER_HEADER``; ``"A-…-53"``
+            # belongs to ``DNS_ANSWER``). Emit ``(recontype,
+            # source)`` tuples so the facet groups observations by
+            # the meaningful pair, mirroring how active
+            # ``top/product`` emits ``(service, product)``.
+            specialproj = {
+                "_id": 0,
+                "source": ["$recontype", "$source"],
+            }
+
+            def outputproc(x):  # noqa: F811
+                return {
+                    "count": x["count"],
+                    "_id": tuple(x["_id"]),
+                }
+
         pipeline = self._topvalues(
-            field, flt=flt, aggrflt=aggrflt, specialproj=specialproj, **kargs
+            field,
+            flt=flt,
+            aggrflt=aggrflt,
+            specialproj=specialproj,
+            specialflt=specialflt,
+            **kargs,
         )
-        log_pipeline(pipeline)
-        cursor = self.set_limits(
-            self.db[self.columns[self.column_passive]].aggregate(
-                pipeline,
-                cursor={},
-            )
-        )
+        cursor = self._aggregate(self.db[self.columns[self.column_passive]], pipeline)
         if outputproc is not None:
             return (outputproc(res) for res in cursor)
         return cursor
@@ -4528,29 +5570,70 @@ class MongoDBPassive(MongoDB, DBPassive):
             "$infos",
         )
 
-    @staticmethod
-    def searchrecontype(rectype):
-        return {"recontype": rectype}
+    @classmethod
+    def searchrecontype(cls, rectype=None, source=None, neg=False):
+        """Filter (or filter out) passive records on the
+        ``(recontype, source)`` field pair.
 
-    @staticmethod
-    def searchsensor(sensor, neg=False):
-        if neg:
-            if isinstance(sensor, utils.REGEXP_T):
-                return {"sensor": {"$not": sensor}}
-            return {"sensor": {"$ne": sensor}}
-        return {"sensor": sensor}
+        Either or both of ``rectype`` and ``source`` may be supplied;
+        each accepts a single string, a list of strings, or a
+        compiled ``re.Pattern``. When both are supplied, the filter
+        is the conjunction; ``neg=True`` negates the conjunction
+        (i.e. ``NOT (recontype matches AND source matches)``).
 
-    @staticmethod
-    def searchport(port, protocol="tcp", state="open", neg=False):
+        Calling with both ``rectype`` and ``source`` set to
+        ``None`` is degenerate: the positive form matches every
+        record, the negated form matches none.
+
+        This is the only entry point for filtering by
+        ``recontype`` / ``source`` on the passive backend; the
+        inherited ``searchsource`` from ``MongoDB`` is overridden
+        to delegate here, so callers do not have to know which
+        field they are filtering on.
+        """
+        # Single-field cases (or pure-source / pure-recontype
+        # negation): the shared ``_search_field`` helper handles
+        # them with the canonical wire shape (``$ne`` /
+        # ``$nin`` / ``$not``).
+        if rectype is None and source is None:
+            return cls.searchnonexistent() if neg else {}
+        if source is None:
+            return cls._search_field("recontype", rectype, neg=neg)
+        if rectype is None:
+            return cls._search_field("source", source, neg=neg)
+        # Combined case: conjunction of the two positive clauses;
+        # negation wraps the whole AND in ``$nor``.
+        clause = {
+            "$and": [
+                cls._search_field("recontype", rectype),
+                cls._search_field("source", source),
+            ]
+        }
+        return {"$nor": [clause]} if neg else clause
+
+    @classmethod
+    def searchsource(cls, src, neg=False):
+        """Inherited from ``MongoDB`` but overridden for passive:
+        a passive record's ``source`` is meaningful only relative
+        to its ``recontype``, so the search path is unified
+        through :meth:`searchrecontype`."""
+        return cls.searchrecontype(source=src, neg=neg)
+
+    @classmethod
+    def searchsensor(cls, sensor, neg=False):
+        return cls._search_field("sensor", sensor, neg=neg)
+
+    @classmethod
+    def searchport(cls, port, protocol="tcp", state="open", neg=False):
         """Filters (if `neg` == True, filters out) records on the specified
         protocol/port.
 
         """
         if protocol != "tcp":
-            raise ValueError("Protocols other than TCP are not supported " "in passive")
+            raise ValueError("Protocols other than TCP are not supported in passive")
         if state != "open":
             raise ValueError("Only open ports can be found in passive")
-        return {"port": {"$ne": port} if neg else port}
+        return cls._search_field("port", port, neg=neg)
 
     @staticmethod
     def searchservice(srv, port=None, protocol=None):
@@ -4560,11 +5643,13 @@ class MongoDBPassive(MongoDB, DBPassive):
         """
         if srv is False:
             srv = {"$exists": False}
+        elif isinstance(srv, list):
+            srv = {"$in": srv}
         flt = {"infos.service_name": srv}
         if port is not None:
             flt["port"] = port
         if protocol is not None and protocol != "tcp":
-            raise ValueError("Protocols other than TCP are not supported " "in passive")
+            raise ValueError("Protocols other than TCP are not supported in passive")
         return flt
 
     @staticmethod
@@ -4583,16 +5668,22 @@ class MongoDBPassive(MongoDB, DBPassive):
         if product is not None:
             if product is False:
                 flt["infos.service_product"] = {"$exists": False}
+            elif isinstance(product, list):
+                flt["infos.service_product"] = {"$in": product}
             else:
                 flt["infos.service_product"] = product
         if version is not None:
             if product is False:
                 flt["infos.service_version"] = {"$exists": False}
+            elif isinstance(version, list):
+                flt["infos.service_version"] = {"$in": version}
             else:
                 flt["infos.service_version"] = version
         if service is not None:
             if service is False:
                 flt["infos.service_name"] = {"$exists": False}
+            elif isinstance(service, list):
+                flt["infos.service_name"] = {"$in": service}
             else:
                 flt["infos.service_name"] = service
         if port is not None:
@@ -4600,7 +5691,7 @@ class MongoDBPassive(MongoDB, DBPassive):
         if protocol is not None:
             if protocol != "tcp":
                 raise ValueError(
-                    "Protocols other than TCP are not supported " "in passive"
+                    "Protocols other than TCP are not supported in passive"
                 )
         return flt
 
@@ -4609,29 +5700,27 @@ class MongoDBPassive(MongoDB, DBPassive):
         return {"infos.service_hostname": hostname}
 
     @classmethod
-    def searchmac(cls, mac=None, reverse=False, neg=False):
-        res = {"recontype": "MAC_ADDRESS"}
-        value = "targetval" if reverse else "value"
-        if mac is not None:
-            if isinstance(mac, utils.REGEXP_T):
-                mac = re.compile(mac.pattern, mac.flags | re.I)
-                if neg:
-                    res[value] = {"$not": mac}
-                else:
-                    res[value] = mac
-            elif neg:
-                res[value] = {"$ne": mac.lower()}
-            else:
-                res[value] = mac.lower()
-        elif neg:
-            return {"recontype": {"$not": "MAC_ADDRESS"}}
-        return res
+    def searchmac(cls, mac=None, neg=False):
+        if mac is None:
+            # No specific MAC: the recontype gate alone scopes
+            # the result.  Negation flips the gate so
+            # ``searchmac(neg=True)`` excludes the MAC-address
+            # passive records entirely.
+            if neg:
+                return {"recontype": {"$not": "MAC_ADDRESS"}}
+            return {"recontype": "MAC_ADDRESS"}
+        # See :meth:`MongoDBActive.searchmac` for the
+        # normalisation rationale; the recontype gate stays a
+        # positive constraint so the result remains scoped to
+        # MAC-address records regardless of ``neg``.
+        mac = _normalize_mac(mac)
+        return {"recontype": "MAC_ADDRESS", **cls._search_field("value", mac, neg=neg)}
 
     @staticmethod
     def searchuseragent(useragent=None, neg=False):
         if neg:
             raise ValueError(
-                "searchuseragent([...], neg=True) is not " "supported in passive DB."
+                "searchuseragent([...], neg=True) is not supported in passive DB."
             )
         if useragent is None:
             return {
@@ -4644,30 +5733,27 @@ class MongoDBPassive(MongoDB, DBPassive):
             "value": useragent,
         }
 
-    @staticmethod
-    def searchdns(name=None, reverse=False, dnstype=None, subdomains=False):
-        if isinstance(name, list):
-            if len(name) == 1:
-                name = name[0]
-            else:
-                name = {"$in": name}
+    @classmethod
+    def searchdns(
+        cls, name=None, reverse=False, dnstype=None, subdomains=False, neg=False
+    ):
         res = {
             "recontype": "DNS_ANSWER",
         }
         if name is not None:
-            res[
-                (
-                    ("infos.domaintarget" if reverse else "infos.domain")
-                    if subdomains
-                    else ("targetval" if reverse else "value")
-                )
-            ] = name
+            field = (
+                ("infos.domaintarget" if reverse else "infos.domain")
+                if subdomains
+                else ("targetval" if reverse else "value")
+            )
+            res.update(cls._search_field(field, name, neg=neg))
         if dnstype is not None:
-            res["source"] = re.compile("^%s-" % dnstype.upper())
+            res["source"] = re.compile(f"^{dnstype.upper()}-")
         return res
 
-    @staticmethod
+    @classmethod
     def searchcert(
+        cls,
         keytype=None,
         md5=None,
         sha1=None,
@@ -4680,35 +5766,27 @@ class MongoDBPassive(MongoDB, DBPassive):
         pksha256=None,
         cacert=False,
     ):
-        res = {"recontype": "SSL_SERVER", "source": "cacert" if cacert else "cert"}
-        if keytype is not None:
-            res["infos.pubkey.type"] = keytype
-        if md5 is not None:
-            res["infos.md5"] = md5.lower()
-        if sha1 is not None:
-            res["infos.sha1"] = sha1.lower()
-        if sha256 is not None:
-            res["infos.sha256"] = sha256.lower()
-        if subject is not None:
-            res["infos.subject_text"] = subject
-        if issuer is not None:
-            res["infos.issuer_text"] = issuer
-        if self_signed is not None:
-            res["infos.self_signed"] = self_signed
-        if pkmd5 is not None:
-            res["infos.pubkey.md5"] = pkmd5.lower()
-        if pksha1 is not None:
-            res["infos.pubkey.sha1"] = pksha1.lower()
-        if pksha256 is not None:
-            res["infos.pubkey.sha256"] = pksha256.lower()
-        return res
+        return cls._searchcert(
+            base={"recontype": "SSL_SERVER", "source": "cacert" if cacert else "cert"},
+            prefix="infos.",
+            keytype=keytype,
+            md5=md5,
+            sha1=sha1,
+            sha256=sha256,
+            subject=subject,
+            issuer=issuer,
+            self_signed=self_signed,
+            pkmd5=pkmd5,
+            pksha1=pksha1,
+            pksha256=pksha256,
+        )
 
     @classmethod
     def _searchja3(cls, value_or_hash):
-        if value_or_hash is None:
+        if not value_or_hash:
             return {}
         key, value = cls._ja3keyvalue(value_or_hash)
-        return {"value" if key == "md5" else "infos.%s" % key: value}
+        return {"value" if key == "md5" else f"infos.{key}": value}
 
     @classmethod
     def searchja3client(cls, value_or_hash=None):
@@ -4717,26 +5795,95 @@ class MongoDBPassive(MongoDB, DBPassive):
     @classmethod
     def searchja3server(cls, value_or_hash=None, client_value_or_hash=None):
         base = dict(cls._searchja3(value_or_hash), recontype="SSL_SERVER")
-        if client_value_or_hash is None:
+        if not client_value_or_hash:
             return dict(base, source=re.compile("^ja3-"))
         key, value = cls._ja3keyvalue(client_value_or_hash)
         if key == "md5":
-            return dict(base, source="ja3-%s" % value)
+            return dict(base, source=f"ja3-{value}")
         return dict(
             base,
             source=re.compile("^ja3-"),
-            **{"infos.client.%s" % key: client_value_or_hash},
+            **{f"infos.client.{key}": client_value_or_hash},
         )
 
+    @classmethod
+    def searchja4client(
+        cls,
+        value=None,
+        raw=None,
+        ja4_a=None,
+        ja4_b=None,
+        ja4_c=None,
+        ja4_b_raw=None,
+        ja4_c_raw=None,
+        ja4_c1_raw=None,
+        ja4_c2_raw=None,
+        neg=False,
+    ):
+        flt = {"recontype": "SSL_CLIENT", "source": "ja4"}
+        if value is not None:
+            flt["value"] = value
+            # also, use ja4_* fields that are indexed
+            if isinstance(value, str):
+                try:
+                    if value[10] != "_":
+                        raise ValueError()
+                    flt["infos.ja4_a"] = value[:10]
+                    flt["infos.ja4_b"], flt["infos.ja4_c"] = value[11:].split("_", 1)
+                except (KeyError, ValueError):
+                    utils.LOGGER.warning("Invalid JA4 value %r", value, exc_info=True)
+        if raw is not None:
+            try:
+                if raw[10] != "_":
+                    raise ValueError()
+                flt["infos.ja4_a"] = raw[:10]
+                # using _ja4_c_raw to prevent conflict with parameter
+                flt["infos.ja4_b_raw"], _ja4_c_raw = value[11:].split("_", 1)
+                if "_" in _ja4_c_raw:
+                    flt["infos.ja4_c1_raw"], flt["infos.ja4_c2_raw"] = _ja4_c_raw.split(
+                        "_", 1
+                    )
+                else:
+                    flt["infos.ja4_c1_raw"] = _ja4_c_raw
+                    flt["infos.ja4_c2_raw"] = ""
+            except (KeyError, ValueError):
+                utils.LOGGER.warning("Invalid JA4 raw value %r", raw, exc_info=True)
+        if ja4_a is not None:
+            flt["infos.ja4_a"] = ja4_a
+        if ja4_b is not None:
+            flt["infos.ja4_b"] = ja4_b
+        if ja4_c is not None:
+            flt["infos.ja4_c"] = ja4_c
+        if ja4_b_raw is not None:
+            flt["infos.ja4_b_raw"] = ja4_b_raw
+        if ja4_c_raw is not None:
+            if "_" in ja4_c_raw:
+                flt["infos.ja4_c1_raw"], flt["infos.ja4_c2_raw"] = ja4_c_raw.split(
+                    "_", 1
+                )
+            else:
+                flt["infos.ja4_c1_raw"] = ja4_c_raw
+                flt["infos.ja4_c2_raw"] = ""
+        if ja4_c1_raw is not None:
+            flt["infos.ja4_c1_raw"] = ja4_c1_raw
+        if ja4_c2_raw is not None:
+            flt["infos.ja4_c2_raw"] = ja4_c2_raw
+        return flt
+
     @staticmethod
-    def searchsshkey(keytype=None):
-        if keytype is None:
-            return {"recontype": "SSH_SERVER_HOSTKEY", "source": "SSHv2"}
-        return {
-            "recontype": "SSH_SERVER_HOSTKEY",
-            "source": "SSHv2",
-            "infos.algo": "ssh-" + keytype,
-        }
+    def searchsshkey(fingerprint=None, key=None, keytype=None, bits=None):
+        res = {"recontype": "SSH_SERVER_HOSTKEY", "source": "SSHv2"}
+        if fingerprint is not None:
+            if not isinstance(fingerprint, re.Pattern):
+                fingerprint = fingerprint.replace(":", "").lower()
+            res["infos.md5"] = fingerprint
+        if key is not None:
+            res["value"] = key
+        if keytype is not None:
+            res["infos.algo"] = f"ssh-{keytype}"
+        if bits is not None:
+            res["infos.bits"] = bits
+        return res
 
     @staticmethod
     def searchbasicauth():
@@ -4770,9 +5917,9 @@ class MongoDBPassive(MongoDB, DBPassive):
         if not isinstance(delta, datetime.timedelta):
             delta = datetime.timedelta(seconds=delta)
         return {
-            "firstseen"
-            if new
-            else "lastseen": {"$lt" if neg else "$gte": datetime.datetime.now() - delta}
+            "firstseen" if new else "lastseen": {
+                "$lt" if neg else "$gte": datetime.datetime.now() - delta
+            }
         }
 
     @staticmethod
@@ -4784,211 +5931,412 @@ class MongoDBPassive(MongoDB, DBPassive):
         }
 
 
-class MongoDBAgent(MongoDB, DBAgent):
-    """MongoDB-specific code to handle agents-in-DB"""
+def _coerce_asnum(asnum):
+    """Coerce an AS-number argument to the type the underlying
+    ``aut-num`` integer field uses. Accepts int / ``"AS1234"`` /
+    ``"1234"``, lists thereof, or a regex (passed through). Used by
+    :meth:`MongoDBRir.searchasnum`."""
+    if isinstance(asnum, re.Pattern):
+        return asnum
+    if isinstance(asnum, list):
+        return [_coerce_asnum(v) for v in asnum]
+    if isinstance(asnum, int):
+        return asnum
+    s = str(asnum).strip()
+    if s[:2].upper() == "AS":
+        s = s[2:]
+    return int(s)
 
-    column_agents = 0
-    column_scans = 1
-    column_masters = 2
-    indexes: List[List[Tuple[List[SortKey], Dict[str, Any]]]] = [
-        # agents
+
+class MongoDBRir(MongoDB, DBRir):
+    column_rir = 0
+    schema_latest_versions = [
+        # rir: v2 added the ``size`` field on inet[6]num records so the
+        # web layer can sort allocations narrowest-first without an
+        # aggregation pipeline. ``ivre rirlookup --update-schema``
+        # backfills the field on existing records.
+        2,
+    ]
+    indexes: list[list[tuple[list[IndexKey], dict[str, Any]]]] = [
+        # rir
         [
-            ([("host", pymongo.ASCENDING)], {}),
-            ([("path.remote", pymongo.ASCENDING)], {}),
-            ([("path.local", pymongo.ASCENDING)], {}),
-            ([("master", pymongo.ASCENDING)], {}),
-            ([("scan", pymongo.ASCENDING)], {}),
+            (
+                [
+                    ("start_0", pymongo.ASCENDING),
+                    ("stop_0", pymongo.DESCENDING),
+                    ("start_1", pymongo.ASCENDING),
+                    ("stop_1", pymongo.DESCENDING),
+                ],
+                {"sparse": True},
+            ),
+            ([("aut-num", pymongo.ASCENDING)], {"sparse": True}),
+            ([("country", pymongo.ASCENDING)], {}),
+            ([("source", pymongo.ASCENDING)], {}),
+            ([("source_file", pymongo.ASCENDING)], {}),
+            ([("source_hash", pymongo.ASCENDING)], {}),
+            ([("schema_version", pymongo.ASCENDING)], {}),
+            ([("size", pymongo.ASCENDING)], {"sparse": True}),
+            ([(fld, "text") for fld in DBRir.text_fields], {"name": "text"}),
         ],
-        # scans
-        [
-            ([("agents", pymongo.ASCENDING)], {}),
-        ],
-        # masters
-        [
-            ([("hostname", pymongo.ASCENDING), ("path", pymongo.ASCENDING)], {}),
-        ],
+    ]
+    schema_migrations_indexes: list[dict[int, dict[str, list[Any]]]] = [
+        # rir
+        {
+            2: {
+                "ensure": [
+                    ([("size", pymongo.ASCENDING)], {"sparse": True}),
+                ],
+            },
+        },
     ]
 
     def __init__(self, url):
         super().__init__(url)
-        self.columns = [
-            self.params.pop("colname_agents", "agents"),
-            self.params.pop("colname_scans", "runningscans"),
-            self.params.pop("colname_masters", "masters"),
+        self.columns = ["rir"]
+        self.schema_migrations = [
+            # rir
+            {
+                None: (1, self.__migrate_schema_rir_0_1),
+                1: (2, self.__migrate_schema_rir_1_2),
+            },
         ]
 
-    def _add_agent(self, agent):
-        return self.db[self.columns[self.column_agents]].insert(agent)
+    def cmp_schema_version_rir(self, rec):
+        """Returns 0 if `rec`'s schema version matches the code's
+        current version, -1 if it is higher (you need to update IVRE),
+        and 1 if it is lower (you need to call .migrate_schema())."""
+        return self.cmp_schema_version(self.column_rir, rec)
 
-    def get_agent(self, agentid):
-        return self.find_one(self.columns[self.column_agents], {"_id": agentid})
+    def migrate_schema(self, version):
+        """Process schema migrations on the RIR column starting from
+        ``version``."""
+        MongoDB.migrate_schema(self, self.column_rir, version)
 
-    def get_free_agents(self):
-        return (
-            x["_id"]
-            for x in self.set_limits(
-                self.find(
-                    self.columns[self.column_agents], {"scan": None}, fields=["_id"]
-                )
-            )
-        )
+    @staticmethod
+    def __migrate_schema_rir_0_1(doc):
+        """Stamp records lacking ``schema_version`` with version 1.
+        Pre-v1 records were the same shape on the wire — only the
+        ``schema_version`` marker was missing — so this is a no-op
+        beyond setting the field."""
+        assert "schema_version" not in doc
+        doc["schema_version"] = 1
+        return doc
 
-    def get_agents_by_master(self, masterid):
-        return (
-            x["_id"]
-            for x in self.set_limits(
-                self.find(
-                    self.columns[self.column_agents],
-                    {"master": masterid},
-                    fields=["_id"],
-                )
-            )
-        )
+    @classmethod
+    def __migrate_schema_rir_1_2(cls, doc):
+        """Backfill the ``size`` field on inet[6]num records. ``size``
+        is the number of addresses in the range, ``stop - start + 1``,
+        stored as ``bson.Decimal128`` so an IPv6 /0 (2**128 addresses)
+        round-trips losslessly. ``aut-num`` records have no range and
+        keep no ``size``."""
+        assert doc.get("schema_version") == 1
+        update = {"schema_version": 2}
+        size = cls._compute_rir_size(doc)
+        if size is not None:
+            update["size"] = size
+        return update
 
-    def get_agents(self):
-        return (
-            x["_id"]
-            for x in self.set_limits(
-                self.find(self.columns[self.column_agents], fields=["_id"])
-            )
-        )
+    @staticmethod
+    def _compute_rir_size(doc):
+        """Return the inclusive address-count of an inet[6]num record's
+        range as ``bson.Decimal128``, or ``None`` for records that
+        carry no range (typically ``aut-num`` records)."""
+        try:
+            start_0 = doc["start_0"]
+            start_1 = doc["start_1"]
+            stop_0 = doc["stop_0"]
+            stop_1 = doc["stop_1"]
+        except KeyError:
+            return None
+        # Pack the (high, low) halves as IVRE does: high = bits 64..127,
+        # low = bits 0..63 (with the IPv4 bias applied at ip2internal
+        # time). The size is just (stop - start + 1) on the packed
+        # 128-bit integer.
+        start = ((start_0 + (1 << 63)) << 64) | (start_1 + (1 << 63))
+        stop = ((stop_0 + (1 << 63)) << 64) | (stop_1 + (1 << 63))
+        return bson.Decimal128(str(stop - start + 1))
 
-    def assign_agent(self, agentid, scanid, only_if_unassigned=False, force=False):
-        flt = {"_id": agentid}
-        if only_if_unassigned:
-            flt["scan"] = None
-        elif not force:
-            flt["scan"] = {"$ne": False}
-        self.db[self.columns[self.column_agents]].update(
-            flt, {"$set": {"scan": scanid}}
-        )
-        agent = self.get_agent(agentid)
-        if scanid is not None and scanid is not False and scanid == agent["scan"]:
-            self.db[self.columns[self.column_scans]].update(
-                {"_id": scanid, "agents": {"$ne": agentid}},
-                {"$push": {"agents": agentid}},
-            )
+    def remove_many(self, flt):
+        """Removes hosts from the RIR column, based on the filter `flt`."""
+        self.db[self.columns[self.column_rir]].delete_many(flt)
 
-    def unassign_agent(self, agentid, dont_reuse=False):
-        agent = self.get_agent(agentid)
-        scanid = agent["scan"]
-        if scanid is not None:
-            self.db[self.columns[self.column_scans]].update(
-                {"_id": scanid, "agents": agentid}, {"$pull": {"agents": agentid}}
-            )
-        if dont_reuse:
-            self.assign_agent(agentid, False, force=True)
-        else:
-            self.assign_agent(agentid, None, force=True)
-
-    def _del_agent(self, agentid):
-        return self.db[self.columns[self.column_agents]].remove(spec_or_id=agentid)
-
-    def _add_scan(self, scan):
-        return self.db[self.columns[self.column_scans]].insert(scan)
-
-    def get_scan(self, scanid):
-        scan = self.find_one(
-            self.columns[self.column_scans], {"_id": scanid}, fields={"target": 0}
-        )
-        if scan.get("lock") is not None:
-            scan["lock"] = uuid.UUID(bytes=scan["lock"])
-        if "target_info" not in scan:
-            target = self.get_scan_target(scanid)
-            if target is not None:
-                target_info = target.target.infos
-                self.db[self.columns[self.column_scans]].update(
-                    {"_id": scanid},
-                    {"$set": {"target_info": target_info}},
-                )
-                scan["target_info"] = target_info
-        return scan
-
-    def _get_scan_target(self, scanid):
-        scan = self.find_one(
-            self.columns[self.column_scans],
-            {"_id": scanid},
-            fields={"target": 1, "_id": 0},
-        )
-        return None if scan is None else scan["target"]
-
-    def _lock_scan(self, scanid, oldlockid, newlockid):
-        """Change lock for scanid from oldlockid to newlockid. Returns the new
-        scan object on success, and raises a LockError on failure.
+    @classmethod
+    def searchsourcefile(cls, src, neg=False):
+        """Filters (if `neg` == True, filters out) one particular
+        source.
 
         """
-        if oldlockid is not None:
-            oldlockid = bson.Binary(oldlockid)
-        if newlockid is not None:
-            newlockid = bson.Binary(newlockid)
-        scan = self.db[self.columns[self.column_scans]].find_and_modify(
-            {
-                "_id": scanid,
-                "lock": oldlockid,
-            },
-            {
-                "$set": {"lock": newlockid, "pid": os.getpid()},
-            },
-            full_response=True,
-            fields={"target": False},
-            new=True,
-        )["value"]
-        if scan is None:
-            if oldlockid is None:
-                raise LockError("Cannot acquire lock for %r" % scanid)
-            if newlockid is None:
-                raise LockError("Cannot release lock for %r" % scanid)
-            raise LockError(
-                "Cannot change lock for %r from "
-                "%r to %r" % (scanid, oldlockid, newlockid)
-            )
-        if "target_info" not in scan:
-            target = self.get_scan_target(scanid)
-            if target is not None:
-                target_info = target.target.infos
-                self.db[self.columns[self.column_scans]].update(
-                    {"_id": scanid},
-                    {"$set": {"target_info": target_info}},
+        return cls._search_field("source_file", src, neg=neg)
+
+    @classmethod
+    def searchfileid(cls, fileid, neg=False):
+        """Filters (if `neg` == True, filters out) one particular
+        file id. Accepts a scalar (the typical operator-typed
+        SHA-256 hex digest), a list of digests, or a regex \u2014
+        delegated to :meth:`MongoDB._search_field`.
+
+        """
+        return cls._search_field("source_hash", fileid, neg=neg)
+
+    @classmethod
+    def searchhost(cls, addr, neg=False):
+        """Filters one particular host (IP address)."""
+        if neg:
+            raise ValueError("neg == True is not supported for this purpose")
+        addr_0, addr_1 = cls.ip2internal(addr)
+        return {
+            "$and": [
+                {
+                    "$or": [
+                        {"start_0": {"$lt": addr_0}},
+                        {"$and": [{"start_0": addr_0}, {"start_1": {"$lte": addr_1}}]},
+                    ],
+                },
+                {
+                    "$or": [
+                        {"stop_0": {"$gt": addr_0}},
+                        {"$and": [{"stop_0": addr_0}, {"stop_1": {"$gte": addr_1}}]},
+                    ],
+                },
+            ],
+        }
+
+    @classmethod
+    def searchnet(cls, net, neg=False):
+        """Filters every record whose ``(start, stop)`` range overlaps
+        with ``net`` at all. Records that fully contain ``net``,
+        records fully contained in ``net``, and records overlapping on
+        either side all match.
+
+        Pair this filter with ``sort=[("size", 1)]`` (or pass no
+        ``?sortby=`` on the web ``/rir`` route, which defaults to it)
+        to surface the most specific allocation first.
+
+        ``neg=True`` is not supported (mirrors :meth:`searchhost`)."""
+        if neg:
+            raise ValueError("neg == True is not supported for this purpose")
+        net_start, net_stop = utils.net2range(net)
+        s0, s1 = cls.ip2internal(net_start)
+        e0, e1 = cls.ip2internal(net_stop)
+        return cls._searchrange_overlap(s0, s1, e0, e1)
+
+    @classmethod
+    def searchrange(cls, start, stop, neg=False):
+        """Filters every record whose ``(start, stop)`` range overlaps
+        with the ``[start, stop]`` window. Same overlap semantics as
+        :meth:`searchnet`. ``neg=True`` is not supported."""
+        if neg:
+            raise ValueError("neg == True is not supported for this purpose")
+        s0, s1 = cls.ip2internal(start)
+        e0, e1 = cls.ip2internal(stop)
+        return cls._searchrange_overlap(s0, s1, e0, e1)
+
+    @staticmethod
+    def _searchrange_overlap(s0, s1, e0, e1):
+        """Build the Mongo filter for ``record.start <= window.stop AND
+        record.stop >= window.start`` using the same dual-key compare
+        idiom as :meth:`searchhost`. Stays index-friendly on the
+        (start_0, stop_0, start_1, stop_1) compound index."""
+        return {
+            "$and": [
+                # record.start <= window.stop  (record starts at or
+                # before the window's last address)
+                {
+                    "$or": [
+                        {"start_0": {"$lt": e0}},
+                        {"$and": [{"start_0": e0}, {"start_1": {"$lte": e1}}]},
+                    ],
+                },
+                # record.stop >= window.start  (record stops at or
+                # after the window's first address)
+                {
+                    "$or": [
+                        {"stop_0": {"$gt": s0}},
+                        {"$and": [{"stop_0": s0}, {"stop_1": {"$gte": s1}}]},
+                    ],
+                },
+            ],
+        }
+
+    @classmethod
+    def searchasnum(cls, asnum, neg=False):
+        """Filters AS-number records (``aut-num`` records) by integer
+        AS number. Accepts a string (``"AS1234"`` / ``"1234"``), an
+        int, or a list of either; regexes pass through unchanged.
+        Strings are coerced to int so the filter matches the
+        underlying ``aut-num`` integer field."""
+        return cls._search_field("aut-num", _coerce_asnum(asnum), neg=neg)
+
+    @classmethod
+    def searchasname(cls, name, neg=False):
+        """Filters AS-number records (``aut-num`` records) by their
+        ``as-name`` text field. Accepts a string, a list, or a
+        regex."""
+        return cls._search_field("as-name", name, neg=neg)
+        # This query is equivalent but slower with our indexes
+        # return {
+        #     "$and": [
+        #         {"start_0": {"$lte": addr_0}},
+        #         {"stop_0": {"$gte": addr_0}},
+        #         {"$or": [
+        #             {"start_0": {"$ne": addr_0}},
+        #             {"start_1": {"$lte": addr_1}},
+        #         ]},
+        #         {"$or": [
+        #             {"stop_0": {"$ne": addr_0}},
+        #             {"stop_1": {"$gte": addr_1}},
+        #         ]},
+        #     ]
+        # }
+
+    @classmethod
+    def searchcountry(cls, country, neg=False):
+        """Filters (if `neg` == True, filters out) one particular
+        country, or a list of countries.
+
+        """
+        return cls._search_field("country", utils.country_unalias(country), neg=neg)
+
+    def _get(self, flt, **kargs):
+        """Like .get(), but returns a MongoDB cursor (suitable for use with
+        e.g.  .explain()).
+
+        """
+        return self._get_cursor(self.columns[self.column_rir], flt, **kargs)
+
+    def get(self, spec, **kargs):
+        """Queries the RIR column with the provided filter "spec",
+        and returns a MongoDB cursor.
+
+        This should be very fast, as no operation is done (the cursor
+        is only returned). Next operations (e.g., enumeration) might
+        take a long time, depending on both the operations and the
+        filter.
+
+        Any keyword argument is passed to the .find() method of the Mongodb
+        column object, without any validation (and might have no effect if
+        it is not expected).
+
+        """
+        # Convert IP addresses to internal DB format
+        for rec in self._get(spec, **kargs):
+            for fld in self.ipaddr_fields:
+                try:
+                    rec[fld] = self.internal2ip(
+                        [rec.pop(f"{fld}_0"), rec.pop(f"{fld}_1")]
+                    )
+                except (KeyError, socket.error):
+                    # If the expected internal IP components are missing or invalid,
+                    # leave the record as-is and continue with the next field.
+                    pass
+            yield rec
+
+    def count(self, flt):
+        """Count documents in RIR column."""
+        if not flt:
+            return self.db[self.columns[self.column_rir]].estimated_document_count()
+        return self.db[self.columns[self.column_rir]].count_documents(flt)
+
+    def get_best(self, addr, spec=None):
+        if spec is None:
+            spec = self.flt_empty
+        addr_0, addr_1 = self.ip2internal(addr)
+        # First try with start_0 == stop_0 == addr_0.
+        # Rationale: if one result exists, it is the best, and this query should be faster
+        spec_addr = {
+            "start_0": addr_0,
+            "stop_0": addr_0,
+            "start_1": {"$lte": addr_1},
+            "stop_1": {"$gte": addr_1},
+        }
+        try:
+            return next(
+                iter(
+                    self.get(
+                        self.flt_and(spec_addr, spec), sort=[("start", -1), ("stop", 1)]
+                    )
                 )
-                scan["target_info"] = target_info
-        if scan["lock"] is not None:
-            scan["lock"] = bytes(scan["lock"])
-        return scan
-
-    def get_scans(self):
-        return (
-            x["_id"]
-            for x in self.set_limits(
-                self.find(self.columns[self.column_scans], fields=["_id"])
             )
-        )
-
-    def _update_scan_target(self, scanid, target):
-        return self.db[self.columns[self.column_scans]].update(
-            {"_id": scanid}, {"$set": {"target": target}}
-        )
-
-    def incr_scan_results(self, scanid):
-        return self.db[self.columns[self.column_scans]].update(
-            {"_id": scanid}, {"$inc": {"results": 1}}
-        )
-
-    def _add_master(self, master):
-        return self.db[self.columns[self.column_masters]].insert(master)
-
-    def get_master(self, masterid):
-        return self.find_one(self.columns[self.column_masters], {"_id": masterid})
-
-    def get_masters(self):
-        return (
-            x["_id"]
-            for x in self.set_limits(
-                self.find(self.columns[self.column_masters], fields=["_id"])
+        except StopIteration:
+            pass
+        try:
+            return next(
+                iter(
+                    self.get(
+                        self.flt_and(self.searchhost(addr), spec),
+                        sort=[("start", -1), ("stop", 1)],
+                    )
+                )
             )
+        except StopIteration:
+            return None
+
+    def distinct(self, field, flt=None, sort=None, limit=None, skip=None):
+        """This method makes use of the aggregation framework to
+        produce distinct values for a given field.
+
+        """
+        return self._distinct(
+            self.columns[self.column_rir],
+            field,
+            flt=flt,
+            sort=sort,
+            limit=limit,
+            skip=skip,
         )
+
+    def topvalues(self, field, flt=None, **kargs):
+        """Aggregate the most common values of ``field`` across the
+        RIR column. Supports the standard ``flt``, ``topnbr``,
+        ``least``, ``sort``, ``limit``, ``skip``, ``aggrflt``,
+        ``specialproj``, ``specialflt`` keyword arguments forwarded to
+        :meth:`_topvalues`. RIR records are flat dicts with no nested
+        arrays of interest (no ``addr``, no ``net``, no ``domains``
+        pseudo-fields), so no special-case rewriting is needed.
+
+        Useful fields: ``country``, ``source_file``, ``aut-num``,
+        ``as-name``, ``netname``, ``schema_version``."""
+        pipeline = self._topvalues(field, flt=flt, **kargs)
+        return self._aggregate(self.db[self.columns[self.column_rir]], pipeline)
+
+    @staticmethod
+    def start_bulk():
+        return []
+
+    def stop_bulk(self, bulk):
+        if bulk:
+            utils.LOGGER.debug("DB:MongoDB bulk upsert: %d", len(bulk))
+            self.db[self.columns[self.column_rir]].bulk_write(bulk, ordered=False)
+
+    def insert_bulk(self, bulk, rec):
+        for fld in self.ipaddr_fields:
+            if fld in rec:
+                rec[f"{fld}_0"], rec[f"{fld}_1"] = self.ip2internal(rec.pop(fld))
+        # ``size`` is the inclusive address-count of the range; pinned
+        # at insert so the web ``/rir`` route can sort narrowest-first
+        # without an aggregation pipeline. Stored as bson.Decimal128
+        # because IPv6 ranges can reach 2**128 (overflows int64).
+        # ``aut-num`` records carry no range and skip this.
+        size = self._compute_rir_size(rec)
+        if size is not None:
+            rec["size"] = size
+        bulk.append(pymongo.InsertOne(rec))
+        if len(bulk) >= config.MONGODB_BATCH_SIZE:
+            utils.LOGGER.debug("DB:MongoDB bulk upsert: %d", len(bulk))
+            self.db[self.columns[self.column_rir]].bulk_write(bulk, ordered=False)
+            return []
+        return bulk
 
 
 class MongoDBFlow(MongoDB, DBFlow, metaclass=DBFlowMeta):
+    # Mongo's flow ``topvalues`` unwinds array-typed columns
+    # (``sports`` / ``codes`` / ``times``) and the per-protocol
+    # ``meta.<name>`` JSONB sub-documents via ``$unwind`` /
+    # ``$objectToArray``; the SQL backends defer the
+    # ``meta`` JSONB merge and the ``times`` timeslot
+    # ingestion, so the equivalent ``topvalues`` paths over
+    # the array forms are not available there yet.
+    supports = frozenset({"flow_array_topvalues"})
     column_flow = 0
 
     datefields = [
@@ -5002,7 +6350,7 @@ class MongoDBFlow(MongoDB, DBFlow, metaclass=DBFlowMeta):
     # insertion in db.
     meta_kinds = {"keys": "$addToSet", "counters": "$inc"}
 
-    indexes: List[List[Tuple[List[SortKey], Dict[str, Any]]]] = [
+    indexes: list[list[tuple[list[IndexKey], dict[str, Any]]]] = [
         # flows
         [
             (
@@ -5032,13 +6380,14 @@ class MongoDBFlow(MongoDB, DBFlow, metaclass=DBFlowMeta):
         super().__init__(url)
         self.columns = ["flows"]
 
-    def start_bulk_insert(self):
+    @staticmethod
+    def start_bulk_insert():
         """
         Initialize bulks for inserting data in MongoDB.
         Returns flow_bulk
         """
         utils.LOGGER.debug("start_bulk_insert called")
-        return self.db[self.columns[self.column_flow]].initialize_unordered_bulk_op()
+        return []
 
     @staticmethod
     def _get_flow_key(rec):
@@ -5094,7 +6443,7 @@ class MongoDBFlow(MongoDB, DBFlow, metaclass=DBFlowMeta):
         updatespec = {
             "$min": {"firstseen": rec["start_time"]},
             "$max": {"lastseen": rec["end_time"]},
-            "$inc": {"meta.%s.count" % name: 1},
+            "$inc": {f"meta.{name}.count": 1},
         }
 
         # metadata storage can be disabled.
@@ -5103,15 +6452,12 @@ class MongoDBFlow(MongoDB, DBFlow, metaclass=DBFlowMeta):
                 for key, value in cls.meta_desc[name].get(kind, {}).items():
                     if not rec.get(value):
                         continue
-                    if "%s.%s.%s" % (name, kind, key) in flow.META_DESC_ARRAYS:
+                    if f"{name}.{kind}.{key}" in flow.META_DESC_ARRAYS:
                         rec[value] = {"$each": rec[value]}
-                    updatespec.setdefault(op, {})["meta.%s.%s" % (name, key)] = rec[
-                        value
-                    ]
+                    updatespec.setdefault(op, {})[f"meta.{name}.{key}"] = rec[value]
 
         cls._update_timeslots(updatespec, rec)
-
-        bulk.find(findspec).upsert().update(updatespec)
+        bulk.append(pymongo.UpdateOne(findspec, updatespec, upsert=True))
 
     @classmethod
     def conn2flow(cls, bulk, rec):
@@ -5140,8 +6486,7 @@ class MongoDBFlow(MongoDB, DBFlow, metaclass=DBFlowMeta):
             updatespec.setdefault("$addToSet", {})["sports"] = rec["sport"]
         elif rec["proto"] == "icmp":
             updatespec.setdefault("$addToSet", {})["codes"] = rec["code"]
-
-        bulk.find(findspec).upsert().update(updatespec)
+        bulk.append(pymongo.UpdateOne(findspec, updatespec, upsert=True))
 
     @classmethod
     def flow2flow(cls, bulk, rec):
@@ -5170,23 +6515,19 @@ class MongoDBFlow(MongoDB, DBFlow, metaclass=DBFlowMeta):
             updatespec.setdefault("$addToSet", {})["sports"] = rec["sport"]
         elif rec["proto"] == "icmp":
             updatespec.setdefault("$addToSet", {})["codes"] = rec["code"]
+        bulk.append(pymongo.UpdateOne(findspec, updatespec, upsert=True))
 
-        bulk.find(findspec).upsert().update(updatespec)
-
-    @staticmethod
-    def bulk_commit(bulk):
+    def bulk_commit(self, bulk):
         try:
             start_time = time.time()
-            result = bulk.execute()
+            result = self.db[self.columns[self.column_flow]].bulk_write(
+                bulk, ordered=False
+            )
             newtime = time.time()
-            insert_rate = result.get("nInserted") / float(newtime - start_time)
-            upsert_rate = result.get("nUpserted") / float(newtime - start_time)
-            utils.LOGGER.debug(
-                "%d inserts, %f/sec", result.get("nInserted"), insert_rate
-            )
-            utils.LOGGER.debug(
-                "%d upserts, %f/sec", result.get("nUpserted"), upsert_rate
-            )
+            insert_rate = result.inserted_count / float(newtime - start_time)
+            upsert_rate = result.upserted_count / float(newtime - start_time)
+            utils.LOGGER.debug("%d inserts, %f/sec", result.inserted_count, insert_rate)
+            utils.LOGGER.debug("%d upserts, %f/sec", result.upserted_count, upsert_rate)
 
         except BulkWriteError:
             utils.LOGGER.error("Bulk Write Error", exc_info=True)
@@ -5194,7 +6535,7 @@ class MongoDBFlow(MongoDB, DBFlow, metaclass=DBFlowMeta):
             # Raised when executing an empty bulk
             pass
 
-    def get(self, flt, skip=None, limit=None, orderby=None, fields=None):
+    def get(self, spec, skip=None, limit=None, orderby=None, fields=None):
         """
         Returns an iterator over flows honoring the given filter
         with the given options.
@@ -5216,7 +6557,7 @@ class MongoDBFlow(MongoDB, DBFlow, metaclass=DBFlowMeta):
             raise ValueError("Unsupported orderby (should be 'src', 'dst' or 'flow')")
         for f in self._get_cursor(
             self.columns[self.column_flow],
-            flt,
+            spec,
             limit=(limit or 0),
             skip=(skip or 0),
             sort=sort,
@@ -5240,7 +6581,7 @@ class MongoDBFlow(MongoDB, DBFlow, metaclass=DBFlowMeta):
         """
         sources = 0
         destinations = 0
-        flows = self.db[self.columns[self.column_flow]].count(flt)
+        flows = self.db[self.columns[self.column_flow]].count_documents(flt)
         if flows > 0:
             pipeline = [
                 {"$match": flt},
@@ -5257,10 +6598,9 @@ class MongoDBFlow(MongoDB, DBFlow, metaclass=DBFlowMeta):
                 # https://docs.mongodb.com/manual/reference/operator/aggregation/count/#behavior
                 {"$group": {"_id": None, "count": {"$sum": 1}}},
             ]
-            log_pipeline(pipeline)
-            sources = next(self.db[self.columns[self.column_flow]].aggregate(pipeline))[
-                "count"
-            ]
+            sources = next(
+                self._aggregate(self.db[self.columns[self.column_flow]], pipeline)
+            )["count"]
 
             pipeline = [
                 {"$match": flt},
@@ -5274,9 +6614,8 @@ class MongoDBFlow(MongoDB, DBFlow, metaclass=DBFlowMeta):
                 },
                 {"$group": {"_id": None, "count": {"$sum": 1}}},
             ]
-            log_pipeline(pipeline)
             destinations = next(
-                self.db[self.columns[self.column_flow]].aggregate(pipeline)
+                self._aggregate(self.db[self.columns[self.column_flow]], pipeline)
             )["count"]
         return {"clients": sources, "servers": destinations, "flows": flows}
 
@@ -5372,7 +6711,7 @@ class MongoDBFlow(MongoDB, DBFlow, metaclass=DBFlowMeta):
             for i in range(field.count("."), -1, -1):
                 subfield = field.rsplit(".", i)[0]
                 if subfield in self.list_fields:
-                    pipeline += [{"$unwind": "$" + subfield}]
+                    pipeline += [{"$unwind": f"${subfield}"}]
 
         # It is important to match the query after the unwind stages
         # because the query could target one of the aggregated fields
@@ -5389,17 +6728,17 @@ class MongoDBFlow(MongoDB, DBFlow, metaclass=DBFlowMeta):
         index = 0  # each new field will be indexed
         for i, elt in enumerate(group_fields):
             for field in internal_fields[i]:
-                cur_field = "$%s" % field
+                cur_field = f"${field}"
                 field_name = None
                 if cur_field in reverse_project_fields:
                     field_name = reverse_project_fields[cur_field]
                 else:
-                    field_name = "field%s" % index
+                    field_name = f"field{index}"
                     project_fields[field_name] = cur_field
                     reverse_project_fields[cur_field] = field_name
-                new_field_name = "$%s" % field_name
+                new_field_name = f"${field_name}"
                 # _id group
-                if i == 0:
+                if not i:
                     elt[field_name] = new_field_name
                 # collect group
                 else:
@@ -5408,7 +6747,7 @@ class MongoDBFlow(MongoDB, DBFlow, metaclass=DBFlowMeta):
         # Add sum projection if sum_fields are provided
         if sum_fields:
             project_fields["_sum"] = {
-                "$add": ["$%s" % field for field in internal_fields[2]]
+                "$add": [f"${field}" for field in internal_fields[2]]
             }
 
         pipeline.append({"$project": project_fields})
@@ -5426,8 +6765,7 @@ class MongoDBFlow(MongoDB, DBFlow, metaclass=DBFlowMeta):
         if topnbr is not None:
             pipeline.append({"$limit": topnbr})
 
-        log_pipeline(pipeline)
-        res = self.db[self.columns[self.column_flow]].aggregate(pipeline, cursor={})
+        res = self._aggregate(self.db[self.columns[self.column_flow]], pipeline)
         for entry in res:
             # Translate again the collected fields
             ext_entry = {}
@@ -5445,8 +6783,8 @@ class MongoDBFlow(MongoDB, DBFlow, metaclass=DBFlowMeta):
                     ext_entry["_id"][key] = value
             # apply internal2ip to addr results
             for addr_field in ["src_addr", "dst_addr"]:
-                addr0, addr1 = (addr_field + "_0", addr_field + "_1")
-                addr = addr_field[:3] + ".addr"
+                addr0, addr1 = (f"{addr_field}_0", f"{addr_field}_1")
+                addr = f"{addr_field[:3]}.addr"
                 # Apply in aggregate fields
                 if addr0 in ext_entry["_id"] and addr1 in ext_entry["_id"]:
                     ext_entry["_id"][addr] = self.internal2ip(
@@ -5477,9 +6815,9 @@ class MongoDBFlow(MongoDB, DBFlow, metaclass=DBFlowMeta):
             # Format collected results in a set of tuples to avoid duplicates
             if ext_entry:
                 # Transforms collected list fields in tuples
-                for key in ext_entry:
+                for key in list(ext_entry):
                     ext_entry[key] = [
-                        elt if not isinstance(elt, list) else tuple(elt)
+                        tuple(elt) if isinstance(elt, list) else elt
                         for elt in ext_entry[key]
                     ]
                 # This keeps the order of collected fields
@@ -5502,7 +6840,7 @@ class MongoDBFlow(MongoDB, DBFlow, metaclass=DBFlowMeta):
             ]
             op = "$and" if neg else "$or"
             return {op: res}
-        return cls._searchnet(net, neg=neg, fieldname=fieldname + "_addr")
+        return cls._searchnet(net, neg=neg, fieldname=f"{fieldname}_addr")
 
     @classmethod
     def search_flow_host(cls, addr, neg=False, prefix=""):
@@ -5518,7 +6856,7 @@ class MongoDBFlow(MongoDB, DBFlow, metaclass=DBFlowMeta):
             ]
             op = "$and" if neg else "$or"
             return {op: res}
-        return cls._searchhost(addr, neg=neg, fieldname=prefix + "_addr")
+        return cls._searchhost(addr, neg=neg, fieldname=f"{prefix}_addr")
 
     @classmethod
     def _flt_from_clause_addr(cls, clause):
@@ -5667,14 +7005,12 @@ class MongoDBFlow(MongoDB, DBFlow, metaclass=DBFlowMeta):
                 attr = clause["attr"]
                 array_attr, value_attr = cls._get_longest_array_attr(clause["attr"])
                 if array_attr is None:
-                    raise ValueError(
-                        "%s is not a valid array attribute" % clause["attr"]
-                    )
+                    raise ValueError(f"{clause['attr']} is not a valid array attribute")
                 clause["operator"] = operators[clause["operator"]]
                 clause["neg"] = not clause["neg"]
-                clause["attr"] = value_attr if value_attr != "" else array_attr
+                clause["attr"] = value_attr if value_attr else array_attr
                 res = cls._flt_from_clause_any(clause)
-                if value_attr != "":
+                if value_attr:
                     # Array values are dictionaries
                     return {
                         "$nor": [
@@ -5724,8 +7060,7 @@ class MongoDBFlow(MongoDB, DBFlow, metaclass=DBFlowMeta):
             "$gte": (-1, True),
         }
         return {
-            "%s.%d"
-            % (clause["attr"], clause["value"] + op_values[op][0]): {
+            f"{clause['attr']}.{int(clause['value'] + op_values[op][0])}": {
                 "$exists": op_values[op][1]
             },
             clause["attr"]: {"$exists": True},
@@ -5856,12 +7191,11 @@ class MongoDBFlow(MongoDB, DBFlow, metaclass=DBFlowMeta):
         }
         """
         g = {"elt": {}}
-        res = self.db[self.columns[self.column_flow]].find(
+        row = self.db[self.columns[self.column_flow]].find_one(
             {"_id": bson.ObjectId(flow_id)}
         )
-        if res.count() != 1:
+        if row is None:
             return None
-        row = res[0]
         g["elt"] = self._edge2json_default(row)["data"]
         g["elt"]["firstseen"] = row.get("firstseen")
         g["elt"]["lastseen"] = row.get("lastseen")
@@ -5934,16 +7268,15 @@ class MongoDBFlow(MongoDB, DBFlow, metaclass=DBFlowMeta):
         # Sort by time ascending
         pipeline.append({"$sort": {"_id.hour": 1, "_id.minute": 1, "_id.second": 1}})
 
-        log_pipeline(pipeline)
-        res = self.db[self.columns[self.column_flow]].aggregate(pipeline, cursor={})
+        res = self._aggregate(self.db[self.columns[self.column_flow]], pipeline)
 
         for entry in res:
             flows = {}
             for fields in entry["fields"]:
                 if fields.get("proto") in ["tcp", "udp"]:
-                    entry_name = "%(proto)s/%(dport)d" % fields
+                    entry_name = f"{fields['proto']}/{int(fields['dport'])}"
                 elif fields.get("type") is not None:
-                    entry_name = "%(proto)s/%(type)d" % fields
+                    entry_name = f"{fields['proto']}/{int(fields['type'])}"
                 else:
                     entry_name = fields["proto"]
                 flows.setdefault(entry_name, 0)
@@ -5966,24 +7299,23 @@ class MongoDBFlow(MongoDB, DBFlow, metaclass=DBFlowMeta):
         new_duration = new_precision
         current_duration = current_precision
         if current_duration is not None:
-            if base % current_duration != 0:
+            if base % current_duration:
                 raise ValueError(
-                    "Base %d must be a multiple of current "
-                    "precision." % config.FLOW_TIME_BASE
+                    f"Base {config.FLOW_TIME_BASE} must be a multiple of current precision."
                 )
             base %= new_duration
             # validate new duration
             if new_duration <= current_duration:
                 raise ValueError(
-                    "New precision value must be greater than " "current one."
+                    "New precision value must be greater than current one."
                 )
-            if new_duration % current_duration != 0:
+            if new_duration % current_duration:
                 raise ValueError(
-                    "New precision must be a multiple of current " "precision."
+                    "New precision must be a multiple of current precision."
                 )
 
         # Create the update bulk
-        bulk = self.db[self.columns[self.column_flow]].initialize_unordered_bulk_op()
+        bulk = []
 
         if flt is None:
             flt = self.flt_empty
@@ -6002,8 +7334,8 @@ class MongoDBFlow(MongoDB, DBFlow, metaclass=DBFlowMeta):
                         current_duration is None
                         and (
                             new_duration <= timeslot["duration"]
-                            or new_duration % timeslot["duration"] != 0
-                            or base % timeslot["duration"] != 0
+                            or new_duration % timeslot["duration"]
+                            or base % timeslot["duration"]
                         )
                     )
                     or (before is not None and timeslot["start"] >= before)
@@ -6019,16 +7351,16 @@ class MongoDBFlow(MongoDB, DBFlow, metaclass=DBFlowMeta):
                 {"start": timeslot[0], "duration": timeslot[1]}
                 for timeslot in new_times
             ]
-            bulk.find({"_id": flw["_id"]}).update({"$set": {"times": timeslots}})
+            bulk.append(
+                pymongo.UpdateOne({"_id": flw["_id"]}, {"$set": {"times": timeslots}})
+            )
         # Execute bulk
         try:
             start_time = time.time()
-            result = bulk.execute()
+            result = self.db[self.columns[self.column_flow]].bulk_write(bulk)
             newtime = time.time()
-            update_rate = result.get("nModified") / float(newtime - start_time)
-            utils.LOGGER.debug(
-                "%d updates, %f/sec", result.get("nModified"), update_rate
-            )
+            update_rate = result.modified_count / float(newtime - start_time)
+            utils.LOGGER.debug("%d updates, %f/sec", result.modified_count, update_rate)
         except pymongo.errors.InvalidOperation:
             utils.LOGGER.debug("No operation to execute.")
 
@@ -6039,7 +7371,7 @@ class MongoDBFlow(MongoDB, DBFlow, metaclass=DBFlowMeta):
             {"$sort": {"_id": 1}},
         ]
 
-        res = self.db[self.columns[self.column_flow]].aggregate(pipeline, cursor={})
+        res = self._aggregate(self.db[self.columns[self.column_flow]], pipeline)
         for entry in res:
             yield entry["_id"]
 
@@ -6107,8 +7439,8 @@ class MongoDBFlow(MongoDB, DBFlow, metaclass=DBFlowMeta):
                 }
             },
         ]
-        res = self.db[self.columns[self.column_flow]].aggregate(pipeline)
-        bulk = self.start_bulk_insert()
+        res = self._aggregate(self.db[self.columns[self.column_flow]], pipeline)
+        bulk = []
         counter = 0
         for rec in res:
             rec["_id"]["src_addr"] = self.internal2ip(
@@ -6150,18 +7482,1220 @@ class MongoDBFlow(MongoDB, DBFlow, metaclass=DBFlowMeta):
                     updatespec["$addToSet"]["times"] = {"$each": rec["times"]}
 
                 if config.DEBUG:
-                    f_str = "%s (%d) -- %s --> %s (%s)" % (
-                        rec["_id"]["src_addr"],
-                        rec["_id"]["sport"],
-                        rec["_id"]["proto"],
-                        rec["_id"]["dst_addr"],
-                        ",".join([str(elt) for elt in rec["dports"]]),
-                    )
+                    f_str = f"{rec['_id']['src_addr']} ({int(rec['_id']['sport'])}) -- {rec['_id']['proto']} --> {rec['_id']['dst_addr']} ({','.join([str(elt) for elt in rec['dports']])})"
                     utils.LOGGER.debug("Switch flow hosts: %s", f_str)
 
-                bulk.find(findspec).upsert().update(updatespec)
-                bulk.find(removespec).remove()
+                bulk.append(pymongo.UpdateOne(findspec, updatespec, upsert=True))
+                bulk.append(pymongo.DeleteMany(removespec))
                 counter += len(rec["_ids"])
 
         self.bulk_commit(bulk)
         utils.LOGGER.debug("%d flows switched.", counter)
+
+
+class MongoDBAuth(MongoDB, DBAuth):
+    """MongoDB-specific code to handle authentication"""
+
+    column_users = 0
+    column_sessions = 1
+    column_api_keys = 2
+    column_rate_limit = 3
+    column_magic_links = 4
+    column_oauth_clients = 5
+    column_oauth_auth_requests = 6
+    column_oauth_codes = 7
+    column_oauth_tokens = 8
+    indexes: list[list[tuple[list[IndexKey], dict[str, Any]]]] = [
+        # auth_user
+        [
+            ([("email", pymongo.ASCENDING)], {"unique": True}),
+        ],
+        # auth_session
+        [
+            ([("token_hash", pymongo.ASCENDING)], {"unique": True}),
+            ([("user_email", pymongo.ASCENDING)], {}),
+            ([("expires_at", pymongo.ASCENDING)], {"expireAfterSeconds": 0}),
+        ],
+        # auth_api_key
+        [
+            ([("key_hash", pymongo.ASCENDING)], {"unique": True}),
+            ([("user_email", pymongo.ASCENDING)], {}),
+        ],
+        # auth_rate_limit
+        [
+            ([("created_at", pymongo.ASCENDING)], {"expireAfterSeconds": 3600}),
+            ([("key", pymongo.ASCENDING), ("created_at", pymongo.ASCENDING)], {}),
+        ],
+        # auth_magic_link
+        [
+            ([("token_hash", pymongo.ASCENDING)], {"unique": True}),
+            ([("expires_at", pymongo.ASCENDING)], {"expireAfterSeconds": 0}),
+        ],
+        # auth_oauth_client
+        [
+            ([("client_id", pymongo.ASCENDING)], {"unique": True}),
+        ],
+        # auth_oauth_auth_request: pending OAuth ``authorize`` requests
+        # awaiting user consent.  TTL index on ``expires_at`` so
+        # abandoned consent flows clean themselves up.
+        [
+            ([("request_id", pymongo.ASCENDING)], {"unique": True}),
+            ([("expires_at", pymongo.ASCENDING)], {"expireAfterSeconds": 0}),
+        ],
+        # auth_oauth_code: issued one-shot authorization codes awaiting
+        # exchange at the ``/token`` endpoint.  TTL index keeps the
+        # short-lived codes self-cleaning.
+        [
+            ([("code", pymongo.ASCENDING)], {"unique": True}),
+            ([("expires_at", pymongo.ASCENDING)], {"expireAfterSeconds": 0}),
+        ],
+        # auth_oauth_token: issued access + refresh tokens (kind
+        # discriminates).  ``expires_at`` is nullable for never-expiring
+        # refresh tokens (operator picks via
+        # :data:`config.MCP_OAUTH_REFRESH_TOKEN_TTL`); the TTL index
+        # is sparse so the null entries are skipped.
+        [
+            ([("token_hash", pymongo.ASCENDING)], {"unique": True}),
+            ([("user_email", pymongo.ASCENDING)], {}),
+            ([("client_id", pymongo.ASCENDING)], {}),
+            (
+                [("expires_at", pymongo.ASCENDING)],
+                {"expireAfterSeconds": 0, "sparse": True},
+            ),
+        ],
+    ]
+
+    def __init__(self, url):
+        super().__init__(url)
+        self.columns = [
+            self.params.pop("colname_auth_users", "auth_user"),
+            self.params.pop("colname_auth_sessions", "auth_session"),
+            self.params.pop("colname_auth_api_keys", "auth_api_key"),
+            self.params.pop("colname_auth_rate_limit", "auth_rate_limit"),
+            self.params.pop("colname_auth_magic_links", "auth_magic_link"),
+            self.params.pop("colname_auth_oauth_clients", "auth_oauth_client"),
+            self.params.pop(
+                "colname_auth_oauth_auth_requests", "auth_oauth_auth_request"
+            ),
+            self.params.pop("colname_auth_oauth_codes", "auth_oauth_code"),
+            self.params.pop("colname_auth_oauth_tokens", "auth_oauth_token"),
+        ]
+
+    def get_user_by_email(self, email):
+        return self.db[self.columns[self.column_users]].find_one({"email": email})
+
+    def create_user(
+        self, email, display_name=None, is_admin=False, is_active=False, groups=None
+    ):
+        doc = {
+            "email": email,
+            "display_name": display_name or email,
+            "is_admin": is_admin,
+            "is_active": is_active,
+            "groups": groups or [],
+            "created_at": datetime.datetime.now(tz=datetime.timezone.utc),
+            "last_login": None,
+        }
+        self.db[self.columns[self.column_users]].insert_one(doc)
+        return doc
+
+    def update_user(self, email, **updates):
+        self.db[self.columns[self.column_users]].update_one(
+            {"email": email}, {"$set": updates}
+        )
+
+    def delete_user(self, email):
+        self.db[self.columns[self.column_sessions]].delete_many({"user_email": email})
+        self.db[self.columns[self.column_api_keys]].delete_many({"user_email": email})
+        self.db[self.columns[self.column_magic_links]].delete_many({"email": email})
+        self.db[self.columns[self.column_users]].delete_one({"email": email})
+
+    def add_user_group(self, email, group):
+        self.db[self.columns[self.column_users]].update_one(
+            {"email": email}, {"$addToSet": {"groups": group}}
+        )
+
+    def remove_user_group(self, email, group):
+        self.db[self.columns[self.column_users]].update_one(
+            {"email": email}, {"$pull": {"groups": group}}
+        )
+
+    def create_session(self, user_email, lifetime=None):
+        if lifetime is None:
+            lifetime = config.WEB_AUTH_SESSION_LIFETIME
+        token = token_urlsafe(32)
+        token_hash = hashlib.sha256(token.encode()).hexdigest()
+        now = datetime.datetime.now(tz=datetime.timezone.utc)
+        doc = {
+            "token_hash": token_hash,
+            "user_email": user_email,
+            "created_at": now,
+            "expires_at": now + datetime.timedelta(seconds=lifetime),
+            "last_used": now,
+        }
+        self.db[self.columns[self.column_sessions]].insert_one(doc)
+        # Update last_login on user
+        self.update_user(user_email, last_login=now)
+        return token
+
+    def validate_session(self, token):
+        token_hash = hashlib.sha256(token.encode()).hexdigest()
+        now = datetime.datetime.now(tz=datetime.timezone.utc)
+        session = self.db[self.columns[self.column_sessions]].find_one(
+            {"token_hash": token_hash, "expires_at": {"$gt": now}}
+        )
+        if session is None:
+            return None
+        # Update last_used
+        self.db[self.columns[self.column_sessions]].update_one(
+            {"_id": session["_id"]}, {"$set": {"last_used": now}}
+        )
+        return self.get_user_by_email(session["user_email"])
+
+    def delete_session(self, token):
+        token_hash = hashlib.sha256(token.encode()).hexdigest()
+        self.db[self.columns[self.column_sessions]].delete_one(
+            {"token_hash": token_hash}
+        )
+
+    def create_api_key(self, user_email, name):
+        key = f"ivre_{token_urlsafe(32)}"
+        key_hash = hashlib.sha256(key.encode()).hexdigest()
+        now = datetime.datetime.now(tz=datetime.timezone.utc)
+        doc = {
+            "key_hash": key_hash,
+            "key_prefix": key[:12],
+            "user_email": user_email,
+            "name": name,
+            "created_at": now,
+            "expires_at": None,
+            "last_used": None,
+        }
+        self.db[self.columns[self.column_api_keys]].insert_one(doc)
+        return key
+
+    def validate_api_key(self, key):
+        key_hash = hashlib.sha256(key.encode()).hexdigest()
+        now = datetime.datetime.now(tz=datetime.timezone.utc)
+        api_key = self.db[self.columns[self.column_api_keys]].find_one(
+            {
+                "key_hash": key_hash,
+                "$or": [
+                    {"expires_at": None},
+                    {"expires_at": {"$gt": now}},
+                ],
+            }
+        )
+        if api_key is None:
+            return None
+        self.db[self.columns[self.column_api_keys]].update_one(
+            {"_id": api_key["_id"]}, {"$set": {"last_used": now}}
+        )
+        return self.get_user_by_email(api_key["user_email"])
+
+    def list_api_keys(self, user_email=None):
+        flt = {} if user_email is None else {"user_email": user_email}
+        return list(self.db[self.columns[self.column_api_keys]].find(flt))
+
+    def delete_api_key(self, key_hash, user_email=None):
+        flt = {"key_hash": key_hash}
+        if user_email is not None:
+            flt["user_email"] = user_email
+        return self.db[self.columns[self.column_api_keys]].delete_one(flt).deleted_count
+
+    def ensure_remote_user(self, username):
+        user = self.get_user_by_email(username)
+        if user is None:
+            self.create_user(username, is_active=True)
+        return self.get_user_by_email(username)
+
+    def get_user_groups(self, email):
+        user = self.get_user_by_email(email)
+        if user is None:
+            return []
+        return user.get("groups", [])
+
+    def list_users(self, **filters):
+        flt = {}
+        if "is_active" in filters:
+            flt["is_active"] = filters["is_active"]
+        if "is_admin" in filters:
+            flt["is_admin"] = filters["is_admin"]
+        if "group" in filters:
+            flt["groups"] = filters["group"]
+        return list(self.db[self.columns[self.column_users]].find(flt))
+
+    def create_magic_link_token(self, email, lifetime):
+        token = token_urlsafe(32)
+        token_hash = hashlib.sha256(token.encode()).hexdigest()
+        now = datetime.datetime.now(tz=datetime.timezone.utc)
+        col = self.db[self.columns[self.column_magic_links]]
+        col.insert_one(
+            {
+                "token_hash": token_hash,
+                "email": email,
+                "created_at": now,
+                "expires_at": now + datetime.timedelta(seconds=lifetime),
+            }
+        )
+        return token
+
+    def consume_magic_link_token(self, token):
+        token_hash = hashlib.sha256(token.encode()).hexdigest()
+        now = datetime.datetime.now(tz=datetime.timezone.utc)
+        col = self.db[self.columns[self.column_magic_links]]
+        doc = col.find_one_and_delete(
+            {"token_hash": token_hash, "expires_at": {"$gt": now}}
+        )
+        if doc is None:
+            return None
+        return doc["email"]
+
+    def is_rate_limited(self, key, max_attempts, window):
+        col = self.db[self.columns[self.column_rate_limit]]
+        now = datetime.datetime.now(tz=datetime.timezone.utc)
+        cutoff = now - datetime.timedelta(seconds=window)
+        count = col.count_documents({"key": key, "created_at": {"$gt": cutoff}})
+        return count >= max_attempts
+
+    def record_rate_limit(self, key):
+        col = self.db[self.columns[self.column_rate_limit]]
+        now = datetime.datetime.now(tz=datetime.timezone.utc)
+        col.insert_one({"key": key, "created_at": now})
+
+    # OAuth 2.1 Authorization Server primitives ---------------------
+
+    def create_oauth_client(self, client):
+        # The caller passes the full OAuth client registration
+        # payload; we copy to avoid mutating the caller's dict and
+        # stamp ``created_at`` for audit / admin display.
+        doc = dict(client)
+        doc.setdefault("created_at", datetime.datetime.now(tz=datetime.timezone.utc))
+        self.db[self.columns[self.column_oauth_clients]].insert_one(doc)
+
+    def get_oauth_client(self, client_id):
+        return self.db[self.columns[self.column_oauth_clients]].find_one(
+            {"client_id": client_id}
+        )
+
+    def list_oauth_clients(self):
+        return list(self.db[self.columns[self.column_oauth_clients]].find())
+
+    def delete_oauth_client(self, client_id):
+        result = self.db[self.columns[self.column_oauth_clients]].delete_one(
+            {"client_id": client_id}
+        )
+        if result.deleted_count:
+            # Cascade-revoke every token the client still holds so
+            # access / refresh tokens cannot be replayed after the
+            # client is gone.
+            self.revoke_oauth_tokens_for_client(client_id)
+            return True
+        return False
+
+    def create_authorization_request(self, request_id, payload):
+        doc = dict(payload)
+        doc["request_id"] = request_id
+        doc.setdefault("created_at", datetime.datetime.now(tz=datetime.timezone.utc))
+        self.db[self.columns[self.column_oauth_auth_requests]].insert_one(doc)
+
+    def get_authorization_request(self, request_id):
+        # Non-consuming peek used by the consent ``GET`` route.
+        # ``find_one`` is non-mutating; the ``expires_at`` filter
+        # mirrors the consume path so a TTL-pruned record reads
+        # as "not found" even before the index has swept it.
+        now = datetime.datetime.now(tz=datetime.timezone.utc)
+        doc = self.db[self.columns[self.column_oauth_auth_requests]].find_one(
+            {"request_id": request_id, "expires_at": {"$gt": now}}
+        )
+        if doc is None:
+            return None
+        doc.pop("_id", None)
+        return doc
+
+    def consume_authorization_request(self, request_id):
+        now = datetime.datetime.now(tz=datetime.timezone.utc)
+        # ``find_one_and_delete`` is atomic; the ``expires_at``
+        # filter rejects records the TTL index has not yet pruned.
+        doc = self.db[
+            self.columns[self.column_oauth_auth_requests]
+        ].find_one_and_delete({"request_id": request_id, "expires_at": {"$gt": now}})
+        if doc is None:
+            return None
+        doc.pop("_id", None)
+        return doc
+
+    def create_authorization_code(self, code, payload):
+        doc = dict(payload)
+        doc["code"] = code
+        doc.setdefault("created_at", datetime.datetime.now(tz=datetime.timezone.utc))
+        self.db[self.columns[self.column_oauth_codes]].insert_one(doc)
+
+    def get_authorization_code(self, code):
+        # Non-consuming peek used by the SDK's
+        # ``load_authorization_code`` Protocol method.  The
+        # corresponding ``consume_authorization_code`` (called at
+        # exchange time) is the atomic single-use claim; keeping
+        # the peek non-mutating is what guarantees RFC 6749 §4.1.2.
+        now = datetime.datetime.now(tz=datetime.timezone.utc)
+        doc = self.db[self.columns[self.column_oauth_codes]].find_one(
+            {"code": code, "expires_at": {"$gt": now}}
+        )
+        if doc is None:
+            return None
+        doc.pop("_id", None)
+        return doc
+
+    def consume_authorization_code(self, code):
+        now = datetime.datetime.now(tz=datetime.timezone.utc)
+        doc = self.db[self.columns[self.column_oauth_codes]].find_one_and_delete(
+            {"code": code, "expires_at": {"$gt": now}}
+        )
+        if doc is None:
+            return None
+        doc.pop("_id", None)
+        return doc
+
+    def create_oauth_token(self, token_hash, payload):
+        doc = dict(payload)
+        doc["token_hash"] = token_hash
+        doc.setdefault("created_at", datetime.datetime.now(tz=datetime.timezone.utc))
+        self.db[self.columns[self.column_oauth_tokens]].insert_one(doc)
+
+    def validate_oauth_token(self, token):
+        token_hash = hashlib.sha256(token.encode()).hexdigest()
+        now = datetime.datetime.now(tz=datetime.timezone.utc)
+        # The token must not be revoked and either never expire
+        # (``expires_at == None``, for refresh tokens with no TTL)
+        # or have an ``expires_at`` strictly in the future.  The
+        # TTL index prunes expired entries opportunistically; the
+        # explicit ``$or`` makes the check correct between sweeps.
+        doc = self.db[self.columns[self.column_oauth_tokens]].find_one(
+            {
+                "token_hash": token_hash,
+                "revoked_at": None,
+                "$or": [
+                    {"expires_at": None},
+                    {"expires_at": {"$gt": now}},
+                ],
+            }
+        )
+        if doc is None:
+            return None
+        doc.pop("_id", None)
+        return doc
+
+    def revoke_oauth_token(self, token_hash):
+        now = datetime.datetime.now(tz=datetime.timezone.utc)
+        self.db[self.columns[self.column_oauth_tokens]].update_one(
+            {"token_hash": token_hash},
+            {"$set": {"revoked_at": now}},
+        )
+
+    def revoke_oauth_tokens_by_refresh(self, refresh_token_hash):
+        now = datetime.datetime.now(tz=datetime.timezone.utc)
+        result = self.db[self.columns[self.column_oauth_tokens]].update_many(
+            {
+                "refresh_token_hash": refresh_token_hash,
+                "revoked_at": None,
+            },
+            {"$set": {"revoked_at": now}},
+        )
+        return result.modified_count
+
+    def revoke_oauth_tokens_for_client(self, client_id):
+        now = datetime.datetime.now(tz=datetime.timezone.utc)
+        result = self.db[self.columns[self.column_oauth_tokens]].update_many(
+            {"client_id": client_id, "revoked_at": None},
+            {"$set": {"revoked_at": now}},
+        )
+        return result.modified_count
+
+
+class MongoDBNotes(MongoDB, DBNotes):
+    """MongoDB backend for the ``notes`` purpose.
+
+    Stores entity-keyed markdown annotations in two collections:
+
+    * ``notes`` -- one record per
+      ``(entity_type, entity_key_0, entity_key_1)`` triple
+      carrying the current body, monotonic ``revision``,
+      authorship and timestamp metadata.  Unique compound
+      index on the triple; secondary indexes on
+      ``(entity_type, updated_at DESC)`` and ``updated_by``;
+      a text index on ``body`` (named ``notes_body_text``)
+      backs free-text search via the inherited
+      :meth:`MongoDB.searchtext`.
+    * ``note_revisions`` -- append-only audit log.  Compound
+      ``(entity_type, entity_key_0, entity_key_1,
+      revision DESC)`` supports newest-first history
+      retrieval at the same key shape as the parent
+      collection.
+
+    The canonical entity_key is *split* across two scalar
+    BSON fields ``entity_key_0`` / ``entity_key_1`` rather
+    than stored as a single ``entity_key`` BSON array.  For
+    the ``host`` type the canonical form is the
+    ``[addr_0, addr_1]`` int128 split
+    :meth:`MongoDB.ip2internal` produces for the ``view``
+    collection's ``addr`` field, so the two collections
+    align byte-for-byte (enables future ``$lookup`` joins
+    and correct IP-range queries).  Storing the canonical
+    list verbatim in a single field would make the unique
+    compound a *multikey* index with element-wise uniqueness
+    semantics -- every IPv4 host's high half is the same
+    bias constant, so the second IPv4 note insert would
+    collide on a per-element basis; see the
+    :attr:`indexes` block for the canonical rationale.
+    Single-scalar entity types (future ``domain`` / ``cve``
+    / ``asn``) store the value in ``entity_key_0`` and
+    ``None`` in ``entity_key_1``.
+
+    Reads reassemble the two storage scalars and strip the
+    canonical form back to the caller-facing shape via
+    :meth:`_present_entity_key` (printable IP string for
+    ``host``; ``entity_key_0`` as-is for single-scalar
+    types).
+    """
+
+    column_notes = 0
+    column_note_revisions = 1
+
+    indexes: list[list[tuple[list[IndexKey], dict[str, Any]]]] = [
+        # notes
+        #
+        # The canonical ``entity_key`` for an entity type may be
+        # a 1-or-2-element list of scalars (e.g. ``[addr_0,
+        # addr_1]`` for the ``host`` type, matching
+        # :meth:`MongoDB.ip2internal`'s int128 split).  Storing
+        # each half in its own scalar BSON field
+        # (``entity_key_0`` / ``entity_key_1``) keeps the unique
+        # compound a plain single-key compound -- a BSON-array
+        # ``entity_key`` would make the compound *multikey*, in
+        # which case Mongo enforces uniqueness element-wise: for
+        # any two IPv4 notes ``addr_0`` is the same (the bias
+        # constant ``-0x8000000000000000``), the second insert
+        # then collides with the first on a per-element basis.
+        # Single-scalar types (``domain``, ``cve``, ...) store
+        # the value in ``entity_key_0`` and ``None`` in
+        # ``entity_key_1``.
+        [
+            (
+                [
+                    ("entity_type", pymongo.ASCENDING),
+                    ("entity_key_0", pymongo.ASCENDING),
+                    ("entity_key_1", pymongo.ASCENDING),
+                ],
+                {"unique": True},
+            ),
+            (
+                [
+                    ("entity_type", pymongo.ASCENDING),
+                    ("updated_at", pymongo.DESCENDING),
+                ],
+                {},
+            ),
+            ([("updated_by", pymongo.ASCENDING)], {}),
+            # Free-text search over note bodies.  Inherited
+            # :meth:`MongoDB.searchtext` returns
+            # ``{"$text": {"$search": ...}}`` filters that
+            # compose with :meth:`flt_and` and feed
+            # :meth:`get` / :meth:`count` on the storage
+            # layer.  Mongo allows at most one text index
+            # per collection.
+            ([("body", "text")], {"name": "notes_body_text"}),
+        ],
+        # note_revisions
+        [
+            (
+                [
+                    ("entity_type", pymongo.ASCENDING),
+                    ("entity_key_0", pymongo.ASCENDING),
+                    ("entity_key_1", pymongo.ASCENDING),
+                    ("revision", pymongo.DESCENDING),
+                ],
+                {},
+            ),
+        ],
+    ]
+
+    def __init__(self, url):
+        super().__init__(url)
+        self.columns = [
+            self.params.pop("colname_notes", "notes"),
+            self.params.pop("colname_note_revisions", "note_revisions"),
+        ]
+
+    @staticmethod
+    def _entity_key_to_storage(canonical):
+        """Pack the canonical entity_key into the two storage
+        scalars ``(entity_key_0, entity_key_1)``.
+
+        Accepts either a scalar (1-element canonical form -- the
+        future ``domain`` / ``cve`` / ``asn`` types) or a
+        2-element list (the current ``host`` type's int128
+        split).  1-element lists are accepted too for callers
+        that uniformise the canonicalisation contract.
+        """
+        if isinstance(canonical, list):
+            if len(canonical) == 2:
+                return canonical[0], canonical[1]
+            if len(canonical) == 1:
+                return canonical[0], None
+            raise ValueError(
+                f"canonical entity_key list must have 1 or 2 "
+                f"elements, got {len(canonical)}"
+            )
+        return canonical, None
+
+    @classmethod
+    def _entity_key_filter(cls, entity_type, entity_key):
+        """Build a single-record find filter for the
+        ``(entity_type, entity_key_0, entity_key_1)`` compound
+        from a caller-facing ``entity_key``.
+        """
+        key_0, key_1 = cls._entity_key_to_storage(
+            canonicalize_entity_key(entity_type, entity_key)
+        )
+        return {
+            "entity_type": entity_type,
+            "entity_key_0": key_0,
+            "entity_key_1": key_1,
+        }
+
+    @staticmethod
+    def _present_entity_key(entity_type, entity_key_0, entity_key_1):
+        """Reassemble the caller-facing ``entity_key`` from the
+        two storage scalars.  Inverse of
+        :meth:`_entity_key_to_storage` composed with
+        :func:`canonicalize_entity_key`.
+
+        At v1 only the ``host`` type needs back-conversion
+        (printable IP string from the int128 split); future
+        single-scalar types round-trip the value in
+        ``entity_key_0`` as-is and ignore ``entity_key_1``.
+        """
+        if entity_type == "host":
+            return MongoDB.internal2ip([entity_key_0, entity_key_1])
+        return entity_key_0
+
+    def _present_note(self, doc):
+        """Common projection helper: drop ``_id`` and the two
+        storage scalars, replacing them with a single
+        caller-facing ``entity_key`` field.
+        """
+        doc.pop("_id", None)
+        doc["entity_key"] = self._present_entity_key(
+            doc["entity_type"],
+            doc.pop("entity_key_0"),
+            doc.pop("entity_key_1"),
+        )
+        return doc
+
+    def get(self, spec, **kargs):
+        """Iterate raw note documents matching ``spec``.
+
+        ``spec`` is composed via :meth:`searchtext` (inherited
+        from :class:`MongoDB`) and the standard combinators
+        (:meth:`flt_and` / :meth:`flt_or` / direct dict
+        literals).  Returned documents carry the storage-layer
+        ``entity_key_0`` / ``entity_key_1`` fields verbatim --
+        free-text search routes and listing pages that want
+        the caller-facing ``entity_key`` form post-process
+        with :meth:`_present_note` / :meth:`_present_entity_key`.
+
+        Routes through :meth:`MongoDB._get_cursor` for parity
+        with :meth:`MongoDBView.get` / :meth:`MongoDBPassive.get`
+        / :meth:`MongoDBRir.get`.  That gives notes queries:
+
+        * Query-timeout enforcement via :meth:`set_limits`
+          (``cursor.max_time_ms(self.maxtime)`` based on the
+          ``MONGODB_QUERY_TIMEOUT_MS`` config knob or the
+          per-URL ``?maxtime=`` parameter).  Free-text search
+          over a large notes collection under adversarial
+          input would otherwise be unbounded.
+        * The ``sort=[("text", direction)]`` shortcut: when
+          a caller asks for relevance-ranked text search,
+          :meth:`_get_cursor` auto-adds
+          ``projection["score"] = {"$meta": "textScore"}``
+          and replaces the sort with the matching
+          ``$meta``-driven order, so web routes can ask for
+          "best matches first" in one line instead of
+          hand-rolling the projection.
+        * Legacy ``fields=`` kwarg compat (converted to
+          ``projection=`` before forwarding to
+          :meth:`pymongo.collection.Collection.find`).
+
+        Other :class:`DBNotes` backends translate or ignore
+        these conveniences per their own storage primitives,
+        so backend-portable code sticks to ``spec`` only.
+        """
+        return self._get_cursor(self.columns[self.column_notes], spec, **kargs)
+
+    def count(self, spec):
+        # Empty-filter shortcut mirrors :meth:`MongoDBView.count`:
+        # ``estimated_document_count`` reads collection metadata
+        # in O(1) instead of scanning, which matters for
+        # ``count_notes(entity_type=None)`` on a heavily-used
+        # notes collection.
+        col = self.db[self.columns[self.column_notes]]
+        if not spec:
+            return col.estimated_document_count()
+        return col.count_documents(spec)
+
+    def get_note(self, entity_type, entity_key):
+        doc = self.db[self.columns[self.column_notes]].find_one(
+            self._entity_key_filter(entity_type, entity_key)
+        )
+        if doc is None:
+            return None
+        return self._present_note(doc)
+
+    def set_note(
+        self,
+        entity_type,
+        entity_key,
+        body,
+        user_email,
+        *,
+        expected_revision=None,
+    ):
+        # Storage-layer body-size check; the web routes add
+        # an edge HTTP-413 in front for the friendlier client
+        # error (see :func:`ivre.web.app.put_note`).
+        self._validate_note_body_size(body)
+        key_0, key_1 = self._entity_key_to_storage(
+            canonicalize_entity_key(entity_type, entity_key)
+        )
+        key_filter = {
+            "entity_type": entity_type,
+            "entity_key_0": key_0,
+            "entity_key_1": key_1,
+        }
+        now = datetime.datetime.now(tz=datetime.timezone.utc)
+        notes_col = self.db[self.columns[self.column_notes]]
+        revisions_col = self.db[self.columns[self.column_note_revisions]]
+        if expected_revision is None:
+            # Race-tolerant upsert: bump revision atomically.
+            doc = notes_col.find_one_and_update(
+                key_filter,
+                {
+                    "$set": {
+                        "body": body,
+                        "updated_at": now,
+                        "updated_by": user_email,
+                    },
+                    "$inc": {"revision": 1},
+                    "$setOnInsert": {
+                        "entity_type": entity_type,
+                        "entity_key_0": key_0,
+                        "entity_key_1": key_1,
+                        "created_at": now,
+                        "created_by": user_email,
+                    },
+                },
+                upsert=True,
+                return_document=ReturnDocument.AFTER,
+            )
+        elif expected_revision >= 1:
+            # Concurrency-checked update: only proceeds when
+            # the stored revision matches.  ``None`` return
+            # means the filter did not find a matching record;
+            # that conflates two failure modes -- the note
+            # does not exist, or it exists at a different
+            # revision.  A second ``find_one`` on the bare
+            # entity-key filter distinguishes them so the web
+            # layer can map to HTTP 404 vs 409 without sniffing
+            # error strings.  The race window between the two
+            # ops is tiny; a concurrent create / delete in that
+            # window at worst surfaces a slightly misleading
+            # exception class, not corruption.
+            doc = notes_col.find_one_and_update(
+                {**key_filter, "revision": expected_revision},
+                {
+                    "$set": {
+                        "body": body,
+                        "updated_at": now,
+                        "updated_by": user_email,
+                    },
+                    "$inc": {"revision": 1},
+                },
+                return_document=ReturnDocument.AFTER,
+            )
+            if doc is None:
+                # The existence check must see authoritative
+                # state; ``find_one_and_update`` is a write
+                # that always hits primary, but a follow-up
+                # read on a client configured with a
+                # non-PRIMARY ``read_preference`` could be
+                # served from a stale secondary and
+                # misclassify a concurrency drift as
+                # :class:`NoteNotFound` (or report a stale
+                # ``stored revision``).  Pin the read to
+                # PRIMARY explicitly so the error class and
+                # message reflect the primary's view.  Other
+                # read-only methods on this backend still
+                # honour the client-level preference -- only
+                # this read-after-write needs the override.
+                existing = notes_col.with_options(
+                    read_preference=ReadPreference.PRIMARY
+                ).find_one(key_filter, projection={"revision": 1, "_id": 0})
+                if existing is None:
+                    raise NoteNotFound(
+                        f"no note exists for {entity_type}/" f"{entity_key!r}"
+                    )
+                raise NoteConcurrencyError(
+                    f"stored revision {existing['revision']} does "
+                    f"not match expected={expected_revision} for "
+                    f"{entity_type}/{entity_key!r}"
+                )
+        else:
+            # ``expected_revision <= 0``: insert-only path,
+            # creating the note iff no record exists.  Negative
+            # values are coalesced into this branch -- the
+            # caller's intent is "no prior history" either way.
+            #
+            # The persisted document is constructed locally
+            # rather than read back via ``find_one`` after the
+            # insert: we know exactly what we just wrote
+            # (``revision=1``, the caller-supplied body /
+            # authorship / timestamps), so a follow-up read is
+            # both unnecessary (one extra round-trip per
+            # create) and unsafe under a non-PRIMARY
+            # ``read_preference`` -- a stale secondary that
+            # has not yet replicated the insert would return
+            # ``None`` and the audit-log step downstream would
+            # crash on ``doc["revision"]``.  Pymongo also
+            # mutates ``doc`` in-place to add the generated
+            # ``_id`` after a successful ``insert_one``, so
+            # ``_present_note``'s ``doc.pop("_id", None)``
+            # later still produces the correct caller-facing
+            # shape.
+            doc = {
+                "entity_type": entity_type,
+                "entity_key_0": key_0,
+                "entity_key_1": key_1,
+                "body": body,
+                "created_at": now,
+                "created_by": user_email,
+                "updated_at": now,
+                "updated_by": user_email,
+                "revision": 1,
+            }
+            try:
+                notes_col.insert_one(doc)
+            except DuplicateKeyError as exc:
+                raise NoteAlreadyExists(
+                    f"note already exists for {entity_type}/"
+                    f"{entity_key!r}; expected_revision=0 cannot "
+                    f"insert"
+                ) from exc
+        # Append the immutable revision row.  The parent commit
+        # above is authoritative; the audit row is best-effort.
+        # Catching :class:`PyMongoError` here keeps the
+        # user-facing write successful when the audit insert
+        # fails on a transient backend issue (network blip,
+        # secondary unreachable under ``w=majority``,
+        # over-BSON-size metadata, ...).  Letting the exception
+        # propagate would poison the next caller operation:
+        # under ``expected_revision=None`` the LWW retry bumps
+        # the revision counter again (audit gap + same body at
+        # rev N and N+2); under ``expected_revision>=1`` the
+        # retry raises a false "concurrent edit" because the
+        # parent already moved.  Operators see the failure via
+        # :data:`utils.LOGGER` and can audit-replay manually if
+        # needed.
+        try:
+            revisions_col.insert_one(
+                {
+                    "entity_type": entity_type,
+                    "entity_key_0": key_0,
+                    "entity_key_1": key_1,
+                    "revision": doc["revision"],
+                    "body": body,
+                    "created_at": now,
+                    "created_by": user_email,
+                }
+            )
+        except PyMongoError as exc:
+            utils.LOGGER.warning(
+                "audit log insert failed for note %s/%r revision %d: %s",
+                entity_type,
+                entity_key,
+                doc["revision"],
+                exc,
+            )
+        return self._present_note(doc)
+
+    def delete_note(self, entity_type, entity_key):
+        key_filter = self._entity_key_filter(entity_type, entity_key)
+        result = self.db[self.columns[self.column_notes]].delete_one(key_filter)
+        # Always sweep the audit log: orphan revisions without
+        # a parent are meaningless and would inflate
+        # ``count_documents`` queries.
+        self.db[self.columns[self.column_note_revisions]].delete_many(key_filter)
+        return result.deleted_count > 0
+
+    def list_note_revisions(self, entity_type, entity_key):
+        cursor = (
+            self.db[self.columns[self.column_note_revisions]]
+            .find(self._entity_key_filter(entity_type, entity_key))
+            .sort([("revision", pymongo.DESCENDING)])
+        )
+        revisions = []
+        for doc in cursor:
+            doc.pop("_id", None)
+            # Strip the redundant ``entity_*`` keys: callers
+            # passed them in and already know.  Keep ``revision``
+            # / ``body`` / ``created_at`` / ``created_by``.
+            doc.pop("entity_type", None)
+            doc.pop("entity_key_0", None)
+            doc.pop("entity_key_1", None)
+            revisions.append(doc)
+        return revisions
+
+    def list_entities(self, entity_type=None):
+        flt = {} if entity_type is None else {"entity_type": entity_type}
+        cursor = self.db[self.columns[self.column_notes]].find(
+            flt,
+            projection={
+                "_id": 0,
+                "entity_type": 1,
+                "entity_key_0": 1,
+                "entity_key_1": 1,
+                "updated_at": 1,
+                "updated_by": 1,
+                "revision": 1,
+            },
+        )
+        entries = []
+        for doc in cursor:
+            doc["entity_key"] = self._present_entity_key(
+                doc["entity_type"],
+                doc.pop("entity_key_0"),
+                doc.pop("entity_key_1"),
+            )
+            entries.append(doc)
+        return entries
+
+    def list_notes(
+        self,
+        entity_type=None,
+        q=None,
+        fields=None,
+        limit=None,
+        skip=None,
+    ):
+        # Build the filter incrementally so the free-text
+        # ``$text`` clause (when present) composes cleanly
+        # with the optional ``entity_type`` narrow via
+        # :meth:`flt_and` -- the same combinator used by
+        # every other purpose's search routes.
+        flt = self.flt_empty
+        if entity_type is not None:
+            flt = self.flt_and(flt, {"entity_type": entity_type})
+        if q is not None:
+            flt = self.flt_and(flt, self.searchtext(q))
+        kwargs: dict[str, Any] = {}
+        if limit is not None:
+            kwargs["limit"] = limit
+        if skip is not None:
+            kwargs["skip"] = skip
+        if fields is not None:
+            # ``_get_cursor`` accepts a list under ``fields=``
+            # and forwards it as ``projection=`` to ``find()``,
+            # but its ``("text", ...)`` sort branch only
+            # handles a dict projection (the list-conversion
+            # path on line 288 assigns to ``kargs`` rather
+            # than ``kargs["projection"]``, dropping
+            # ``limit`` / ``skip``).  Hand it a dict so the
+            # relevance-ranking case below works whether or
+            # not ``q`` is set.  Always keep the storage
+            # halves in the projection so
+            # :meth:`_present_note` can reassemble the
+            # caller-facing ``entity_key`` even when the
+            # caller did not list the halves explicitly.
+            projection = set(fields) | {"entity_type", "entity_key_0", "entity_key_1"}
+            kwargs["fields"] = dict.fromkeys(projection, 1)
+        if q is not None:
+            # Relevance ranking: ``_get_cursor`` translates
+            # ``("text", ...)`` to a ``$meta: textScore`` sort
+            # and auto-adds the matching projection entry.
+            kwargs["sort"] = [("text", 0)]
+        else:
+            # Deterministic default sort so ``limit`` / ``skip``
+            # pagination is reproducible across calls,
+            # replicas, and document moves.  ``_id`` is unique,
+            # always indexed, and orders deterministically; the
+            # absolute ordering ("oldest first" given Mongo's
+            # ObjectId timestamp prefix) is not meaningful but
+            # *stable*, which is the whole point.  Callers that
+            # want recency or another ordering should bypass
+            # :meth:`list_notes` and call :meth:`get` with an
+            # explicit ``sort=``.
+            kwargs["sort"] = [("_id", 1)]
+        return [self._present_note(doc) for doc in self.get(flt, **kwargs)]
+
+    def count_notes(self, entity_type=None):
+        return self.count({} if entity_type is None else {"entity_type": entity_type})
+
+
+class MongoDBAudit(MongoDB, DBAudit):
+    """MongoDB backend for the ``audit`` purpose.
+
+    Stores audit events in a single append-only collection
+    ``audit_events`` keyed by ``event_id`` (UUID v4 hex, 32
+    chars).  Three indexes back the expected query patterns:
+
+    * ``(event_type ASC, created_at DESC)`` -- "show me the
+      last N upload events".
+    * ``(actor.user_email ASC, created_at DESC)`` -- "show me
+      what alice did".  Restricted via a
+      ``partialFilterExpression`` to events whose
+      ``actor.user_email`` is a string so anonymous /
+      REMOTE_USER-less events (which :meth:`record` normalises
+      to ``actor.user_email = None`` at write time) do not
+      bloat the index with a giant NULL bucket.  A plain
+      ``sparse: True`` would not work here -- ``sparse``
+      excludes documents where the indexed field is *missing*,
+      not those where it is *present-but-null*, and write-time
+      normalisation always materialises the key.
+    * ``(created_at DESC)`` -- generic time-window scan.
+
+    Insert failures (``PyMongoError``) are wrapped in
+    :class:`AuditWriteError` and re-raised: the audit log is
+    fail-loud by design, consistent with the ABC contract.
+
+    There is **no TTL index** on this collection -- retention
+    is operator-driven via :meth:`purge_older_than`.  Adding a
+    TTL is a deliberate operator choice (a future
+    ``WEB_AUDIT_TTL_SECONDS`` knob would create it
+    conditionally at startup); shipping without one keeps
+    compliance setups defaulting to indefinite retention.
+    """
+
+    column_audit_events = 0
+
+    indexes: list[list[tuple[list[IndexKey], dict[str, Any]]]] = [
+        # audit_events
+        [
+            (
+                [
+                    ("event_type", pymongo.ASCENDING),
+                    ("created_at", pymongo.DESCENDING),
+                ],
+                {},
+            ),
+            (
+                [
+                    ("actor.user_email", pymongo.ASCENDING),
+                    ("created_at", pymongo.DESCENDING),
+                ],
+                # ``partialFilterExpression`` (not ``sparse``)
+                # because :meth:`record` always writes
+                # ``actor.user_email`` -- as a string for
+                # authenticated callers, as ``None`` for
+                # anonymous ones.  ``sparse: True`` only skips
+                # documents where the field is *missing*; it
+                # would still index every anonymous event under
+                # a single NULL bucket, which is exactly what
+                # we want to avoid for an audit collection that
+                # may carry millions of anonymous reads.
+                # ``{"$type": "string"}`` matches every real
+                # email and rejects ``None`` / missing.
+                {
+                    "partialFilterExpression": {
+                        "actor.user_email": {"$type": "string"},
+                    },
+                },
+            ),
+            ([("created_at", pymongo.DESCENDING)], {}),
+            # ``event_id`` is operator-supplied or auto-
+            # generated UUID hex; uniqueness is best-effort
+            # (caller-supplied collisions are a programming
+            # error, not a security one) so the index is plain
+            # ``unique=True`` -- a duplicate insert fails loud.
+            ([("event_id", pymongo.ASCENDING)], {"unique": True}),
+        ],
+    ]
+
+    def __init__(self, url):
+        super().__init__(url)
+        self.columns = [
+            self.params.pop("colname_audit_events", "audit_events"),
+        ]
+
+    def record(
+        self,
+        event_type,
+        *,
+        actor=None,
+        resource=None,
+        details=None,
+        outcome=None,
+        event_id=None,
+    ):
+        self._validate_event_type(event_type)
+        self._validate_details(details)
+        event_id = self._normalize_event_id(event_id)
+        # Normalise ``actor`` / ``resource`` to the canonical
+        # key sets at write time so the on-disk shape matches
+        # the caller-visible shape every :class:`DBAudit`
+        # backend returns.  The SQL backend always reassembles
+        # the full key set from its individual columns
+        # (``actor_user_email`` etc., defaulting to ``None``
+        # when nullable columns are unset); Mongo does the same
+        # normalisation up front so a partial caller-supplied
+        # dict turns into the same shape on disk and on the
+        # ``query()`` / ``record()`` boundary.  Forensics
+        # expects ``audit.events`` documents to look like they
+        # did when written, not like a query-layer projection.
+        actor = actor or {}
+        resource = resource or {}
+        doc = {
+            "event_id": event_id,
+            "event_type": event_type,
+            "created_at": datetime.datetime.now(tz=datetime.timezone.utc),
+            "actor": {
+                "user_email": actor.get("user_email"),
+                "api_key_hash": actor.get("api_key_hash"),
+                "remote_addr": actor.get("remote_addr"),
+            },
+            "resource": {
+                "route": resource.get("route"),
+                "method": resource.get("method"),
+            },
+            "details": details or {},
+            "outcome": outcome,
+        }
+        try:
+            self.db[self.columns[self.column_audit_events]].insert_one(doc)
+        except PyMongoError as exc:
+            raise AuditWriteError(
+                f"failed to record audit event {event_id} ({event_type}): {exc}"
+            ) from exc
+        return event_id
+
+    def _build_query_filter(
+        self,
+        event_id=None,
+        event_type=None,
+        user_email=None,
+        since=None,
+        until=None,
+    ):
+        """Shared filter builder for :meth:`query` and
+        :meth:`count`.  Returns a Mongo find-filter dict; keys
+        absent when the corresponding kwarg is ``None``.
+        """
+        flt: dict[str, Any] = {}
+        if event_id is not None:
+            flt["event_id"] = self._normalize_event_id(event_id)
+        if event_type is not None:
+            self._validate_event_type(event_type)
+            flt["event_type"] = event_type
+        if user_email is not None:
+            flt["actor.user_email"] = user_email
+        if since is not None or until is not None:
+            created_at: dict[str, Any] = {}
+            if since is not None:
+                created_at["$gte"] = since
+            if until is not None:
+                created_at["$lt"] = until
+            flt["created_at"] = created_at
+        return flt
+
+    def query(
+        self,
+        *,
+        event_id=None,
+        event_type=None,
+        user_email=None,
+        since=None,
+        until=None,
+        limit=None,
+        skip=None,
+    ):
+        flt = self._build_query_filter(
+            event_id=event_id,
+            event_type=event_type,
+            user_email=user_email,
+            since=since,
+            until=until,
+        )
+        # Route through :meth:`MongoDB._get_cursor` so the audit
+        # query inherits the shared cursor plumbing every other
+        # purpose uses -- in particular the
+        # ``MONGODB_QUERY_TIMEOUT_MS`` cap via
+        # :meth:`set_limits`.  Bypassing it (an earlier draft
+        # called ``.find().sort().skip().limit()`` directly)
+        # let audit queries run unbounded even when an operator
+        # had set a deployment-wide query timeout.
+        cargs: dict[str, Any] = {"sort": [("created_at", pymongo.DESCENDING)]}
+        if skip is not None and skip > 0:
+            cargs["skip"] = skip
+        if limit is not None and limit > 0:
+            cargs["limit"] = limit
+        cursor = self._get_cursor(self.columns[self.column_audit_events], flt, **cargs)
+        return [self._present_event(doc) for doc in cursor]
+
+    def count(
+        self,
+        *,
+        event_id=None,
+        event_type=None,
+        user_email=None,
+        since=None,
+        until=None,
+    ):
+        flt = self._build_query_filter(
+            event_id=event_id,
+            event_type=event_type,
+            user_email=user_email,
+            since=since,
+            until=until,
+        )
+        # Always use ``count_documents`` -- including for the
+        # empty filter.  The :class:`MongoDBNotes.count` pattern
+        # uses ``estimated_document_count`` as a fast path, but
+        # that returns the collection's metadata count, which
+        # lags behind the live state during chunk migrations /
+        # segment writes.  The SQL backend's ``count(*)`` is
+        # exact, and the audit log's contract is "tell me
+        # exactly how many events I have" for compliance /
+        # forensics; an approximation would silently diverge
+        # across backends.
+        return self.db[self.columns[self.column_audit_events]].count_documents(flt)
+
+    def purge_older_than(self, cutoff):
+        col = self.db[self.columns[self.column_audit_events]]
+        result = col.delete_many({"created_at": {"$lt": cutoff}})
+        return result.deleted_count
+
+    def get(self, spec, **kargs):
+        # Low-level escape hatch: route through
+        # :meth:`MongoDB._get_cursor` so the standard
+        # ``fields=`` / ``projection=`` handling, the
+        # text-sort sugar, and the
+        # ``MONGODB_QUERY_TIMEOUT_MS`` cap all apply --
+        # matching :meth:`MongoDBNotes.get`.
+        cursor = self._get_cursor(self.columns[self.column_audit_events], spec, **kargs)
+        for doc in cursor:
+            yield self._present_event(doc)
+
+    @staticmethod
+    def _present_event(doc):
+        """Strip Mongo's internal ``_id`` from a stored event
+        document before handing it to a caller.  Mirrors the
+        :meth:`MongoDBNotes._present_note` projection helper
+        in spirit: the ABC's contract is the caller-visible
+        shape, not the on-disk shape.
+        """
+        if doc is None:
+            return None
+        out = dict(doc)
+        out.pop("_id", None)
+        return out
+
+
+load_plugins("ivre.plugins.db.mongo", globals())

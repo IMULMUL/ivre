@@ -1,7 +1,7 @@
 #! /usr/bin/env python
 
 # This file is part of IVRE.
-# Copyright 2011 - 2021 Pierre LALET <pierre@droids-corp.org>
+# Copyright 2011 - 2026 Pierre LALET <pierre@droids-corp.org>
 #
 # IVRE is free software: you can redistribute it and/or modify it
 # under the terms of the GNU General Public License as published by
@@ -21,21 +21,17 @@ files.
 
 """
 
-
-import codecs
+import os
+import struct
+import sys
 from functools import partial, reduce
 from multiprocessing import Pool
-import os
-import sys
-import struct
-
 
 from ivre import config, utils
 from ivre.db import DBData
 
 
 class MaxMindFileIter:
-
     """Iterator for MaxMindFile"""
 
     def __init__(self, base):
@@ -58,7 +54,7 @@ class MaxMindFileIter:
                 self.current.append(self.nextval)
                 self.nextval = 0
             next_node_no = self.base.read_record(node_no, flag)
-            if next_node_no == 0:
+            if not next_node_no:
                 raise Exception("Invalid file format")
             if next_node_no >= self.base.node_count:
                 pos = (
@@ -94,7 +90,6 @@ class MaxMindFileIter:
 
 
 class EmptyMaxMindFile:
-
     """Stub to replace MaxMind databases parsers. Used when a file is
     missing to emit a warning message and return empty results.
 
@@ -109,7 +104,6 @@ class EmptyMaxMindFile:
 
 
 class MaxMindFile:
-
     """Parser for MaxMind databases.
 
     Code copied and adapted from
@@ -151,7 +145,7 @@ class MaxMindFile:
         return reduce(
             lambda x, y: (x << 8) + y,
             struct.unpack(
-                "%dB" % size,
+                f"{size}B",
                 self.data[pos : pos + size],
             ),
             0,
@@ -168,7 +162,7 @@ class MaxMindFile:
             val2 = self.read_value(pos + base_pos, size)
             pointer = (val1 << (8 * size)) + val2 + self.POINTER_BASE_VALUES[size]
             return pos + size, self.decode(pointer, base_pos)[1]
-        if type_ == 0:
+        if not type_:
             # extended type
             type_ = 7 + self.read_byte(pos + base_pos)
             pos += 1
@@ -233,25 +227,25 @@ class MaxMindFile:
             val = bool(size)
         else:
             # unknown
-            raise Exception("TODO type == %d (unknown)" % type_)
+            raise Exception(f"TODO type == {type_} (unknown)")
         return pos, val
 
     def read_record(self, node_no, flag):
         rec_byte_size = self.node_byte_size // 2
         pos = self.node_byte_size * node_no
         middle = self.read_byte(pos + rec_byte_size) if self.node_byte_size % 2 else 0
-        if flag == 0:  # left
-            val = self.read_value(pos, rec_byte_size)
-            val += ((middle & 0xF0) << 20) if middle else 0
-        else:  # right
+        if flag:  # right
             val = self.read_value(
                 pos + self.node_byte_size - rec_byte_size, rec_byte_size
             )
             val += ((middle & 0xF) << 24) if middle else 0
+        else:  # left
+            val = self.read_value(pos, rec_byte_size)
+            val += ((middle & 0xF0) << 20) if middle else 0
         return val
 
     def __repr__(self):
-        return "<%s from %s>" % (self.__class__.__name__, self.path)
+        return f"<{self.__class__.__name__} from {self.path}>"
 
     def lookup(self, ip):
         node_no = 0
@@ -259,7 +253,7 @@ class MaxMindFile:
         for i in range(96 if self.ip_version == 4 else 0, 128):
             flag = (addr >> (127 - i)) & 1
             next_node_no = self.read_record(node_no, flag)
-            if next_node_no == 0:
+            if not next_node_no:
                 raise Exception("Invalid file format")
             if next_node_no >= self.node_count:
                 pos = next_node_no - self.node_count - self.DATA_SECTION_SEPARATOR_SIZE
@@ -316,7 +310,6 @@ class MaxMindFile:
 
 
 class MaxMindDBData(DBData):
-
     LANG = "en"
 
     AS_KEYS = {
@@ -362,7 +355,7 @@ class MaxMindDBData(DBData):
                 name = subdb.metadata["database_type"].lower()
                 if name.startswith("geolite2-"):
                     name = name[9:]
-                setattr(self, "_db_%s" % name, subdb)
+                setattr(self, f"_db_{name}", subdb)
 
     def as_byip(self, addr):
         return {
@@ -441,7 +434,7 @@ class MaxMindDBData(DBData):
         ):
             if data[0] > 0xFFFFFFFF:  # only IPv4
                 break
-            fdesc.write("%d,%d,%d\n" % data)
+            fdesc.write(f"{data[0]},{data[1]},{data[2]}\n")
 
     def dump_country_ranges(self, fdesc):
         for data in self.db_country.get_ranges(
@@ -450,7 +443,7 @@ class MaxMindDBData(DBData):
         ):
             if data[0] > 0xFFFFFFFF:  # only IPv4
                 break
-            fdesc.write("%d,%d,%s\n" % data)
+            fdesc.write(f"{data[0]},{data[1]},{data[2]}\n")
 
     def dump_registered_country_ranges(self, fdesc):
         for data in self.db_country.get_ranges(
@@ -459,14 +452,14 @@ class MaxMindDBData(DBData):
         ):
             if data[0] > 0xFFFFFFFF:  # only IPv4
                 break
-            fdesc.write("%d,%d,%s\n" % data)
+            fdesc.write(f"{data[0]},{data[1]},{data[2]}\n")
 
     def dump_city_ranges(self, fdesc):
         for data in self.db_city.get_ranges(
             [
                 "country->iso_code",
                 "subdivisions->0->iso_code",
-                "city->names->%s" % config.GEOIP_LANG,
+                f"city->names->{config.GEOIP_LANG}",
                 "city->geoname_id",
             ],
             cond=lambda line: (
@@ -475,17 +468,11 @@ class MaxMindDBData(DBData):
         ):
             if data[0] > 0xFFFFFFFF:  # only IPv4
                 break
+            data_4_fixed = utils.encode_b64((data[4] or "").encode("utf-8")).decode(
+                "utf-8"
+            )
             fdesc.write(
-                "%d,%d,%s,%s,%s,%s\n"
-                % (
-                    data[:4]
-                    + (
-                        utils.encode_b64((data[4] or "").encode("utf-8")).decode(
-                            "utf-8"
-                        ),
-                    )
-                    + data[5:]
-                )
+                f"{data[0]},{data[1]},{data[2]},{data[3]},{data_4_fixed},{data[5]}\n"
             )
 
     def build_dumps(self, force=False):
@@ -524,7 +511,7 @@ class MaxMindDBData(DBData):
             return
         if not subdb.path.endswith(".mmdb"):
             return
-        csv_file = subdb.path[:-4] + "dump-IPv4.csv"
+        csv_file = f"{subdb.path[:-4]}dump-IPv4.csv"
         if attr == "db_registered_country":
             if "Country" not in csv_file:
                 utils.LOGGER.error(
@@ -550,5 +537,5 @@ class MaxMindDBData(DBData):
         utils.LOGGER.info(
             "Dumping %r to %r", os.path.basename(subdb.path), os.path.basename(csv_file)
         )
-        with codecs.open(csv_file, mode="w", encoding="utf-8") as fdesc:
+        with open(csv_file, mode="w", encoding="utf-8") as fdesc:
             dumper(fdesc)

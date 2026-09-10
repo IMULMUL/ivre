@@ -1,8 +1,7 @@
 #! /usr/bin/env python
-# -*- coding: utf-8 -*-
 
 # This file is part of IVRE.
-# Copyright 2011 - 2021 Pierre LALET <pierre@droids-corp.org>
+# Copyright 2011 - 2024 Pierre LALET <pierre@droids-corp.org>
 #
 # IVRE is free software: you can redistribute it and/or modify it
 # under the terms of the GNU General Public License as published by
@@ -22,24 +21,21 @@ database.
 
 """
 
-
-from collections import namedtuple
 import re
 import subprocess
-from typing import AnyStr, Dict, Generator, Optional, Pattern, Union
-
+from collections import namedtuple
+from collections.abc import Generator
+from typing import AnyStr
 
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives.asymmetric.rsa import RSAPublicNumbers
 
-
+from ivre import config, utils
 from ivre.db import db
-from ivre import config
-from ivre.types import DBPassive, DBNmap, DBView, Filter, Record
+from ivre.types import DBNmap, DBPassive, DBView, Filter, Record
 from ivre.types.active import NmapScript
-from ivre import utils
 
-DB = Union[DBPassive, DBNmap, DBView]
+DB = DBPassive | DBNmap | DBView
 
 Key = namedtuple("Key", ["ip", "port", "service", "type", "size", "key", "md5"])
 
@@ -55,7 +51,7 @@ class DBKey:
 
     fltkey: Filter
 
-    def __init__(self, dbc: DB, baseflt: Optional[Filter] = None) -> None:
+    def __init__(self, dbc: DB, baseflt: Filter | None = None) -> None:
         self.dbc = dbc
         self.baseflt = self.dbc.flt_empty if baseflt is None else baseflt
 
@@ -78,14 +74,14 @@ class NmapKey(DBKey):
 
     """
 
-    scriptid: Optional[str] = None
+    scriptid: str | None = None
 
-    def __init__(self, baseflt: Optional[Filter] = None) -> None:
+    def __init__(self, baseflt: Filter | None = None) -> None:
         DBKey.__init__(self, db.nmap, baseflt=baseflt)
 
     def getscripts(
         self, host: Record
-    ) -> Generator[Dict[str, Union[str, NmapScript]], None, None]:
+    ) -> Generator[dict[str, str | NmapScript], None, None]:
         for port in host.get("ports", []):
             try:
                 script = next(
@@ -99,7 +95,7 @@ class NmapKey(DBKey):
 class PassiveKey(DBKey):
     """Base class for a key lookup tool specialized for the passive DB."""
 
-    def __init__(self, baseflt: Optional[Filter] = None) -> None:
+    def __init__(self, baseflt: Filter | None = None) -> None:
         DBKey.__init__(self, db.passive, baseflt=baseflt)
 
 
@@ -111,7 +107,7 @@ class SSLKey:
 
     pem_borders = re.compile(b"^-*(BEGIN|END) CERTIFICATE-*$", re.M)
     keytype: str
-    keyincert: Pattern[bytes]
+    keyincert: re.Pattern[bytes]
     dbc: DB
 
     @property
@@ -134,10 +130,13 @@ class SSLKey:
             assert proc.stdout is not None
             proc.stdin.write(raw_cert)
             proc.stdin.close()
-            return proc.stdout.read()
+            # typeshed types ``Popen.stdout`` as ``IO[Any]``; pin the
+            # payload type so this is not an ``Any`` return.
+            data: bytes = proc.stdout.read()
+            return data
 
     @classmethod
-    def _pem2key(cls, pem: AnyStr) -> Optional[Dict[str, bytes]]:
+    def _pem2key(cls, pem: AnyStr) -> dict[str, bytes] | None:
         assert cls.keyincert is not None
         pem_parsed = cls.read_pem(pem)
         certtext = cls.keyincert.search(pem_parsed)
@@ -154,9 +153,12 @@ class SSLKey:
             assert proc.stdout is not None
             proc.stdin.write(der)
             proc.stdin.close()
-            return proc.stdout.read()
+            # typeshed types ``Popen.stdout`` as ``IO[Any]``; pin the
+            # payload type so this is not an ``Any`` return.
+            data: bytes = proc.stdout.read()
+            return data
 
-    def _der2key(self, der: bytes) -> Optional[Dict[str, bytes]]:
+    def _der2key(self, der: bytes) -> dict[str, bytes] | None:
         assert self.keyincert is not None
         der = self.read_der(der)
         certtext = self.keyincert.search(der)
@@ -171,12 +173,12 @@ class SSLNmapKey(NmapKey, SSLKey):
 
     scriptid = "ssl-cert"
 
-    def __init__(self, baseflt: Optional[Filter] = None) -> None:
+    def __init__(self, baseflt: Filter | None = None) -> None:
         NmapKey.__init__(self, baseflt=baseflt)
         SSLKey.__init__(self)
 
     @classmethod
-    def pem2key(cls, pem: bytes) -> Optional[RSAPublicNumbers]:
+    def pem2key(cls, pem: bytes) -> RSAPublicNumbers | None:
         raise NotImplementedError
 
     def getkeys(self, record: Record) -> Generator[Key, None, None]:
@@ -199,12 +201,12 @@ class SSLPassiveKey(PassiveKey, SSLKey):
 
     """
 
-    def __init__(self, baseflt: Optional[Filter] = None) -> None:
+    def __init__(self, baseflt: Filter | None = None) -> None:
         PassiveKey.__init__(self, baseflt=baseflt)
         SSLKey.__init__(self)
 
     def getkeys(self, record: Filter) -> Generator[Key, None, None]:
-        certtext = self._der2key(record["value"])
+        certtext = self._der2key(utils.decode_b64(record["value"].encode()))
         if certtext is None:
             return
 
@@ -312,11 +314,11 @@ class RSAKey:
     keytype = "rsa"
 
     @classmethod
-    def _pem2key(cls, pem: AnyStr) -> Optional[Dict[str, bytes]]:
+    def _pem2key(cls, pem: AnyStr) -> dict[str, bytes] | None:
         raise NotImplementedError
 
     @classmethod
-    def pem2key(cls, pem: bytes) -> Optional[RSAPublicNumbers]:
+    def pem2key(cls, pem: bytes) -> RSAPublicNumbers | None:
         certtext = cls._pem2key(pem)
         return (
             None
@@ -344,7 +346,7 @@ class SSLRsaNmapKey(RSAKey, SSLNmapKey):
 
     """
 
-    def __init__(self, baseflt: Optional[Filter] = None) -> None:
+    def __init__(self, baseflt: Filter | None = None) -> None:
         SSLNmapKey.__init__(self, baseflt=baseflt)
         RSAKey.__init__(self)
 
@@ -370,7 +372,7 @@ class SSHRsaNmapKey(RSAKey, SSHNmapKey):
 
     """
 
-    def __init__(self, baseflt: Optional[Filter] = None) -> None:
+    def __init__(self, baseflt: Filter | None = None) -> None:
         SSHNmapKey.__init__(self, baseflt=baseflt)
         RSAKey.__init__(self)
 
@@ -378,7 +380,7 @@ class SSHRsaNmapKey(RSAKey, SSHNmapKey):
 class SSLRsaPassiveKey(RSAKey, SSLPassiveKey):
     """Tool for the RSA Keys from SSL certificates within the passive DB."""
 
-    def __init__(self, baseflt: Optional[Filter] = None) -> None:
+    def __init__(self, baseflt: Filter | None = None) -> None:
         SSLPassiveKey.__init__(self, baseflt=baseflt)
         RSAKey.__init__(self)
 
@@ -389,6 +391,6 @@ class SSHRsaPassiveKey(RSAKey, SSHPassiveKey):
 
     """
 
-    def __init__(self, baseflt: Optional[Filter] = None) -> None:
+    def __init__(self, baseflt: Filter | None = None) -> None:
         SSHPassiveKey.__init__(self, baseflt=baseflt)
         RSAKey.__init__(self)

@@ -1,7 +1,7 @@
 #! /usr/bin/env python
 
 # This file is part of IVRE.
-# Copyright 2011 - 2021 Pierre LALET <pierre@droids-corp.org>
+# Copyright 2011 - 2024 Pierre LALET <pierre@droids-corp.org>
 #
 # IVRE is free software: you can redistribute it and/or modify it
 # under the terms of the GNU General Public License as published by
@@ -19,23 +19,22 @@
 
 """Update the passive database from Airodump CSV files"""
 
-
 from argparse import ArgumentParser
+from collections.abc import Generator, Iterable
 from functools import partial
-from typing import Any, Dict, Generator, List, Optional, Tuple
-
+from sys import stdin
+from typing import Any, BinaryIO
 
 from ivre.db import DBPassive, db
 from ivre.parser.airodump import Airodump
-from ivre.passive import _prepare_rec, getinfos
-from ivre.tools.passiverecon2db import _get_ignore_rules
+from ivre.passive import _prepare_rec, get_ignore_rules, getinfos
 from ivre.types import Record
+from ivre.utils import recursive_filelisting
 
 
 def _handle_rec(
-    sensor: Optional[str],
-    ignore_rules: Dict[str, Dict[str, List[Tuple[int, int]]]],
-    line: Dict[str, Any],
+    ignore_rules: dict[str, dict[str, list[tuple[int, int]]]],
+    line: dict[str, Any],
 ) -> Generator[Record, None, None]:
     yield from _prepare_rec(
         line, ignore_rules.get("IGNORENETS", {}), ignore_rules.get("NEVERIGNORE", {})
@@ -43,9 +42,9 @@ def _handle_rec(
 
 
 def rec_iter(
-    filenames: List[str],
-    sensor: Optional[str],
-    ignore_rules: Dict[str, Dict[str, List[Tuple[int, int]]]],
+    filenames: Iterable[BinaryIO | str],
+    sensor: str | None,
+    ignore_rules: dict[str, dict[str, list[tuple[int, int]]]],
 ) -> Generator[Record, None, None]:
     for fname in filenames:
         with Airodump(fname) as fdesc:
@@ -56,11 +55,12 @@ def rec_iter(
                     "lastseen": line["Last time seen"],
                     "count": 1,
                 }
+                if sensor is not None:
+                    baserec["sensor"] = sensor
                 if "Station MAC" in line:
                     if line["BSSID"] == "(not associated)":
                         continue
                     yield from _handle_rec(
-                        sensor,
                         ignore_rules,
                         dict(
                             baserec,
@@ -74,7 +74,6 @@ def rec_iter(
                         continue
                     for probed in line["Probed ESSIDs"].split(","):
                         yield from _handle_rec(
-                            sensor,
                             ignore_rules,
                             dict(
                                 baserec,
@@ -94,16 +93,15 @@ def rec_iter(
                     if not line.get(fld) or line[fld] == none_val:
                         continue
                     yield from _handle_rec(
-                        sensor,
                         ignore_rules,
                         dict(
                             baserec,
-                            source="WLAN_AP_%s" % fld.upper().replace(" ", "_"),
+                            source=f"WLAN_AP_{fld.upper().replace(' ', '_')}",
                             # count=line["# beacons"],
                             **{
-                                "addr"
-                                if fld == "LAN IP"
-                                else "targetval": str(line[fld])
+                                "addr" if fld == "LAN IP" else "targetval": str(
+                                    line[fld]
+                                )
                             },
                         ),
                     )
@@ -112,9 +110,8 @@ def rec_iter(
                 privacy = line["Privacy"].replace(" ", "_")
                 for fld in ["Cipher", "Authentication"]:
                     if line.get(fld):
-                        privacy = "%s-%s" % (privacy, line[fld])
+                        privacy = f"{privacy}-{line[fld]}"
                 yield from _handle_rec(
-                    sensor,
                     ignore_rules,
                     dict(
                         baserec,
@@ -125,24 +122,20 @@ def rec_iter(
                 )
 
 
+def build_parser() -> ArgumentParser:
+    """Build the argument parser for this tool."""
+    parser = ArgumentParser(description=__doc__, parents=[db.passive.argparser_insert])
+    parser.add_argument("files", nargs="*", metavar="FILE", help="Airodump CSV files")
+    return parser
+
+
 def main() -> None:
     """Update the flow database from Airodump CSV files"""
-    parser = ArgumentParser(description=__doc__)
-    parser.add_argument("--sensor", "-s", help="Sensor name")
-    parser.add_argument("--ignore-spec", "-i", help="Filename containing ignore rules")
-    parser.add_argument(
-        "--bulk", action="store_true", help="Use DB bulk inserts (this is the default)"
-    )
-    parser.add_argument(
-        "--local-bulk", action="store_true", help="Use local (memory) bulk inserts"
-    )
-    parser.add_argument(
-        "--no-bulk", action="store_true", help="Do not use bulk inserts"
-    )
-    parser.add_argument("files", nargs="*", metavar="FILE", help="Airodump CSV files")
-    args = parser.parse_args()
-    ignore_rules = _get_ignore_rules(args.ignore_spec)
-    if (not (args.no_bulk or args.local_bulk)) or args.bulk:
+    args = build_parser().parse_args()
+    ignore_rules = get_ignore_rules(args.ignore_spec)
+    if args.test:
+        function = DBPassive().insert_or_update_local_bulk
+    elif (not (args.no_bulk or args.local_bulk)) or args.bulk:
         function = db.passive.insert_or_update_bulk
     elif args.local_bulk:
         function = db.passive.insert_or_update_local_bulk
@@ -151,8 +144,15 @@ def main() -> None:
             DBPassive.insert_or_update_bulk,
             db.passive,
         )
+    files: Iterable[BinaryIO | str]
+    if not args.files:
+        files = [stdin.buffer]
+    elif args.recursive:
+        files = recursive_filelisting(args.files)
+    else:
+        files = args.files
     function(
-        rec_iter(args.files, args.sensor, ignore_rules),
+        rec_iter(files, args.sensor, ignore_rules),
         getinfos=getinfos,
         separated_timestamps=False,
     )

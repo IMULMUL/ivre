@@ -1,8 +1,7 @@
 #! /usr/bin/env python
-# -*- coding: utf-8 -*-
 
 # This file is part of IVRE.
-# Copyright 2011 - 2021 Pierre LALET <pierre@droids-corp.org>
+# Copyright 2011 - 2024 Pierre LALET <pierre@droids-corp.org>
 #
 # IVRE is free software: you can redistribute it and/or modify it
 # under the terms of the GNU General Public License as published by
@@ -20,8 +19,7 @@
 
 import binascii
 import struct
-from typing import Any, Dict, Optional
-
+from typing import Any
 
 from ivre import utils
 
@@ -79,7 +77,7 @@ def is_unicode(msg: bytes, flags: int) -> bool:
     return False
 
 
-def _ntlm_negotiate_extract(negotiate: bytes) -> Optional[Dict[str, Any]]:
+def _ntlm_negotiate_extract(negotiate: bytes) -> dict[str, Any] | None:
     """
     Extract host information in an NTLMSSP_NEGOTIATE message
     """
@@ -91,7 +89,7 @@ def _ntlm_negotiate_extract(negotiate: bytes) -> Optional[Dict[str, Any]]:
     value = {}
 
     flags = struct.unpack("I", negotiate[12:16])[0]
-    value["ntlm-fingerprint"] = "0x%08x" % flags
+    value["ntlm-fingerprint"] = f"0x{flags:08x}"
     uses_unicode = is_unicode(negotiate, flags)
     if len(negotiate) > 32:
         ln_dom, off_dom, ln_work, off_work = struct.unpack("H2xIH2xI", negotiate[16:32])
@@ -128,7 +126,7 @@ info_types = {
 }
 
 
-def _ntlm_challenge_extract(challenge: bytes) -> Optional[Dict[str, Any]]:
+def _ntlm_challenge_extract(challenge: bytes) -> dict[str, Any] | None:
     """
     Extract host information in an NTLMSSP_CHALLENGE message
     """
@@ -140,7 +138,7 @@ def _ntlm_challenge_extract(challenge: bytes) -> Optional[Dict[str, Any]]:
 
     value = {}
     flags = struct.unpack("I", challenge[20:24])[0]
-    value["ntlm-fingerprint"] = "0x%08x" % flags
+    value["ntlm-fingerprint"] = f"0x{flags:08x}"
     uses_unicode = is_unicode(challenge, flags)
 
     # Get target name
@@ -175,7 +173,7 @@ def _ntlm_challenge_extract(challenge: bytes) -> Optional[Dict[str, Any]]:
 
         maj, minor, bld, ntlm_ver = struct.unpack("BBH3xB", challenge[48:56])
         try:
-            value["Product_Version"] = "{}.{}.{}".format(maj, minor, bld)
+            value["Product_Version"] = f"{maj}.{minor}.{bld}"
         except ValueError:
             pass
         try:
@@ -199,7 +197,7 @@ def _ntlm_challenge_extract(challenge: bytes) -> Optional[Dict[str, Any]]:
         # Return if the target info block is shorter than it is supposed to be
         if len(challenge) < ln_info:
             utils.LOGGER.warning(
-                "NTLM target info should be of size %d but " "is too short (size %d)",
+                "NTLM target info should be of size %d but is too short (size %d)",
                 ln_info,
                 len(challenge),
             )
@@ -221,13 +219,13 @@ def _ntlm_challenge_extract(challenge: bytes) -> Optional[Dict[str, Any]]:
     return value
 
 
-def _ntlm_authenticate_info(request: bytes) -> Optional[Dict[str, Any]]:
+def _ntlm_authenticate_info(request: bytes) -> dict[str, Any] | None:
     """
     Extract host information in an NTLMSSP_AUTH message
     """
     if len(request) < 52:
         utils.LOGGER.warning(
-            "NTLM message is too short (%d) but should be " "at least 52 char long",
+            "NTLM message is too short (%d) but should be at least 52 char long",
             len(request),
         )
         return None
@@ -236,7 +234,7 @@ def _ntlm_authenticate_info(request: bytes) -> Optional[Dict[str, Any]]:
     offset = min(
         off
         for off in (struct.unpack("I", request[i : i + 4])[0] for i in range(16, 49, 8))
-        if off != 0
+        if off
     )
     has_version = False
     # Flags are not present in an NTLM_AUTH message when the data block starts
@@ -274,7 +272,7 @@ def _ntlm_authenticate_info(request: bytes) -> Optional[Dict[str, Any]]:
     if has_version and offset >= 72 and request[72:]:
         maj, minor, bld, ntlm_ver = struct.unpack("BBH3xB", request[64:72])
         try:
-            value["Product_Version"] = "{}.{}.{}".format(maj, minor, bld)
+            value["Product_Version"] = f"{maj}.{minor}.{bld}"
         except ValueError:
             pass
         try:
@@ -285,7 +283,7 @@ def _ntlm_authenticate_info(request: bytes) -> Optional[Dict[str, Any]]:
     return value
 
 
-def ntlm_extract_info(value: bytes) -> Optional[Dict[str, Any]]:
+def ntlm_extract_info(value: bytes) -> dict[str, Any] | None:
     """
     Extract valuable host information from an NTLM message
     """
@@ -297,27 +295,20 @@ def ntlm_extract_info(value: bytes) -> Optional[Dict[str, Any]]:
     if ntlm_type == 1:
         return _ntlm_negotiate_extract(value)
     utils.LOGGER.warning(
-        "The following NTLM message %r has an unknown " "message type: %d",
+        "The following NTLM message %r has an unknown message type: %d",
         value,
         ntlm_type,
     )
     return {}
 
 
-def _ntlm_dict2string(dic: Dict[str, str]) -> str:
+def _ntlm_dict2string(dic: dict[str, str]) -> str:
     """
     Returns a string with the keys and values (encoded in base64)
     of the given dict, in the format
     """
     return ",".join(
-        "{}:{}".format(
-            k,
-            (
-                v
-                if k in {"NTLM_Version", "ntlm-fingerprint"}
-                else utils.encode_b64(v.encode()).decode()
-            ),
-        )
+        f"{k}:{(v if k in {'NTLM_Version', 'ntlm-fingerprint'} else utils.encode_b64(v.encode()).decode())}"
         for k, v in dic.items()
     )
 
@@ -330,14 +321,13 @@ def _is_ntlm_message(message: str) -> bool:
         val1, val2 = message.split(None, 1)
     except ValueError:
         return False
-    else:
-        if not val2:
-            return False
-        if val1.lower() == "ntlm":
-            return True
-        if val1.lower() == "negotiate":
-            try:
-                return utils.decode_b64(val2.encode())[:7] == b"NTLMSSP"
-            except (UnicodeDecodeError, TypeError, ValueError, binascii.Error):
-                pass
+    if not val2:
+        return False
+    if val1.lower() == "ntlm":
+        return True
+    if val1.lower() == "negotiate":
+        try:
+            return utils.decode_b64(val2.encode())[:7] == b"NTLMSSP"
+        except (UnicodeDecodeError, TypeError, ValueError, binascii.Error):
+            pass
     return False

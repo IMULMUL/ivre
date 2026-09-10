@@ -1,7 +1,7 @@
 #! /usr/bin/env python
 
 # This file is part of IVRE.
-# Copyright 2011 - 2020 Pierre LALET <pierre@droids-corp.org>
+# Copyright 2011 - 2024 Pierre LALET <pierre@droids-corp.org>
 #
 # IVRE is free software: you can redistribute it and/or modify it
 # under the terms of the GNU General Public License as published by
@@ -19,15 +19,11 @@
 
 "Query the passive database to perform ARP resolutions."
 
-
 import argparse
 import re
-from typing import List, Tuple
 
-
-from ivre.db import db
 from ivre import utils
-
+from ivre.db import db
 
 MAC_ADDR = re.compile(
     "^([0-9a-f]{1,2})[:-]([0-9a-f]{1,2})[:-]([0-9a-f]{1,2})[:-]([0-9a-f]{1,2})"
@@ -36,7 +32,8 @@ MAC_ADDR = re.compile(
 )
 
 
-def main() -> None:
+def build_parser() -> argparse.ArgumentParser:
+    """Build the argument parser for this tool."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "ips_or_macs",
@@ -51,8 +48,12 @@ def main() -> None:
     parser.add_argument(
         "-r", "--resolve", action="store_true", help="Resolve MAC manufacturer"
     )
-    args = parser.parse_args()
-    flts: Tuple[List[str], List[str]] = ([], [])  # MAC & IP filters
+    return parser
+
+
+def main() -> None:
+    args = build_parser().parse_args()
+    flts: tuple[list[str], list[str]] = ([], [])  # MAC & IP filters
     for arg in args.ips_or_macs:
         if arg[:1] in "-!~":
             neg = True
@@ -61,20 +62,12 @@ def main() -> None:
             neg = False
         match = MAC_ADDR.search(arg)
         if match:
-            flts[0].extend(
-                [
-                    db.passive.searchmac(mac=arg.lower(), neg=neg),
-                    db.passive.searchmac(mac=arg.lower(), reverse=True, neg=neg),
-                ]
+            flts[0].append(
+                db.passive.searchmac(mac=arg.lower(), neg=neg),
             )
         elif arg.startswith("/") and "/" in arg[1:]:
-            flts[0].extend(
-                [
-                    db.passive.searchmac(mac=utils.str2regexp(arg.lower()), neg=neg),
-                    db.passive.searchmac(
-                        mac=utils.str2regexp(arg.lower()), reverse=True, neg=neg
-                    ),
-                ]
+            flts[0].append(
+                db.passive.searchmac(mac=utils.str2regexp(arg.lower()), neg=neg),
             )
         elif "/" in arg:
             flts[1].append(db.passive.searchnet(arg, neg=neg))
@@ -104,11 +97,10 @@ def main() -> None:
             except (TypeError, ValueError, AssertionError):
                 pass
             else:
-                rec["value"] = "%s (%s)" % (rec["value"], manuf)
+                rec["value"] = f"{rec['value']} ({manuf})"
         if "addr" in rec:
             print(
-                "%(value)s %(source)s %(addr)s on %(sensor)s (%(recontype)s %(count)s "
-                "time%(times)s, %(firstseen)s - %(lastseen)s)" % rec
+                f"{rec['value']} {rec['source']} {rec['addr']} on {rec['sensor']} ({rec['recontype']} {rec['count']} time{rec['times']}, {rec['firstseen']} - {rec['lastseen']})"
             )
             continue
         if rec["source"] == "WLAN_ASSOCIATED" and args.resolve:
@@ -119,8 +111,7 @@ def main() -> None:
             except (TypeError, ValueError, AssertionError):
                 pass
             else:
-                rec["targetval"] = "%s (%s)" % (rec["targetval"], manuf)
+                rec["targetval"] = f"{rec['targetval']} ({manuf})"
         print(
-            "%(value)s %(source)s %(targetval)s on %(sensor)s (%(recontype)s %(count)s "
-            "time%(times)s, %(firstseen)s - %(lastseen)s)" % rec
+            f"{rec['value']} {rec['source']} {rec['targetval']} on {rec['sensor']} ({rec['recontype']} {rec['count']} time{rec['times']}, {rec['firstseen']} - {rec['lastseen']})"
         )

@@ -1,8 +1,7 @@
 #! /usr/bin/env python
-# -*- coding: utf-8 -*-
 
 # This file is part of IVRE.
-# Copyright 2011 - 2021 Pierre LALET <pierre@droids-corp.org>
+# Copyright 2011 - 2024 Pierre LALET <pierre@droids-corp.org>
 #
 # IVRE is free software: you can redistribute it and/or modify it
 # under the terms of the GNU General Public License as published by
@@ -22,18 +21,10 @@
 Specific type definitions for IVRE
 """
 
+from __future__ import annotations
 
-from typing import (
-    Any,
-    Dict,
-    Generator,
-    Iterable,
-    List,
-    Optional,
-    Set,
-    Tuple,
-    Union,
-)
+from collections.abc import Generator, Iterable
+from typing import Any
 
 try:
     from typing import Literal, Protocol, TypedDict
@@ -43,30 +34,32 @@ else:
     HAS_TYPED_DICT = True
 
 
-NmapProbe = List[Tuple[str, Dict[str, Any]]]
-ParsedCertificate = Dict[str, Any]  # TODO: TypedDict
+NmapProbe = list[tuple[str, dict[str, Any]]]
+ParsedCertificate = dict[str, Any]  # TODO: TypedDict
 
 
 # Filters
 
-MongoFilter = Dict[str, Any]  # TODO: TypedDict
+MongoFilter = dict[str, Any]  # TODO: TypedDict
 # TODO
 ElasticFilter = Any
 HttpFilter = Any
 SqlFilter = Any
 TinyFilter = Any
-Filter = Union[MongoFilter, SqlFilter, HttpFilter, ElasticFilter, TinyFilter]
+Filter = MongoFilter | SqlFilter | HttpFilter | ElasticFilter | TinyFilter
 
 
 # Records (TODO)
-Record = Dict[str, Any]
+Record = dict[str, Any]
 
 
 # Sort
 if HAS_TYPED_DICT:
-    SortKey = Tuple[str, Literal[-1, 1]]
+    SortKey = tuple[str, Literal[-1, 1]]
+    IndexKey = tuple[str, Literal[-1, 1, "text"]]
 else:
-    SortKey = Tuple[str, int]  # type: ignore
+    SortKey = tuple[str, int]  # type: ignore
+    IndexKey = tuple[str, int | str]  # type: ignore
 Sort = Iterable[SortKey]
 
 
@@ -82,15 +75,20 @@ if HAS_TYPED_DICT:
         vendor: str
         product: str
         version: str
-        origins: Set[str]
+        origins: set[str]
 
     # class ParsedCertificate(TypedDict, total=False):
     #     TODO
 
+    class Tag(TypedDict, total=False):
+        value: str
+        type: str
+        info: list[str]
+
     class NmapProbeRec(TypedDict, total=False):
         probe: bytes
         fp: NmapProbe
-        fallbacks: List[str]
+        fallbacks: list[str]
 
     class NmapServiceMatch(TypedDict, total=False):
         service_name: str
@@ -104,25 +102,8 @@ if HAS_TYPED_DICT:
         service_method: str
         service_servicefp: str
         service_conf: int
-        cpe: List[str]
+        cpe: list[str]
         soft: bool
-
-    class NmapScanTemplate(TypedDict, total=False):
-        nmap: str
-        pings: str
-        scans: str
-        osdetect: bool
-        traceroute: bool
-        resolve: int
-        verbosity: int
-        ports: Optional[str]
-        top_ports: Optional[int]
-        host_timeout: Optional[str]
-        script_timeout: Optional[str]
-        scripts_categories: Optional[Iterable[str]]
-        scripts_exclude: Optional[Iterable[str]]
-        scripts_force: Optional[Iterable[str]]
-        extra_options: Optional[Iterable[str]]
 
     class DB(Protocol):
         flt_empty: Filter
@@ -130,54 +111,42 @@ if HAS_TYPED_DICT:
         def distinct(
             self,
             field: str,
-            flt: Optional[Filter] = None,
-            sort: Optional[Any] = None,
-            limit: Optional[int] = None,
-            skip: Optional[int] = None,
-        ) -> Iterable:
-            ...
+            flt: Filter | None = None,
+            sort: Any | None = None,
+            limit: int | None = None,
+            skip: int | None = None,
+        ) -> Iterable: ...
 
         @classmethod
-        def flt_and(cls, *args: Filter) -> Filter:
-            ...
+        def flt_and(cls, *args: Filter) -> Filter: ...
 
-        def from_binary(self, data: Any) -> bytes:
-            ...
+        def from_binary(self, data: Any) -> bytes: ...
 
-        def get(self, spec: Filter, **kargs: Any) -> Generator[Record, None, None]:
-            ...
+        def get(self, spec: Filter, **kargs: Any) -> Generator[Record, None, None]: ...
 
-        def _get(self, spec: Filter, **kargs: Any) -> DBCursor:
-            ...
+        def _get(self, spec: Filter, **kargs: Any) -> DBCursor: ...
 
-        def explain(self, cur: DBCursor, **kargs: Any) -> str:
-            ...
+        def explain(self, cur: DBCursor, **kargs: Any) -> str: ...
 
-        def remove_many(self, spec: Filter) -> None:
-            ...
+        def remove_many(self, spec: Filter) -> None: ...
 
         def searchcert(
             self,
-            keytype: Optional[str] = None,
-            md5: Optional[str] = None,
-            sha1: Optional[str] = None,
-            sha256: Optional[str] = None,
-            subject: Optional[str] = None,
-            issuer: Optional[str] = None,
-            self_signed: Optional[bool] = None,
-            pkmd5: Optional[str] = None,
-            pksha1: Optional[str] = None,
-            pksha256: Optional[str] = None,
+            keytype: str | None = None,
+            md5: str | None = None,
+            sha1: str | None = None,
+            sha256: str | None = None,
+            subject: str | None = None,
+            issuer: str | None = None,
+            self_signed: bool | None = None,
+            pkmd5: str | None = None,
+            pksha1: str | None = None,
+            pksha256: str | None = None,
             cacert: bool = False,
-        ) -> Filter:
-            ...
+        ) -> Filter: ...
 
         @staticmethod
-        def serialize(obj: Any) -> str:
-            ...
-
-    class DBAgent(DB, Protocol):
-        pass
+        def serialize(obj: Any) -> str: ...
 
     class DBData(DB, Protocol):
         pass
@@ -188,52 +157,48 @@ if HAS_TYPED_DICT:
     class DBActive(DB, Protocol):
         def searchsshkey(
             self,
-            fingerprint: Optional[str] = None,
-            key: Optional[str] = None,
-            keytype: Optional[str] = None,
-            bits: Optional[int] = None,
-            output: Optional[str] = None,
-        ) -> Filter:
-            ...
+            fingerprint: str | None = None,
+            key: str | None = None,
+            keytype: str | None = None,
+            bits: int | None = None,
+            output: str | None = None,
+        ) -> Filter: ...
 
     class DBNmap(DBActive, Protocol):
         pass
 
     class DBPassive(DB, Protocol):
-        def searchsshkey(self, keytype: Optional[str] = None) -> Filter:
-            ...
+        def searchsshkey(
+            self,
+            fingerprint: str | None = None,
+            key: str | None = None,
+            keytype: str | None = None,
+            bits: int | None = None,
+        ) -> Filter: ...
 
     class DBView(DBActive, Protocol):
         pass
 
     class MetaDB(Protocol):
-        agent: DBAgent
         data: DBData
-        db_types: Dict[str, Dict[str, Tuple[str, str]]]
+        db_types: dict[str, dict[str, tuple[str, str]]]
         flow: DBFlow
         nmap: DBNmap
         passive: DBPassive
         url: str
-        urls: Dict[str, str]
+        urls: dict[str, str]
         view: DBView
 
-        def get_class(self, purpose: str) -> DB:
-            ...
+        def get_class(self, purpose: str) -> DB: ...
 
     class Target(Iterable[int], Protocol):
         targetscount: int
 
-
 else:
-    CpeDict = Dict[str, Union[str, Set[str]]]  # type: ignore
-    NmapProbeRec = Dict[str, Union[bytes, NmapProbe, List[str]]]  # type: ignore
-    NmapServiceMatch = Dict[str, Union[str, List[str]]]  # type: ignore
-    NmapScanTemplate = Dict[  # type: ignore
-        str,
-        Union[str, bool, int, Optional[str], Optional[int], Optional[Iterable[str]]],
-    ]
+    CpeDict = dict[str, str | set[str]]  # type: ignore
+    NmapProbeRec = dict[str, bytes | NmapProbe | list[str]]  # type: ignore
+    NmapServiceMatch = dict[str, str | list[str]]  # type: ignore
     DB = Any  # type: ignore
-    DBAgent = Any  # type: ignore
     DBData = Any  # type: ignore
     DBFlow = Any  # type: ignore
     DBActive = Any  # type: ignore
@@ -242,3 +207,4 @@ else:
     DBView = Any  # type: ignore
     MetaDB = Any  # type: ignore
     Target = Any  # type: ignore
+    Tag = dict[str, str | list[str]]  # type: ignore

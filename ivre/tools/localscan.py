@@ -1,7 +1,7 @@
 #! /usr/bin/env python
 
 # This file is part of IVRE.
-# Copyright 2011 - 2021 Pierre LALET <pierre@droids-corp.org>
+# Copyright 2011 - 2024 Pierre LALET <pierre@droids-corp.org>
 #
 # IVRE is free software: you can redistribute it and/or modify it
 # under the terms of the GNU General Public License as published by
@@ -23,21 +23,20 @@ netstat or ss
 """
 
 import argparse
-from datetime import datetime
 import json
 import re
 import subprocess
 import sys
-from typing import Dict, Generator, Set, Tuple
+from collections.abc import Generator
+from datetime import datetime
 
+from ivre import utils
 from ivre.activecli import displayfunction_nmapxml
 from ivre.types import DBCursor
 from ivre.types.active import NmapHost
-from ivre import utils
 
 
 class LocalPorts:
-
     cmd_addrs = ["ip", "addr", "show"]
     cmd_openports = ["ss", "-ltunp"]
     match_addrs = re.compile("^ +inet (?P<addr>[0-9\\.]+)/")
@@ -56,9 +55,9 @@ class LocalPorts:
                     continue
                 yield m.groupdict()["addr"]
 
-    def parse(self) -> Dict[str, Dict[Tuple[str, int], Set[str]]]:
+    def parse(self) -> dict[str, dict[tuple[str, int], set[str]]]:
         addresses = set(self.get_addrs())
-        results: Dict[str, Dict[Tuple[str, int], Set[str]]] = {}
+        results: dict[str, dict[tuple[str, int], set[str]]] = {}
         with subprocess.Popen(self.cmd_openports, stdout=subprocess.PIPE) as proc:
             assert proc.stdout is not None
             for line in proc.stdout:
@@ -88,8 +87,7 @@ class LocalPorts:
                     port["scripts"] = [
                         {
                             "id": "localscan",
-                            "output": "Program%s: %s"
-                            % ("s" if len(progs) > 1 else "", ", ".join(sorted(progs))),
+                            "output": f"Program{'s' if len(progs) > 1 else ''}: {', '.join(sorted(progs))}",
                             "localscan": {"programs": sorted(progs)},
                         },
                     ]
@@ -98,12 +96,17 @@ class LocalPorts:
             yield rec
 
 
-def main() -> None:
+def build_parser() -> argparse.ArgumentParser:
+    """Build the argument parser for this tool."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--json", action="store_true", help="Output as JSON rather than XML."
     )
-    args = parser.parse_args()
+    return parser
+
+
+def main() -> None:
+    args = build_parser().parse_args()
     if args.json:
 
         def displayfunction(cur: DBCursor) -> None:

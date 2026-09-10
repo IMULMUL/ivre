@@ -1,7 +1,7 @@
 #! /usr/bin/env python
 
 # This file is part of IVRE.
-# Copyright 2011 - 2021 Pierre LALET <pierre@droids-corp.org>
+# Copyright 2011 - 2024 Pierre LALET <pierre@droids-corp.org>
 #
 # IVRE is free software: you can redistribute it and/or modify it
 # under the terms of the GNU General Public License as published by
@@ -18,20 +18,21 @@
 
 """Update the flow database from Zeek logs"""
 
-
-from argparse import ArgumentParser
 import os
-from typing import Any, Callable, Dict, Iterable
+from argparse import ArgumentParser
+from collections.abc import Callable, Iterable
+from sys import stdin
+from typing import Any, BinaryIO
 
-
-from ivre.parser.zeek import ZeekFile
+from ivre import config, flow, utils
 from ivre.db import db
-from ivre import config, utils, flow
+from ivre.parser.zeek import ZeekFile
 from ivre.types import Record
 from ivre.types.flow import Bulk
+from ivre.utils import recursive_filelisting
 
 
-def _zeek2flow(rec: Dict[str, Any]) -> Record:
+def _zeek2flow(rec: dict[str, Any]) -> Record:
     """Prepares a document"""
     if "id_orig_h" in rec:
         rec["src"] = rec.pop("id_orig_h")
@@ -128,21 +129,40 @@ def any2flow(name: str) -> Callable[[Bulk, Record], None]:
     return inserter
 
 
-def main() -> None:
-    """Update the flow database from Zeek logs"""
+def build_parser() -> ArgumentParser:
+    """Build the argument parser for this tool."""
     parser = ArgumentParser(description=__doc__)
-    parser.add_argument("logfiles", nargs="*", metavar="FILE", help="Zeek log files")
+    parser.add_argument("files", nargs="*", metavar="FILE", help="Zeek log files")
     parser.add_argument("-v", "--verbose", help="verbose mode", action="store_true")
     parser.add_argument(
         "-C", "--no-cleanup", help="avoid port cleanup heuristics", action="store_true"
     )
-    args = parser.parse_args()
+    parser.add_argument(
+        "-r",
+        "--recursive",
+        action="store_true",
+        help="Import all files from given directories.",
+    )
+    return parser
+
+
+def main() -> None:
+    """Update the flow database from Zeek logs"""
+    args = build_parser().parse_args()
 
     if args.verbose:
         config.DEBUG = True
+    files: Iterable[BinaryIO | str]
 
-    for fname in args.logfiles:
-        if not os.path.exists(fname):
+    if not args.files:
+        files = [stdin.buffer]
+    elif args.recursive:
+        files = recursive_filelisting(args.files)
+    else:
+        files = args.files
+
+    for fname in files:
+        if isinstance(fname, str) and not os.path.exists(fname):
             utils.LOGGER.error("File %r does not exist", fname)
             continue
         with ZeekFile(fname) as zeekf:
@@ -150,10 +170,7 @@ def main() -> None:
             utils.LOGGER.debug(
                 "Parsing %s\n\t%s",
                 fname,
-                "Fields:\n%s\n"
-                % "\n".join(
-                    "%s: %s" % (f.decode(), t.decode()) for f, t in zeekf.field_types
-                ),
+                f"Fields:\n{'\n'.join(f'{f.decode()}: {t.decode()}' for f, t in zeekf.field_types)}\n",
             )
             if zeekf.path in FUNCTIONS:
                 func = FUNCTIONS[zeekf.path]

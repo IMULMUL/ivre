@@ -1,8 +1,7 @@
 #! /usr/bin/env python
-# -*- coding: utf-8 -*-
 
 # This file is part of IVRE.
-# Copyright 2011 - 2018 Pierre LALET <pierre.lalet@cea.fr>
+# Copyright 2011 - 2024 Pierre LALET <pierre@droids-corp.org>
 #
 # IVRE is free software: you can redistribute it and/or modify it
 # under the terms of the GNU General Public License as published by
@@ -18,9 +17,6 @@
 # along with IVRE. If not, see <http://www.gnu.org/licenses/>.
 
 """
-This module is part of IVRE.
-Copyright 2011 - 2018 Pierre LALET <pierre.lalet@cea.fr>
-
 This sub-module contains math functions missing from Python's math
 module that might be useful to any other sub-module or script.
 """
@@ -48,7 +44,7 @@ def genprimes():
 def factors(n):
     """Yields the prime factors of the integer n."""
     for p in genprimes():
-        while n != 1 and n % p == 0:
+        while n != 1 and not n % p:
             yield p
             n //= p
         if n == 1:

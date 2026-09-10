@@ -1,7 +1,7 @@
 #! /usr/bin/env python
 
 # This file is part of IVRE.
-# Copyright 2011 - 2021 Pierre LALET <pierre@droids-corp.org>
+# Copyright 2011 - 2025 Pierre LALET <pierre@droids-corp.org>
 #
 # IVRE is free software: you can redistribute it and/or modify it
 # under the terms of the GNU General Public License as published by
@@ -19,28 +19,17 @@
 
 """Sub-module to run DNS checks."""
 
-
-from ast import literal_eval
-from collections import namedtuple
-from datetime import datetime
 import re
 import subprocess
-from typing import (
-    Dict,
-    FrozenSet,
-    Generator,
-    List,
-    Optional,
-    Sequence,
-    Set,
-    Tuple,
-)
-
+from ast import literal_eval
+from collections import namedtuple
+from collections.abc import Generator, Sequence
+from datetime import datetime
+from itertools import chain
 
 from ivre.types.active import NmapHost
-from ivre.utils import LOGGER, get_domains
+from ivre.utils import LOGGER, get_domains, key_sort_dom
 from ivre.xmlnmap import SCHEMA_VERSION
-
 
 nsrecord = namedtuple("nsrecord", ["name", "ttl", "rclass", "rtype", "data"])
 
@@ -57,14 +46,14 @@ MAIL_REGEXP = re.compile(r"[^@]+@[^@]+\.[^@]+", re.IGNORECASE)
 
 
 def _dns_do_query(
-    name: str, rtype: Optional[str] = None, srv: Optional[str] = None
+    name: str, rtype: str | None = None, srv: str | None = None
 ) -> Generator[nsrecord, None, None]:
     cmd = ["dig", "+noquestion", "+nocomments", "+nocmd", "+nostat"]
     if rtype:
         cmd.extend(["-t", rtype])
     cmd.append(name)
     if srv:
-        cmd.append("@%s" % srv)
+        cmd.append(f"@{srv}")
     with subprocess.Popen(cmd, stdout=subprocess.PIPE) as proc:
         assert proc.stdout is not None
         for line_bytes in proc.stdout:
@@ -78,9 +67,9 @@ def _dns_do_query(
 
 def _dns_query_full(
     name: str,
-    rtype: Optional[str] = None,
-    srv: Optional[str] = None,
-    getall: Optional[bool] = False,
+    rtype: str | None = None,
+    srv: str | None = None,
+    getall: bool | None = False,
 ) -> Generator[nsrecord, None, None]:
     for ans in _dns_do_query(name, rtype=rtype, srv=srv):
         if ans.rclass == "IN" and (getall or (rtype is None) or (ans.rtype == rtype)):
@@ -89,24 +78,24 @@ def _dns_query_full(
 
 def _dns_query(
     name: str,
-    rtype: Optional[str] = None,
-    srv: Optional[str] = None,
-    getall: Optional[bool] = False,
+    rtype: str | None = None,
+    srv: str | None = None,
+    getall: bool | None = False,
 ) -> Generator[str, None, None]:
     for ans in _dns_query_full(name, rtype=rtype, srv=srv, getall=getall):
         yield ans.data
 
 
 class Checker:
-    _ns: List[str]
-    _ns4: List[Tuple[str, str]]
-    _ns6: List[Tuple[str, str]]
+    _ns: list[str]
+    _ns4: list[tuple[str, str]]
+    _ns6: list[tuple[str, str]]
 
     def __init__(self, domain: str) -> None:
         self.domain = domain
 
     @property
-    def ns_servers(self) -> List[str]:
+    def ns_servers(self) -> list[str]:
         try:
             return self._ns
         except AttributeError:
@@ -114,7 +103,7 @@ class Checker:
             return self._ns
 
     @property
-    def ns4_servers(self) -> List[Tuple[str, str]]:
+    def ns4_servers(self) -> list[tuple[str, str]]:
         try:
             return self._ns4
         except AttributeError:
@@ -126,7 +115,7 @@ class Checker:
             return self._ns4
 
     @property
-    def ns6_servers(self) -> List[Tuple[str, str]]:
+    def ns6_servers(self) -> list[tuple[str, str]]:
         try:
             return self._ns6
         except AttributeError:
@@ -137,7 +126,7 @@ class Checker:
             )
             return self._ns6
 
-    def _test(self, addr: str) -> List[nsrecord]:
+    def _test(self, addr: str) -> list[nsrecord]:
         raise NotImplementedError
 
     def test(self, v4: bool = True, v6: bool = True) -> Generator[NmapHost, None, None]:
@@ -145,7 +134,7 @@ class Checker:
 
     def do_test(
         self, v4: bool = True, v6: bool = True
-    ) -> Generator[Tuple[str, str, Sequence[nsrecord]], None, None]:
+    ) -> Generator[tuple[str, str, Sequence[nsrecord]], None, None]:
         servers = []
         if v4:
             servers.append(self.ns4_servers)
@@ -157,7 +146,7 @@ class Checker:
 
 
 class AXFRChecker(Checker):
-    def _test(self, addr: str) -> List[nsrecord]:
+    def _test(self, addr: str) -> list[nsrecord]:
         return list(_dns_query_full(self.domain, rtype="AXFR", srv=addr, getall=True))
 
     def test(self, v4: bool = True, v6: bool = True) -> Generator[NmapHost, None, None]:
@@ -166,14 +155,12 @@ class AXFRChecker(Checker):
             srvname = srvname.rstrip(".")
             if not res:
                 continue
-            if len(res) == 1 and res[0].rtype == "SOA":
+            if len(res) == 1 and res[0].rtype in {"SOA", "CNAME"}:
                 # SOA only: transfer failed
+                # CNAME only: no transfer actually performed
                 continue
             LOGGER.info("AXFR success for %r on %r", self.domain, addr)
-            line_fmt = "| %%-%ds  %%-%ds  %%s" % (
-                max(len(r.name) for r in res),
-                max(len(r.rtype) for r in res),
-            )
+            line_fmt = f"| %-{max(len(r.name) for r in res)}s  %-{max(len(r.rtype) for r in res)}s  %s"
             yield {
                 "addr": addr,
                 "hostnames": [
@@ -195,14 +182,7 @@ class AXFRChecker(Checker):
                         "scripts": [
                             {
                                 "id": "dns-zone-transfer",
-                                "output": "\nDomain: %s\n%s\n\\\n"
-                                % (
-                                    self.domain,
-                                    "\n".join(
-                                        line_fmt % (r.name, r.rtype, r.data)
-                                        for r in res
-                                    ),
-                                ),
+                                "output": f"\nDomain: {self.domain}\n{'\n'.join(line_fmt % (r.name, r.rtype, r.data) for r in res)}\n\\\n",
                                 "dns-zone-transfer": [
                                     {
                                         "domain": self.domain,
@@ -223,12 +203,12 @@ class AXFRChecker(Checker):
                     },
                 ],
             }
-            hosts: Dict[str, Set[Tuple[str, str]]] = {}
+            hosts: dict[str, set[tuple[str, str]]] = {}
             for r in res:
                 if r.rclass != "IN":
                     continue
                 if r.rtype in ["A", "AAAA"]:
-                    name = r.name.rstrip(".")
+                    name = r.name.rstrip(".").lower()
                     hosts.setdefault(r.data, set()).add((r.rtype, name))
             for host, records in hosts.items():
                 yield {
@@ -249,16 +229,16 @@ class AXFRChecker(Checker):
 
 
 class SameValueChecker(Checker):
-    name: Optional[str] = None
-    rtype: Optional[str] = None
+    name: str | None = None
+    rtype: str | None = None
 
-    def _sv_test(self, addr: str) -> FrozenSet[str]:
+    def _sv_test(self, addr: str) -> frozenset[str]:
         assert self.name is not None
         return frozenset(_dns_query(self.name, rtype=self.rtype, srv=addr))
 
     def do_sv_test(
         self, v4: bool = True, v6: bool = True
-    ) -> Generator[Tuple[str, str, FrozenSet[str]], None, None]:
+    ) -> Generator[tuple[str, str, frozenset[str]], None, None]:
         servers = []
         if v4:
             servers.append(self.ns4_servers)
@@ -270,7 +250,7 @@ class SameValueChecker(Checker):
 
     def test(self, v4: bool = True, v6: bool = True) -> Generator[NmapHost, None, None]:
         self.start = datetime.now()
-        results: Dict[FrozenSet[str], Dict[str, List[str]]] = {}
+        results: dict[frozenset[str], dict[str, list[str]]] = {}
         self.results = list(self.do_sv_test(v4=v4, v6=v6))
         for srvname, addr, res in self.results:
             srvname = srvname.rstrip(".")
@@ -279,7 +259,7 @@ class SameValueChecker(Checker):
             return
         self.stop = datetime.now()
         good_value = max(results, key=lambda val: len(results[val]))
-        good_value_repr = "\n".join("  %r" % r for r in sorted(good_value))
+        good_value_repr = "\n".join(f"  {r!r}" for r in sorted(good_value))
         good_value_sorted = sorted(good_value)
         for val, servers in results.items():
             if val == good_value:
@@ -311,7 +291,7 @@ class SameValueChecker(Checker):
                                     % (
                                         self.name,
                                         self.rtype,
-                                        "\n".join("  %r" % r for r in sorted(val)),
+                                        "\n".join(f"  {r!r}" for r in sorted(val)),
                                         good_value_repr,
                                     ),
                                     "dns-check-consistency": [
@@ -362,8 +342,7 @@ class DNSSRVChecker(SameValueChecker):
                         "scripts": [
                             {
                                 "id": "dns-domains",
-                                "output": "Server is authoritative for %s"
-                                % self.domain,
+                                "output": f"Server is authoritative for {self.domain}",
                                 "dns-domains": [
                                     {
                                         "domain": self.domain,
@@ -377,12 +356,79 @@ class DNSSRVChecker(SameValueChecker):
             }
 
 
+class DNSMXChecker(SameValueChecker):
+    rtype = "MX"
+
+    def __init__(self, domain: str) -> None:
+        super().__init__(domain)
+        self.name = domain
+        self._name2addr: dict[str, list[str]] = {}
+
+    def name2addr(self, name: str, v4: bool = True, v6: bool = True) -> list[str]:
+        try:
+            return self._name2addr[name]
+        except KeyError:
+            pass
+        resolvers = []
+        if v4:
+            resolvers.append(_dns_query(name, rtype="A"))
+        if v6:
+            resolvers.append(_dns_query(name, rtype="AAAA"))
+        result = self._name2addr[name] = sorted(
+            chain(*resolvers),
+            key=key_sort_dom,
+        )
+        return result
+
+    def test(self, v4: bool = True, v6: bool = True) -> Generator[NmapHost, None, None]:
+        yield from super().test(v4=v4, v6=v6)
+        results = frozenset(
+            result for _, _, subresults in self.results for result in subresults
+        )
+        for result in results:
+            priority, srvname = result.split(None, 1)
+            srvname = srvname.rstrip(".")
+            for addr in self.name2addr(srvname, v4=v4, v6=v6):
+                yield {
+                    "addr": addr,
+                    "hostnames": [
+                        {
+                            "name": srvname,
+                            "type": "user",
+                            "domains": list(get_domains(srvname)),
+                        }
+                    ],
+                    "schema_version": SCHEMA_VERSION,
+                    "starttime": self.start,
+                    "endtime": self.stop,
+                    "ports": [
+                        {
+                            "port": 25,
+                            "protocol": "tcp",
+                            "scripts": [
+                                {
+                                    "id": "dns-domains-mx",
+                                    "output": f"Server is Mail eXchanger for {self.domain} (priority {priority})",
+                                    "dns-domains-mx": [
+                                        {
+                                            "domain": self.domain,
+                                            "parents": list(get_domains(self.domain)),
+                                            "priority": priority,
+                                        }
+                                    ],
+                                },
+                            ],
+                        }
+                    ],
+                }
+
+
 class TLSRPTChecker(SameValueChecker):
     rtype = "TXT"
 
     def __init__(self, domain: str) -> None:
         super().__init__(domain)
-        self.name = "_smtp._tls.%s" % domain
+        self.name = f"_smtp._tls.{domain}"
 
     def test(self, v4: bool = True, v6: bool = True) -> Generator[NmapHost, None, None]:
         yield from super().test(v4=v4, v6=v6)
@@ -390,15 +436,13 @@ class TLSRPTChecker(SameValueChecker):
             srvname = srvname.rstrip(".")
             res = [literal_eval(r) for r in sorted(raw_res)]
             if not res:
-                output = "Domain %s has no TLS-RPT configuration" % self.domain
+                output = f"Domain {self.domain} has no TLS-RPT configuration"
                 structured = {
                     "domain": self.domain,
                     "warnings": ["Domain has no TLS-RPT configuration"],
                 }
             elif len(res) > 1:
-                output = (
-                    "Domain %s has more than one TLS-RPT configuration" % self.domain
-                )
+                output = f"Domain {self.domain} has more than one TLS-RPT configuration"
                 structured = {
                     "domain": self.domain,
                     "value": " / ".join(res),
@@ -430,29 +474,24 @@ class TLSRPTChecker(SameValueChecker):
                         if rua_val.startswith("https://"):
                             if HTTPS_REGEXP.search(rua_val[8:]) is None:
                                 warnings.append(
-                                    "TLS-RPT contains an invalid HTTPS URL: %r"
-                                    % rua_val
+                                    f"TLS-RPT contains an invalid HTTPS URL: {rua_val!r}"
                                 )
                         elif rua_val.startswith("mailto:"):
                             if MAIL_REGEXP.search(rua_val[7:]) is None:
                                 warnings.append(
-                                    "TLS-RPT contains an invalid e-mail URL: %r"
-                                    % rua_val
+                                    f"TLS-RPT contains an invalid e-mail URL: {rua_val!r}"
                                 )
                         else:
                             warnings.append(
-                                "TLS-RPT contains an invalid URL: %r" % rua_val
+                                f"TLS-RPT contains an invalid URL: {rua_val!r}"
                             )
                 else:
-                    warnings.append("TLS-RPT does not contain an rua entry: %r" % value)
+                    warnings.append(f"TLS-RPT does not contain an rua entry: {value!r}")
                 if warnings:
                     structured["warnings"] = warnings
-                    output = (
-                        "Domain %s has a TLS-RPT configuration with warnings:\n%s"
-                        % (self.domain, "\n".join(warnings))
-                    )
+                    output = f"Domain {self.domain} has a TLS-RPT configuration with warnings:\n{'\n'.join(warnings)}"
                 else:
-                    output = "Domain %s has a valid TLS-RPT configuration" % self.domain
+                    output = f"Domain {self.domain} has a valid TLS-RPT configuration"
             yield {
                 "addr": addr,
                 "hostnames": [

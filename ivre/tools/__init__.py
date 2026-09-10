@@ -1,7 +1,7 @@
 #! /usr/bin/env python
 
 # This file is part of IVRE.
-# Copyright 2011 - 2021 Pierre LALET <pierre@droids-corp.org>
+# Copyright 2011 - 2024 Pierre LALET <pierre@droids-corp.org>
 #
 # IVRE is free software: you can redistribute it and/or modify it
 # under the terms of the GNU General Public License as published by
@@ -19,36 +19,45 @@
 
 """This sub-module contains functions to implement ivre commands."""
 
+from collections.abc import Callable
+from itertools import chain
+from typing import cast
 
-from typing import Callable, Optional, List, cast
-
+from ivre.plugins import load_plugins
 
 __all__ = [
     "airodump2db",
-    "arp2db",
+    "auditcli",
     "auditdom",
+    "authcli",
+    "bench",
     "db2view",
     "flow2db",
     "flowcli",
     "getmoduli",
+    "getwebdata",
     "httpd",
     "ipcalc",
     "ipdata",
     "ipinfo",
     "iphost",
+    "iprange",
     "localscan",
+    "macdata",
     "macinfo",
+    "mcp_server",
+    "notes",
+    "p0f2db",
     "passiverecon2db",
-    "passivereconworker",
     "plotdb",
-    "runscans",
-    "runscansagent",
-    "runscansagentdb",
+    "rirlookup",
     "scan2db",
     "scancli",
     "scanstatus",
+    "sort",
     "version",
     "view",
+    "weblog2db",
     "zeek2db",
 ]
 
@@ -57,33 +66,42 @@ ALIASES = {
     "bro2db": "zeek2db",
     "httpd-ivre": "httpd",
     "ipinfohost": "iphost",
-    "runscans-agent": "runscansagent",
-    "runscans-agentdb": "runscansagentdb",
+    "mcp-server": "mcp_server",
     "nmap2db": "scan2db",
 }
 
 
-def get_command(name: str) -> Optional[Callable[[], None]]:
+PLUGINS: dict[str, Callable[[], None]] = {}
+
+
+def get_command(name: str) -> Callable[[], None] | None:
     if name in __all__:
         return cast(
             Callable[[], None],
-            getattr(__import__("%s.%s" % (__name__, name)).tools, name).main,
+            getattr(__import__(f"{__name__}.{name}").tools, name).main,
         )
     if name in ALIASES:
         name = ALIASES[name]
         return cast(
             Callable[[], None],
-            getattr(__import__("%s.%s" % (__name__, name)).tools, name).main,
+            getattr(__import__(f"{__name__}.{name}").tools, name).main,
         )
+    if name in PLUGINS:
+        return PLUGINS[name]
     return None
 
 
-def guess_command(name: str) -> List[str]:
+def guess_command(name: str) -> list[str]:
     if name in __all__:
         return [name]
-    possible = sorted(set(cmd for cmd in __all__ if cmd.startswith(name)))
-    if possible:
-        return possible
     if name in ALIASES:
         return [name]
+    if name in PLUGINS:
+        return [name]
+    possible = sorted({cmd for cmd in chain(__all__, PLUGINS) if cmd.startswith(name)})
+    if possible:
+        return possible
     return sorted(set(cmd for cmd in ALIASES if cmd.startswith(name)))
+
+
+load_plugins("ivre.plugins.tools", globals())

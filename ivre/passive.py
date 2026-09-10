@@ -1,8 +1,7 @@
 #! /usr/bin/env python
-# -*- coding: utf-8 -*-
 
 # This file is part of IVRE.
-# Copyright 2011 - 2021 Pierre LALET <pierre@droids-corp.org>
+# Copyright 2011 - 2025 Pierre LALET <pierre@droids-corp.org>
 #
 # IVRE is free software: you can redistribute it and/or modify it
 # under the terms of the GNU General Public License as published by
@@ -17,23 +16,18 @@
 # You should have received a copy of the GNU General Public License
 # along with IVRE. If not, see <http://www.gnu.org/licenses/>.
 
-"""This sub-module contains functions used for passive recon.
+"""This sub-module contains functions used for passive recon."""
 
-"""
-
-
+import binascii
 import hashlib
 import re
 import struct
-import binascii
 
-
-from ivre import utils, config
+from ivre import config, utils
 from ivre.analyzer import ntlm
 from ivre.data import scanners
 
-
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 DNSBL_START = re.compile(
     "^(?:"
@@ -44,7 +38,27 @@ DNSBL_START = re.compile(
     ")",
     re.I,
 )
+MD5 = re.compile("^[0-9a-f]{32}$", re.I)
 
+_JA4_A = "[tq?][0-9?]{2}[id][0-9]{4}.{2}"  # could be looser; '?' are non-standard
+_JA4_HASH = "[0-9a-f]{12}"
+_JA4_LIST = "(?:[0-9a-f]{4}(?:,[0-9a-f]{4})*)?"
+JA4 = re.compile(f"^(?P<ja4_a>{_JA4_A})_(?P<ja4_b>{_JA4_HASH})_(?P<ja4_c>{_JA4_HASH})$")
+JA4_RAW = re.compile(
+    f"^(?P<ja4_a>{_JA4_A})_(?P<ja4_b_raw>{_JA4_LIST})_(?P<ja4_c1_raw>{_JA4_LIST})(?:_(?P<ja4_c2_raw>{_JA4_LIST}))?$",
+    re.I,
+)
+
+TESTS = [
+    "t13d1516h2_8daaf6152771_e5627efa2ab1",
+    "q13d0310h3_55b375c5d22e_cd85d2d88918",
+    "t13d1516h2_002f,0035,009c,009d,1301,1302,1303,c013,c014,c02b,c02c,c02f,c030,cca8,cca9_0005,000a,000b,000d,0012,0015,0017,001b,0023,002b,002d,0033,4469,ff01_0403,0804,0401,0503,0805,0501,0806,0601",
+    "t13d1516h2_002f,0035,009c,009d,1301,1302,1303,c013,c014,c02b,c02c,c02f,c030,cca8,cca9_0005,000a,000b,000d,0012,0015,0017,001b,0023,002b,002d,0033,4469,ff01_",
+    "t13d1516h2_002f,0035,009c,009d,1301,1302,1303,c013,c014,c02b,c02c,c02f,c030,cca8,cca9_0005,000a,000b,000d,0012,0015,0017,001b,0023,002b,002d,0033,4469,ff01",
+    "q13d0310h3_1301,1302,1303_000a,000d,001b,002b,002d,0033,0039,4469_0403,0804,0401,0503,0805,0501,0806,0601,0201",
+    "q13d0310h3_1301,1302,1303_000a,000d,001b,002b,002d,0033,0039,4469_",
+    "q13d0310h3_1301,1302,1303_000a,000d,001b,002b,002d,0033,0039,4469",
+]
 
 # Zeek specific
 
@@ -158,7 +172,7 @@ def _split_digest_auth(data):
     curdata = []
     state = 0  # state init
     for char in data:
-        if state == 0:
+        if not state:
             if char == ",":
                 values.append("".join(curdata).strip())
                 curdata = []
@@ -188,9 +202,8 @@ def _prepare_rec_ntlm(spec, new_recontype):
             "_prepare_rec_ntlm(): cannot decode %r", spec["value"], exc_info=True
         )
         return
-    spec["value"] = "%s %s" % (
-        spec["value"].split(None, 1)[0],
-        ntlm._ntlm_dict2string(ntlm.ntlm_extract_info(auth)),
+    spec["value"] = (
+        f"{spec['value'].split(None, 1)[0]} {ntlm._ntlm_dict2string(ntlm.ntlm_extract_info(auth))}"
     )
     # Separate the NTLM flags from the rest of the message's info
     # for NTLMSSP_NEGOTIAGE and NTLMSSP_CHALLENGE messages
@@ -202,7 +215,7 @@ def _prepare_rec_ntlm(spec, new_recontype):
         except ValueError:
             spec["value"] = ""
         else:
-            spec["value"] = "NTLM %s" % spec["value"]
+            spec["value"] = f"NTLM {spec['value']}"
         fingerprint["value"] = fingerprint["value"][5:]
         yield fingerprint
     yield spec
@@ -228,33 +241,25 @@ def _prepare_rec(spec, ignorenets, neverignore):
         else:
             match = SYMANTEC_SEP_UA.match(spec["value"])
             if match is not None:
+                # pylint: disable=consider-using-f-string
                 spec["value"] = "%s%s" % match.groups()
     # Change any Digest authorization header to remove non-constant
     # information. On one hand we loose the necessary information to
     # try to recover the passwords, but on the other hand we store
     # specs with different challenges but the same username, realm,
     # host and sensor in the same records.
-    elif (
-        spec["recontype"]
-        in {
-            "HTTP_CLIENT_HEADER",
-            "HTTP_CLIENT_HEADER_SERVER",
-        }
-        and spec.get("source") in {"AUTHORIZATION", "PROXY-AUTHORIZATION"}
-    ):
+    elif spec["recontype"] in {
+        "HTTP_CLIENT_HEADER",
+        "HTTP_CLIENT_HEADER_SERVER",
+    } and spec.get("source") in {"AUTHORIZATION", "PROXY-AUTHORIZATION"}:
         value = spec["value"]
         if value:
             authtype = value.split(None, 1)[0]
             if authtype.lower() == "digest":
                 try:
                     # we only keep relevant info
-                    spec["value"] = "%s %s" % (
-                        authtype,
-                        ",".join(
-                            val
-                            for val in _split_digest_auth(value[6:].strip())
-                            if DIGEST_AUTH_INFOS.match(val)
-                        ),
+                    spec["value"] = (
+                        f"{authtype} {','.join((val for val in _split_digest_auth(value[6:].strip()) if DIGEST_AUTH_INFOS.match(val)))}"
                     )
                 except Exception:
                     utils.LOGGER.warning(
@@ -276,13 +281,8 @@ def _prepare_rec(spec, ignorenets, neverignore):
             if authtype.lower() == "digest":
                 try:
                     # we only keep relevant info
-                    spec["value"] = "%s %s" % (
-                        authtype,
-                        ",".join(
-                            val
-                            for val in _split_digest_auth(value[6:].strip())
-                            if DIGEST_AUTH_INFOS.match(val)
-                        ),
+                    spec["value"] = (
+                        f"{authtype} {','.join((val for val in _split_digest_auth(value[6:].strip()) if DIGEST_AUTH_INFOS.match(val)))}"
                     )
                 except Exception:
                     utils.LOGGER.warning(
@@ -312,7 +312,7 @@ def _prepare_rec(spec, ignorenets, neverignore):
                     "service_product": scanner,
                 }
                 if probe is not None:
-                    info["service_extrainfo"] = "TCP probe %s" % probe
+                    info["service_extrainfo"] = f"TCP probe {probe}"
                 spec.setdefault("infos", {}).update(info)
             else:
                 probe = utils.get_nmap_probes("tcp").get(data)
@@ -321,7 +321,7 @@ def _prepare_rec(spec, ignorenets, neverignore):
                         {
                             "service_name": "scanner",
                             "service_product": "Nmap",
-                            "service_extrainfo": "TCP probe %s" % probe,
+                            "service_extrainfo": f"TCP probe {probe}",
                         }
                     )
     elif spec["recontype"] == "UDP_HONEYPOT_HIT":
@@ -333,7 +333,7 @@ def _prepare_rec(spec, ignorenets, neverignore):
                 "service_product": scanner,
             }
             if probe is not None:
-                info["service_extrainfo"] = "UDP probe %s" % probe
+                info["service_extrainfo"] = f"UDP probe {probe}"
             spec.setdefault("infos", {}).update(info)
         else:
             probe = utils.get_nmap_probes("udp").get(data)
@@ -342,7 +342,7 @@ def _prepare_rec(spec, ignorenets, neverignore):
                     {
                         "service_name": "scanner",
                         "service_product": "Nmap",
-                        "service_extrainfo": "UDP probe %s" % probe,
+                        "service_extrainfo": f"UDP probe {probe}",
                     }
                 )
             else:
@@ -352,31 +352,65 @@ def _prepare_rec(spec, ignorenets, neverignore):
                         {
                             "service_name": "scanner",
                             "service_product": "Nmap",
-                            "service_extrainfo": "UDP payload %s" % payload,
+                            "service_extrainfo": f"UDP payload {payload}",
                         }
                     )
+    elif spec["recontype"] == "STUN_HONEYPOT_REQUEST":
+        spec["value"] = utils.nmap_decode_data(spec["value"])
     # SSL_{CLIENT,SERVER} JA3
     elif (spec["recontype"] == "SSL_CLIENT" and spec["source"] == "ja3") or (
         spec["recontype"] == "SSL_SERVER" and spec["source"].startswith("ja3-")
     ):
         value = spec["value"]
-        spec.setdefault("infos", {})["raw"] = value
-        spec["value"] = hashlib.new("md5", value.encode()).hexdigest()
+        if MD5.search(value) is None:
+            spec.setdefault("infos", {})["raw"] = value
+            spec["value"] = hashlib.new(
+                "md5", data=value.encode(), usedforsecurity=False
+            ).hexdigest()
         if spec["recontype"] == "SSL_SERVER":
             clientvalue = spec["source"][4:]
-            spec["infos"].setdefault("client", {})["raw"] = clientvalue
-            spec["source"] = (
-                "ja3-%s"
-                % hashlib.new(
-                    "md5",
-                    clientvalue.encode(),
-                ).hexdigest()
-            )
+            if MD5.search(clientvalue) is None:
+                spec["infos"].setdefault("client", {})["raw"] = clientvalue
+                spec["source"] = (
+                    f"ja3-{hashlib.new('md5', data=clientvalue.encode(), usedforsecurity=False).hexdigest()}"
+                )
+            else:
+                spec["source"] = f"ja3-{clientvalue}"
+    # SSL_CLIENT JA4
+    elif spec["recontype"] == "SSL_CLIENT" and spec["source"] == "ja4":
+        info = spec.setdefault("infos", {})
+        value = spec["value"]
+        if (ja4_raw_match := JA4_RAW.search(value)) is not None:
+            info.update(ja4_raw_match.groupdict())
+            if info["ja4_c2_raw"] is None:
+                info["ja4_c2_raw"] = ""
+            info["ja4_b"] = hashlib.new(
+                "sha256", data=info["ja4_b_raw"].encode()
+            ).hexdigest()[:12]
+            if info["ja4_c2_raw"]:
+                ja4_c_raw = f"{info['ja4_c1_raw']}_{info['ja4_c2_raw']}"
+            else:
+                ja4_c_raw = info["ja4_c1_raw"]
+            info["ja4_c"] = hashlib.new("sha256", data=ja4_c_raw.encode()).hexdigest()[
+                :12
+            ]
+            spec["value"] = f"{info['ja4_a']}_{info['ja4_b']}_{info['ja4_c']}"
+        else:
+            ja4_match = JA4.search(value)
+            if ja4_match is not None:
+                info.update(ja4_match.groupdict())
+            else:
+                utils.LOGGER.warning("Incorrect value for JA4 in record %r", spec)
     # SSH_{CLIENT,SERVER}_HASSH
     elif spec["recontype"] in ["SSH_CLIENT_HASSH", "SSH_SERVER_HASSH"]:
         value = spec["value"]
         spec.setdefault("infos", {})["raw"] = value
-        spec["value"] = hashlib.new("md5", value.encode()).hexdigest()
+        spec["value"] = hashlib.new(
+            "md5", data=value.encode(), usedforsecurity=False
+        ).hexdigest()
+    # SSH_SERVER_HOSTKEY
+    elif spec["recontype"] == "SSH_SERVER_HOSTKEY":
+        spec["value"] = utils.encode_b64(utils.nmap_decode_data(spec["value"])).decode()
     # Check DNS Blacklist answer
     elif spec["recontype"] == "DNS_ANSWER":
         if any(
@@ -388,7 +422,7 @@ def _prepare_rec(spec, ignorenets, neverignore):
             if match is not None:
                 spec["recontype"] = "DNS_BLACKLIST"
                 spec["value"] = spec.get("addr")
-                spec["source"] = "%s-%s" % (dnsbl_val[match.end() :], spec["source"])
+                spec["source"] = f"{dnsbl_val[match.end():]}-{spec['source']}"
                 addr = match.group()
                 # IPv4
                 if addr.count(".") == 4:
@@ -403,7 +437,7 @@ def handle_rec(
     sensor,
     ignorenets,
     neverignore,
-    # these argmuments are provided by **bro_line
+    # these arguments are provided by **bro_line
     timestamp=None,
     uid=None,
     host=None,
@@ -488,9 +522,7 @@ def _getinfos_dns(spec):
         try:
             if value not in spec:
                 continue
-            infos[field] = []
-            for domain in utils.get_domains(spec[value]):
-                infos[field].append(domain)
+            infos[field] = list(utils.get_domains(spec[value]))
             if not infos[field]:
                 del infos[field]
         except Exception:
@@ -506,9 +538,7 @@ def _getinfos_dns_blacklist(spec):
     infos = {}
     try:
         if "source" in spec:
-            infos["domain"] = []
-            for domain in utils.get_domains(spec["source"].split("-")[-4]):
-                infos["domain"].append(domain)
+            infos["domain"] = list(utils.get_domains(spec["source"].split("-")[-4]))
             if not infos["domain"]:
                 del infos["domain"]
     except Exception:
@@ -541,9 +571,17 @@ def _getinfos_cert(spec):
     try:
         cert = utils.decode_b64(spec["value"].encode())
     except Exception:
-        utils.LOGGER.info("Cannot parse certificate for record %r", spec, exc_info=True)
+        utils.LOGGER.info(
+            "Cannot decode certificate for record %r", spec, exc_info=True
+        )
         return {}
-    info = utils.get_cert_info(cert)
+    try:
+        info = utils.get_cert_info(cert)
+    except Exception:
+        utils.LOGGER.warning(
+            "Cannot parse certificate for record %r", spec, exc_info=True
+        )
+        return {}
     res = {}
     if info:
         res["infos"] = info
@@ -552,26 +590,35 @@ def _getinfos_cert(spec):
 
 def _getinfos_ja3_hassh(spec):
     """Extract hashes from JA3 & HASSH fingerprint strings."""
-    value = spec["infos"]["raw"]
-    data = value.encode()
-
-    info = dict(
-        (
-            (hashtype, hashlib.new(hashtype, data).hexdigest())
-            for hashtype in ["sha1", "sha256"]
-        ),
-        **spec["infos"],
-    )
-
-    if spec.get("recontype") == "SSL_SERVER":
-        clientvalue = spec["infos"]["client"]["raw"]
-        clientdata = clientvalue.encode()
-        info["client"].update(
-            (hashtype, hashlib.new(hashtype, clientdata).hexdigest())
-            for hashtype in ["sha1", "sha256"]
+    try:
+        value = spec["infos"]["raw"]
+    except KeyError:
+        info = dict(spec.get("infos", {}))
+    else:
+        data = value.encode()
+        info = dict(
+            (
+                (hashtype, hashlib.new(hashtype, data).hexdigest())
+                for hashtype in ["sha1", "sha256"]
+            ),
+            **spec["infos"],
         )
 
-    return {"infos": info}
+    if spec.get("recontype") == "SSL_SERVER":
+        try:
+            clientvalue = spec["infos"]["client"]["raw"]
+        except KeyError:
+            pass
+        else:
+            clientdata = clientvalue.encode()
+            info["client"].update(
+                (hashtype, hashlib.new(hashtype, clientdata).hexdigest())
+                for hashtype in ["sha1", "sha256"]
+            )
+
+    if info:
+        return {"infos": info}
+    return {}
 
 
 def _getinfos_from_banner(banner, proto="tcp", probe="NULL"):
@@ -604,7 +651,7 @@ def _getinfos_ssh(spec):
 def _getinfos_ssh_hostkey(spec):
     """Parse SSH host keys."""
     infos = {}
-    data = utils.nmap_decode_data(spec["value"])
+    data = utils.decode_b64(spec["value"].encode())
     for hashtype in ["md5", "sha1", "sha256"]:
         infos[hashtype] = hashlib.new(hashtype, data).hexdigest()
     info = utils.parse_ssh_key(data)
@@ -743,3 +790,25 @@ def getinfos(spec):
     if function is None:
         return {}
     return function(spec)
+
+
+def get_ignore_rules(
+    ignore_spec: str | None,
+) -> dict[str, dict[str, list[tuple[int, int]]]]:
+    """Executes the ignore_spec file and returns the ignore_rules
+    dictionary.
+
+    """
+    ignore_rules: dict[str, dict[str, list[tuple[int, int]]]] = {}
+    if ignore_spec is not None:
+        with open(ignore_spec, "rb") as fdesc:
+            # pylint: disable=exec-used
+            exec(compile(fdesc.read(), ignore_spec, "exec"), ignore_rules)
+    subdict = ignore_rules.get("IGNORENETS")
+    if subdict:
+        for subkey, values in subdict.items():
+            subdict[subkey] = [
+                (utils.force_ip2int(val[0]), utils.force_ip2int(val[1]))
+                for val in values
+            ]
+    return ignore_rules

@@ -1,8 +1,7 @@
 #! /usr/bin/env python
-# -*- coding: utf-8 -*-
 
 # This file is part of IVRE.
-# Copyright 2011 - 2021 Pierre LALET <pierre@droids-corp.org>
+# Copyright 2011 - 2024 Pierre LALET <pierre@droids-corp.org>
 #
 # IVRE is free software: you can redistribute it and/or modify it
 # under the terms of the GNU General Public License as published by
@@ -24,11 +23,10 @@ script.
 
 import datetime
 import functools
-import hmac
 import os
 import re
 import shlex
-import sys
+from typing import Any, Callable
 
 try:
     import MySQLdb  # type: ignore
@@ -38,39 +36,147 @@ except ImportError:
     HAVE_MYSQL = False
 
 
-from bottle import request  # type: ignore
-
+from bottle import abort, request  # type: ignore
+from regexploit.ast.sre import SreOpParser  # type: ignore[import-untyped]
+from regexploit.redos import find as _regexploit_find  # type: ignore[import-untyped]
 
 from ivre import config, utils
-
-
-def js_alert(ident, level, message):
-    """This function returns a string containing JS code to
-    generate an alert message.
-
-    """
-    return (
-        'try {add_message("%(ident)s", "%(level)s", "%(message)s");}\n'
-        'catch(err) {alert("%(levelup)s: %(message)s");}\n'
-        ""
-        % {
-            "ident": ident,
-            "level": level,
-            "levelup": level.upper(),
-            "message": message.replace('"', '\\"'),
-        }
-    )
-
-
-def js_del_alert(ident):
-    """This function returns a string containing JS code to
-    remove an alert message.
-
-    """
-    return 'try {del_message("%s");} catch(err) {}\n' % ident
-
+from ivre.db import db
+from ivre.plugins import load_plugins
+from ivre.types import Filter
+from ivre.web.base import extract_api_key
 
 GET_NOTEPAD_PAGES = {}
+
+
+_REGEX_BUDGET_DEFAULT: object = object()
+
+
+def validate_regex_complexity(
+    pattern: str,
+    *,
+    max_length: int | None | object = _REGEX_BUDGET_DEFAULT,
+    starriness_limit: int | None | object = _REGEX_BUDGET_DEFAULT,
+) -> None:
+    """Validate a user-supplied regex pattern against the
+    ``WEB_REGEX_*`` complexity budget.
+
+    Raises ``ValueError`` if either budget is exceeded. The
+    function is designed to run before user-supplied regex
+    literals (e.g. arriving via the Web API ``q=`` parameter) are
+    compiled or forwarded to ``$regex``, as defence-in-depth on
+    top of the server-side ``MONGODB_QUERY_TIMEOUT_MS`` cap.
+
+    Two rules are enforced:
+
+      1. ``len(pattern) <= max_length`` — bounds the size of the
+         pattern fed to the analyser, the regex compiler and the
+         database.
+      2. The pattern's regexploit "starriness" must not exceed
+         ``starriness_limit``. starriness is the depth of nested
+         unbounded repetition that an attacker can drive through
+         backtracking; it is the standard exploitability metric
+         for nested-quantifier and alternation-overlap ReDoS
+         (``(a+)+x``, ``(a|a)*x``, ``(?:.*)*x``, ...). The
+         analysis is performed by the ``regexploit`` library
+         (Doyensec, Apache-2.0), which builds an AST from
+         CPython's own ``sre_parse`` output and searches for
+         pumping sequences with a "killer" suffix.
+
+    Defaults for ``max_length`` and ``starriness_limit`` are
+    pulled from ``ivre.config.WEB_REGEX_MAX_LENGTH`` /
+    ``ivre.config.WEB_REGEX_STARRINESS_LIMIT`` when the argument
+    is not passed. Passing the argument explicitly as ``None``
+    disables that specific check (this distinction matters for
+    callers that want to ignore the operator-configured default).
+
+    Note: regexploit's own dependence on ``sre_parse`` (which is
+    deprecated in CPython 3.11+ but still functional) is the only
+    reason this validator is not entirely future-proof. If
+    ``sre_parse`` is removed in a future Python release,
+    regexploit will need to migrate to ``re._parser`` first.
+    """
+    if not isinstance(pattern, str):
+        return
+
+    if max_length is _REGEX_BUDGET_DEFAULT:
+        max_length = config.WEB_REGEX_MAX_LENGTH
+    if starriness_limit is _REGEX_BUDGET_DEFAULT:
+        starriness_limit = config.WEB_REGEX_STARRINESS_LIMIT
+
+    if (
+        max_length is not None
+        and isinstance(max_length, int)
+        and len(pattern) > max_length
+    ):
+        raise ValueError(
+            f"Regex exceeds maximum length ({len(pattern)} > {max_length})"
+        )
+
+    if starriness_limit is None:
+        return
+
+    try:
+        parsed = SreOpParser().parse_sre(pattern)
+    except re.error as exc:
+        # Re-raise as ``ValueError``, the codebase-wide "malformed
+        # user input" signal; the web application maps it to HTTP
+        # 400 (``bad_input_plugin`` in :mod:`ivre.web.base`).
+        raise ValueError(f"Invalid regex pattern: {exc}") from exc
+
+    if parsed is None:
+        # Empty / no-op pattern; nothing to analyse.
+        return
+
+    if not isinstance(starriness_limit, int):
+        return
+
+    for finding in _regexploit_find(parsed):
+        if finding.starriness > starriness_limit:
+            raise ValueError(
+                "Regex pattern is vulnerable to ReDoS "
+                f"(starriness={finding.starriness}, "
+                f"limit={starriness_limit})"
+            )
+
+
+def _validate_user_regex(value: object) -> None:
+    """Validate a user-supplied ``str2regexp`` argument against the
+    ``WEB_REGEX_*`` complexity budget.
+
+    Only values that ``utils.str2regexp`` would interpret as a
+    regex (``"/.../[flags]"`` syntax) are checked. Plain string
+    values, the special ``"-"`` sentinel honoured by
+    ``str2regexpnone``, and non-string inputs pass through
+    unchanged. ``ValueError`` is raised on overflow; the Bottle
+    application converts it into an HTTP 400 JSON response (via
+    ``bad_input_plugin``, registered application-wide in
+    :mod:`ivre.web.base`), and the MCP server surfaces it as a
+    tool error.
+    """
+    if not isinstance(value, str):
+        return
+    if not value.startswith("/"):
+        return
+    inner = value[1:]
+    # Mirror the ``str2regexp`` rsplit so we validate the inner
+    # pattern rather than the trailing ``/flags`` block.
+    if "/" in inner:
+        inner, _flags = inner.rsplit("/", 1)
+    validate_regex_complexity(inner)
+
+
+def str2regexp(value: str) -> str | re.Pattern[str]:
+    """Validating wrapper over ``utils.str2regexp`` for inputs
+    arriving from the network. See ``_validate_user_regex``."""
+    _validate_user_regex(value)
+    return utils.str2regexp(value)  # type: ignore[no-any-return]
+
+
+def str2regexpnone(value: str) -> str | re.Pattern[str] | bool:
+    """Validating wrapper over ``utils.str2regexpnone``."""
+    _validate_user_regex(value)
+    return utils.str2regexpnone(value)  # type: ignore[no-any-return]
 
 
 def get_notepad_pages_localdokuwiki(pagesdir="/var/lib/dokuwiki/data/pages"):
@@ -94,11 +200,10 @@ if HAVE_MYSQL:
         page exists.
 
         """
-        ipaddr_page = "^" + re.escape(base) + "\\/\\d+\\.\\d+\\.\\d+\\.\\d+$"
         cur = MySQLdb.Connect(server, username, password, dbname).cursor()
         cur.execute(
-            "SELECT `page_title` FROM `wiki_page` WHERE `page_title` "
-            "REGEXP '%s'" % ipaddr_page
+            "SELECT `page_title` FROM `wiki_page` WHERE `page_title` REGEXP %s",
+            (f"^{re.escape(base)}" + "\\/\\d+\\.\\d+\\.\\d+\\.\\d+$",),
         )
         return [page[0][len(base) + 1 :] for page in cur]
 
@@ -123,13 +228,46 @@ def _find_get_notepad_pages():
 get_notepad_pages = _find_get_notepad_pages()
 
 
+def _split_param(pval: str) -> list[str | None]:
+    # This is needed for IPv6 filters
+    if utils.IPADDR.search(pval):
+        return [pval, None]
+    if utils.NETADDR.search(pval):
+        return [pval, None]
+    if ":" in pval:
+        return pval.split(":", 1)
+    return [pval, None]
+
+
+def _split_query(query: str) -> list[str]:
+    """Split a query string into whitespace-separated tokens, with
+    single or double quotes grouping values that contain whitespace.
+
+    This is a `shlex.split()` variant with escape processing
+    disabled: backslashes are ordinary characters, so regex-heavy
+    values such as ``cert.subject:/.*\\.example\\.com/`` reach the
+    filter (and ultimately the regex engine) unmodified. To include
+    a literal quote character in a value, quote it with the other
+    quote character.
+
+    Raises ``ValueError`` on unbalanced quotes.
+    """
+    lex = shlex.shlex(query, posix=True)
+    lex.whitespace_split = True
+    lex.commenters = ""
+    lex.escape = ""
+    return list(lex)
+
+
 def query_from_params(params):
     """This function *consumes* the 'q' parameter (if it exists) and
     returns the query as a list of three elements list: [boolean
     `neg`, `param`, `value`].
 
-    This function will write an error message and abort the CGI if an
-    error occurs with `shlex.split()`.
+    Raises ``ValueError`` if `_split_query()` fails on the query
+    string; the web application surfaces the error as HTTP 400 via
+    ``bad_input_plugin`` (:mod:`ivre.web.base`), and the MCP server
+    reports it as a tool error.
 
     """
     try:
@@ -137,42 +275,108 @@ def query_from_params(params):
     except KeyError:
         return []
     try:
-        query = query.replace("\\", "\\\\")
         return [
-            [neg] + pval.split(":", 1) if ":" in pval else [neg, pval, None]
+            [neg] + _split_param(pval)
             for neg, pval in (
                 (True, x[1:]) if x[:1] in "!-" else (False, x)
-                for x in shlex.split(query)
+                for x in _split_query(query)
             )
         ]
     except ValueError as exc:
-        sys.stdout.write(
-            js_alert(
-                "param-parsing",
-                "warning",
-                "Parameter parsing error. Check the server's logs "
-                "for more information.",
-            )
-        )
         utils.LOGGER.critical("Parameter parsing error [%s (%r)]", exc, exc)
-        raise ValueError("Parameter parsing error.")
+        raise ValueError("Parameter parsing error") from exc
 
 
-def get_user():
-    """Return the connected user."""
-    return request.environ.get("REMOTE_USER")
+def is_admin_email(user_email: str | None) -> bool:
+    """Return ``True`` when ``user_email`` resolves to an
+    administrative user in :data:`ivre.db.db.auth`.
 
+    Used by the audit read API in :mod:`ivre.web.app` to
+    apply the admin-or-self gate without reaching into
+    ``ivre.web.auth`` (that module is conditionally imported
+    only when ``WEB_AUTH_ENABLED`` is true).
 
-def get_anonymized_user():
-    """Return the HMAC value of the current user authenticated with
-    the HMAC secret.
+    Note: :func:`ivre.web.auth._ensure_admin` still performs
+    the admin lookup inline rather than delegating here.
+    Consolidating the two is intentionally out of scope for
+    the audit work, because :func:`_ensure_admin` aborts with
+    HTTP 500 on a missing auth backend / transient DB error
+    while this helper is deliberately fail-closed (returns
+    ``False``).  Merging them is a real auth-gate semantic
+    change and deserves its own review.
 
+    Returns ``False`` for every non-admin path:
+
+    * ``user_email`` is ``None`` (no resolved caller);
+    * ``db.auth`` is ``None`` (no auth backend configured);
+    * the user record is missing or does not carry
+      ``is_admin = True``.
+
+    The check is fail-closed: a transient backend failure that
+    causes ``get_user_by_email`` to return ``None`` is treated
+    as "not an admin" rather than crashing the caller; the
+    caller's own auth gate decides how to escalate.
     """
+    if user_email is None:
+        return False
+    if db.auth is None:
+        return False
     try:
-        secret = config.WEB_SECRET.encode()
-    except AttributeError:
-        secret = config.WEB_SECRET
-    return utils.encode_b64(hmac.new(secret, msg=get_user().encode()).digest()[:9])
+        user_doc = db.auth.get_user_by_email(user_email)
+    except Exception:
+        utils.LOGGER.error(
+            "is_admin_email: get_user_by_email failed for %r",
+            user_email,
+            exc_info=True,
+        )
+        return False
+    return bool(user_doc and user_doc.get("is_admin"))
+
+
+def get_user() -> str | None:
+    """Return the connected user."""
+    if not config.WEB_AUTH_ENABLED:
+        return request.environ.get("REMOTE_USER")
+
+    # 1. Check session cookie. Mirror the cache-reader's
+    # ``email`` requirement so a session record without an
+    # email field falls through to the next resolution step
+    # rather than crashing on ``user["email"]`` -> ``KeyError``
+    # -> 500.
+    session_token = request.get_cookie("_ivre_session", secret=config.WEB_SECRET)
+    if session_token and db.auth is not None:
+        user = db.auth.validate_session(session_token)
+        if user and user.get("is_active") and user.get("email"):
+            return user["email"]
+
+    # 2. Check API key. If an upstream gate (e.g.
+    # :func:`ivre.web.base.quota_gated`) has already validated
+    # the key for this request, reuse its cached user record
+    # rather than hitting the DB twice (and double-stamping
+    # ``last_used``).
+    cached_user = request.environ.get("ivre.api_key_user")
+    if (
+        isinstance(cached_user, dict)
+        and cached_user.get("is_active")
+        and cached_user.get("email")
+    ):
+        return cached_user["email"]
+    # Same ``email``-required check as the session-cookie path
+    # and the cache reader above: a half-formed user dict from
+    # ``validate_api_key`` must not crash on ``user["email"]``.
+    api_key = extract_api_key()
+    if api_key and db.auth is not None:
+        user = db.auth.validate_api_key(api_key)
+        if user and user.get("is_active") and user.get("email"):
+            return user["email"]
+
+    # 3. Check REMOTE_USER (reverse proxy)
+    remote_user = request.environ.get("REMOTE_USER")
+    if remote_user and db.auth is not None:
+        db.auth.ensure_remote_user(remote_user)
+        return remote_user
+
+    return None
 
 
 def _parse_query(dbase, query):
@@ -192,29 +396,198 @@ def _parse_query(dbase, query):
     }[query[0]](dbase, *query[1:])
 
 
-def get_init_flt(dbase):
-    """Return a filter corresponding to the current user's
-    privileges.
+# ---------------------------------------------------------------------
+# Filter-injection hook
+#
+# Plugins register zero or more callables in :data:`FILTER_INJECTORS`
+# via the ``ivre.plugins.web.filter`` entry-point group. Each
+# registered callable is invoked from :func:`get_init_flt_for` (and
+# therefore from every code path that builds the base filter: Bottle
+# routes via :func:`get_init_flt`, the MCP server's ``_parse``,
+# …); its return value (if not ``None``) is AND'd into the user's
+# base filter before any user-supplied query is applied.
+#
+# This is the in-tree extension point for out-of-tree
+# authorization / scoping plugins. The plugin reads the
+# authenticated identity (the ``user`` argument, or anything
+# else it pulls from the request, the auth backend, an external
+# IAM, ...) and returns a backend filter clause; the hook AND's
+# that clause into every query the user can run. The policy
+# itself -- who can see what, default-deny vs. default-allow,
+# cross-principal share rules, audit requirements -- is
+# deployment-specific and lives in the plugin; core stays
+# policy-agnostic and only ships the hook. The contract is
+# intentionally minimal: a registered callable receives
+# ``(dbase, user)`` and returns either ``None`` (no clause to
+# inject for this pair) or a backend filter object that
+# ``dbase.flt_and`` can compose with the base filter.
+#
+# Failure model: fail-closed. An uncaught exception in an
+# injector means the plugin could not determine the scope it
+# was supposed to enforce; for an authorization control,
+# silently continuing with whatever ``_resolve_init_flt``
+# returned would be fail-open (the user runs against the base
+# filter, often :data:`flt_empty`, i.e. the whole database).
+# :func:`apply_filter_injectors` therefore logs the failure
+# via :data:`ivre.utils.LOGGER` at ``ERROR`` level with
+# ``exc_info=True`` and the failing injector's identity, then
+# re-raises so the request is aborted -- the web layer turns the
+# unhandled exception into an HTTP error (``500``, or ``400`` for
+# ``ValueError`` via ``bad_input_plugin`` in
+# :mod:`ivre.web.base`) and the MCP server surfaces it as a tool
+# error. A plugin that wants graceful degradation
+# (e.g. fall back to a deny-all clause on a transient IAM
+# outage) catches the failure itself and returns a backend
+# deny clause -- ``dbase.searchnonexistent()`` on every
+# backend that ships one, the in-tree ``noaccess`` preset is
+# exactly this pattern. The composing call ``dbase.flt_and``
+# is likewise not wrapped: an un-composable clause is a
+# contract violation by the plugin and must surface as an
+# error rather than be silently dropped.
+# ---------------------------------------------------------------------
 
+FilterInjector = Callable[[Any, str | None], Filter | None]
+
+FILTER_INJECTORS: list[FilterInjector] = []
+
+
+def register_filter_injector(func: FilterInjector) -> FilterInjector:
+    """Register a filter-injection callable and return it unchanged.
+
+    The callable receives ``(dbase, user)`` and returns either:
+
+    * ``None`` — no clause to inject for this ``(dbase, user)``
+      pair;
+    * a backend filter — will be AND'd into the user's base
+      filter before any user-supplied query is applied.
+
+    Returns the registered function unchanged so it can be used
+    as a decorator. Plugins typically call this from an
+    ``_install_<name>(scope)`` entry-point (the ``scope`` argument
+    is the :func:`globals` of this module, but the function is
+    importable directly so plugins do not have to reach into it).
+    """
+    FILTER_INJECTORS.append(func)
+    return func
+
+
+def apply_filter_injectors(dbase: Any, base_flt: Filter, user: str | None) -> Filter:
+    """Compose every registered :data:`FILTER_INJECTORS` callable
+    on top of ``base_flt`` and return the resulting filter.
+
+    Injectors are called in registration order. A return value of
+    ``None`` skips the injector; any other value is AND'd into
+    the accumulator via ``dbase.flt_and``.
+
+    Fail-closed on uncaught injector exceptions: an uncaught
+    exception means the plugin could not determine the scope it
+    was supposed to enforce, so the request is aborted. The
+    failing injector and the original exception are logged via
+    :data:`ivre.utils.LOGGER` at ``ERROR`` level with
+    ``exc_info=True``, then the exception is re-raised; later
+    injectors are *not* invoked. The web layer turns the unhandled
+    exception into an HTTP error (``500``, or ``400`` for
+    ``ValueError`` via ``bad_input_plugin`` in
+    :mod:`ivre.web.base`) and the MCP server surfaces it as a
+    tool error. A plugin that wants graceful degradation (e.g.
+    fall back to a deny-all clause on a transient IAM outage)
+    catches the failure itself and returns a backend deny
+    clause -- ``dbase.searchnonexistent()`` on every backend
+    that ships one.
+
+    The composing call ``dbase.flt_and`` is likewise not
+    wrapped: an un-composable clause (wrong backend shape,
+    malformed operator, ...) is a contract violation by the
+    plugin and must surface as an error rather than be silently
+    dropped.
+    """
+    flt = base_flt
+    for inj in FILTER_INJECTORS:
+        try:
+            clause = inj(dbase, user)
+        except Exception:
+            # Authorization / scoping plugins are security
+            # controls: an uncaught exception means the plugin
+            # could not return a scope clause, and continuing
+            # would silently apply the bare base filter (often
+            # ``flt_empty``) -- i.e. fail-open. Log loudly with
+            # the failing injector's identity + traceback, then
+            # re-raise so the request fails closed.
+            utils.LOGGER.error(
+                "Filter injector %r raised; aborting request", inj, exc_info=True
+            )
+            raise
+        if clause is not None:
+            flt = dbase.flt_and(flt, clause)
+    return flt
+
+
+def _resolve_init_flt(user: str | None, dbase: Any) -> Filter:
+    """Resolve the legacy ``WEB_INIT_QUERIES`` dispatch.
+
+    Factored out of :func:`get_init_flt_for` so the latter can
+    wrap the result with :func:`apply_filter_injectors` in a
+    single exit point.
     """
     init_queries = {
         key: _parse_query(dbase, value)
         for key, value in config.WEB_INIT_QUERIES.items()
     }
-    user = get_user()
     if user in init_queries:
         return init_queries[user]
     if isinstance(user, str) and "@" in user:
         realm = user[user.index("@") :]
         if realm in init_queries:
             return init_queries[realm]
-    if config.WEB_PUBLIC_SRV:
-        return dbase.searchcategory(["Shared", get_anonymized_user()])
+    # Group-based access control (when auth is enabled)
+    if config.WEB_AUTH_ENABLED and user:
+        if db.auth is not None:
+            for group in db.auth.get_user_groups(user):
+                key = f"group:{group}"
+                if key in init_queries:
+                    return init_queries[key]
     return _parse_query(dbase, config.WEB_DEFAULT_INIT_QUERY)
 
 
+def get_init_flt_for(user: str | None, dbase: Any) -> Filter:
+    """Return a filter corresponding to the given user's privileges.
+
+    Unlike :func:`get_init_flt`, this function does not consult the
+    current Bottle request and does not abort on unauthenticated users;
+    callers are expected to have resolved the user beforehand (for
+    instance from an MCP transport) and to handle the unauthenticated
+    case themselves.
+
+    ``user`` must be either a user email (``str``) or ``None`` to mean
+    "no authenticated user".
+
+    Out-of-tree plugins registered via
+    :data:`FILTER_INJECTORS` get the final say: their clauses
+    are AND'd into the returned filter via
+    :func:`apply_filter_injectors`. This is how an optional
+    authorization / scoping plugin enforces a deployment-specific
+    access policy without requiring core changes.
+    """
+    return apply_filter_injectors(dbase, _resolve_init_flt(user, dbase), user)
+
+
+def get_init_flt(dbase):
+    """Return a filter corresponding to the current user's
+    privileges.
+
+    """
+    user = get_user()
+    # When auth is enabled, deny access to unauthenticated users
+    if config.WEB_AUTH_ENABLED and user is None:
+        abort(401, "Authentication required")
+    return get_init_flt_for(user, dbase)
+
+
+PORT = re.compile("^(?:(tcp|udp)[/_])?([0-9]+)$")
+
+
 def flt_from_query(dbase, query, base_flt=None):
-    """Return a tuple (`flt`, `sortby`, `unused`, `skip`, `limit`):
+    """Return a tuple (`flt`, `sortby`, `unused`, `skip`, `limit`, `fields`):
 
     - a filter based on the query
 
@@ -231,6 +604,7 @@ def flt_from_query(dbase, query, base_flt=None):
     sortby = []
     skip = 0
     limit = None
+    fields = None
     flt = get_init_flt(dbase) if base_flt is None else base_flt
 
     def add_unused(neg, param, value):
@@ -239,18 +613,25 @@ def flt_from_query(dbase, query, base_flt=None):
 
         """
         unused.append(
-            "%s%s"
-            % (
-                "-" if neg else "",
-                "%s=%s" % (param, value) if value is not None else param,
-            )
+            f"{'-' if neg else ''}{f'{param}={value}' if value is not None else param}"
         )
 
-    for (neg, param, value) in query:
+    for neg, param, value in query:
         if not neg and param == "skip":
-            skip = int(value)
+            # Clamp to a non-negative offset: a negative skip would
+            # corrupt the result window (and, on the SQL/slice paths,
+            # silently index from the end of the set).
+            skip = max(0, int(value))
         elif not neg and param == "limit":
             limit = int(value)
+            if limit < 0:
+                # A negative limit is meaningless; fall back to the
+                # default by leaving it unset rather than propagating
+                # a negative value to the database layer. ``limit == 0``
+                # is preserved (callers treat it as "no limit").
+                limit = None
+        elif not neg and param == "fields":
+            fields = value.split(",")
         elif param == "id":
             flt = dbase.flt_and(
                 flt, dbase.searchobjectid(value.replace("-", ",").split(","), neg=neg)
@@ -274,31 +655,67 @@ def flt_from_query(dbase, query, base_flt=None):
                     flt, dbase.searchcountopenports(minn=vals[0], maxn=vals[1], neg=neg)
                 )
         elif param == "hostname":
-            flt = dbase.flt_and(
-                flt, dbase.searchhostname(utils.str2regexp(value), neg=neg)
-            )
+            flt = dbase.flt_and(flt, dbase.searchhostname(str2regexp(value), neg=neg))
         elif param == "domain":
-            flt = dbase.flt_and(
-                flt, dbase.searchdomain(utils.str2regexp(value), neg=neg)
-            )
+            flt = dbase.flt_and(flt, dbase.searchdomain(str2regexp(value), neg=neg))
         elif param == "category":
-            flt = dbase.flt_and(
-                flt, dbase.searchcategory(utils.str2regexp(value), neg=neg)
-            )
-        elif param == "country":
+            flt = dbase.flt_and(flt, dbase.searchcategory(str2regexp(value), neg=neg))
+        elif param == "country" and hasattr(dbase, "searchcountry"):
             flt = dbase.flt_and(
                 flt, dbase.searchcountry(utils.str2list(value.upper()), neg=neg)
             )
-        elif param == "city":
-            flt = dbase.flt_and(flt, dbase.searchcity(utils.str2regexp(value), neg=neg))
-        elif param == "asnum":
+        elif param == "city" and hasattr(dbase, "searchcity"):
+            flt = dbase.flt_and(flt, dbase.searchcity(str2regexp(value), neg=neg))
+        elif param == "asnum" and hasattr(dbase, "searchasnum"):
             flt = dbase.flt_and(flt, dbase.searchasnum(utils.str2list(value), neg=neg))
-        elif param == "asname":
-            flt = dbase.flt_and(
-                flt, dbase.searchasname(utils.str2regexp(value), neg=neg)
-            )
+        elif param == "asname" and hasattr(dbase, "searchasname"):
+            flt = dbase.flt_and(flt, dbase.searchasname(str2regexp(value), neg=neg))
+        elif param == "sourcefile" and hasattr(dbase, "searchsourcefile"):
+            # RIR-only today: filter on the basename of the source
+            # archive each record came from (e.g. ``ripe.db.inetnum.gz``).
+            # Other backends do not expose ``searchsourcefile`` and
+            # the param falls through to the unused list, which is the
+            # expected behaviour.
+            flt = dbase.flt_and(flt, dbase.searchsourcefile(str2regexp(value), neg=neg))
         elif param == "source":
-            flt = dbase.flt_and(flt, dbase.searchsource(value, neg=neg))
+            if hasattr(dbase, "searchrecontype"):
+                # Passive: dispatch through the generalized
+                # ``searchrecontype``. ``source:RECONTYPE:VALUE``
+                # filters on the ``(recontype, source)`` pair;
+                # ``source:VALUE`` (no colon) filters on
+                # ``source`` alone. The View / Active branches
+                # below stay on the legacy ``searchsource`` path
+                # because their backends do not couple ``source``
+                # to a ``recontype``.
+                if ":" in value:
+                    rectype_str, src_str = value.split(":", 1)
+                    flt = dbase.flt_and(
+                        flt,
+                        dbase.searchrecontype(
+                            rectype=str2regexp(rectype_str),
+                            source=str2regexp(src_str),
+                            neg=neg,
+                        ),
+                    )
+                else:
+                    flt = dbase.flt_and(
+                        flt,
+                        dbase.searchrecontype(source=str2regexp(value), neg=neg),
+                    )
+            else:
+                flt = dbase.flt_and(flt, dbase.searchsource(str2regexp(value), neg=neg))
+        elif param == "recontype" and hasattr(dbase, "searchrecontype"):
+            # Passive-only: filter on a passive record's
+            # ``recontype`` (DNS_ANSWER, HTTP_SERVER_HEADER,
+            # SSL_SERVER, ...). Other backends do not expose
+            # ``searchrecontype`` and the param falls through to
+            # the unused list, which is the expected behaviour.
+            flt = dbase.flt_and(flt, dbase.searchrecontype(str2regexp(value), neg=neg))
+        elif param == "sensor" and hasattr(dbase, "searchsensor"):
+            # Passive-only: filter on the sensor name an
+            # observation came from. Same backend-gating rationale
+            # as ``recontype``.
+            flt = dbase.flt_and(flt, dbase.searchsensor(str2regexp(value), neg=neg))
         elif param == "timerange":
             flt = dbase.flt_and(
                 flt,
@@ -314,7 +731,12 @@ def flt_from_query(dbase, query, base_flt=None):
                     "h": 3600,
                     "d": 86400,
                     "y": 31557600,
-                }[value[-1]]
+                }.get(value[-1])
+                if unit is None:
+                    # Surface malformed input as ``ValueError``
+                    # (HTTP 400 via the web app's bad-input
+                    # plugin) rather than ``KeyError`` (500).
+                    raise ValueError(f"Invalid timeago unit {value[-1]!r}")
                 timeago = int(value[:-1]) * unit
             else:
                 timeago = int(value)
@@ -326,28 +748,26 @@ def flt_from_query(dbase, query, base_flt=None):
                 req, port = value.split(":", 1)
                 port = int(port)
                 flt = dbase.flt_and(
-                    flt, dbase.searchservice(utils.str2regexpnone(req), port=port)
+                    flt, dbase.searchservice(str2regexpnone(req), port=port)
                 )
             else:
-                flt = dbase.flt_and(
-                    flt, dbase.searchservice(utils.str2regexpnone(value))
-                )
+                flt = dbase.flt_and(flt, dbase.searchservice(str2regexpnone(value)))
         elif not neg and param == "product" and ":" in value:
             product = value.split(":", 2)
             if len(product) == 2:
                 flt = dbase.flt_and(
                     flt,
                     dbase.searchproduct(
-                        product=utils.str2regexpnone(product[1]),
-                        service=utils.str2regexpnone(product[0]),
+                        product=str2regexpnone(product[1]),
+                        service=str2regexpnone(product[0]),
                     ),
                 )
             else:
                 flt = dbase.flt_and(
                     flt,
                     dbase.searchproduct(
-                        product=utils.str2regexpnone(product[1]),
-                        service=utils.str2regexpnone(product[0]),
+                        product=str2regexpnone(product[1]),
+                        service=str2regexpnone(product[0]),
                         port=int(product[2]),
                     ),
                 )
@@ -357,18 +777,18 @@ def flt_from_query(dbase, query, base_flt=None):
                 flt = dbase.flt_and(
                     flt,
                     dbase.searchproduct(
-                        product=utils.str2regexpnone(product[1]),
-                        version=utils.str2regexpnone(product[2]),
-                        service=utils.str2regexpnone(product[0]),
+                        product=str2regexpnone(product[1]),
+                        version=str2regexpnone(product[2]),
+                        service=str2regexpnone(product[0]),
                     ),
                 )
             else:
                 flt = dbase.flt_and(
                     flt,
                     dbase.searchproduct(
-                        product=utils.str2regexpnone(product[1]),
-                        version=utils.str2regexpnone(product[2]),
-                        service=utils.str2regexpnone(product[0]),
+                        product=str2regexpnone(product[1]),
+                        version=str2regexpnone(product[2]),
+                        service=str2regexpnone(product[0]),
                         port=int(product[3]),
                     ),
                 )
@@ -377,14 +797,14 @@ def flt_from_query(dbase, query, base_flt=None):
             if len(value) == 1:
                 flt = dbase.flt_and(
                     flt,
-                    dbase.searchscript(name=utils.str2regexp(value[0]), neg=neg),
+                    dbase.searchscript(name=str2regexp(value[0]), neg=neg),
                 )
             else:
                 flt = dbase.flt_and(
                     flt,
                     dbase.searchscript(
-                        name=utils.str2regexp(value[0]),
-                        output=utils.str2regexp(value[1]),
+                        name=str2regexp(value[0]),
+                        output=str2regexp(value[1]),
                         neg=neg,
                     ),
                 )
@@ -398,27 +818,27 @@ def flt_from_query(dbase, query, base_flt=None):
         elif not neg and param == "authhttp":
             flt = dbase.flt_and(flt, dbase.searchhttpauth())
         elif not neg and param == "banner":
-            flt = dbase.flt_and(flt, dbase.searchbanner(utils.str2regexp(value)))
-        elif param == "cookie":
+            flt = dbase.flt_and(flt, dbase.searchbanner(str2regexp(value)))
+        elif not neg and param == "cookie":
             flt = dbase.flt_and(flt, dbase.searchcookie(value))
-        elif param == "file":
+        elif not neg and param == "file":
             if value is None:
                 flt = dbase.flt_and(flt, dbase.searchfile())
             else:
                 value = value.split(":", 1)
                 if len(value) == 1:
                     flt = dbase.flt_and(
-                        flt, dbase.searchfile(fname=utils.str2regexp(value[0]))
+                        flt, dbase.searchfile(fname=str2regexp(value[0]))
                     )
                 else:
                     flt = dbase.flt_and(
                         flt,
                         dbase.searchfile(
-                            fname=utils.str2regexp(value[1]),
+                            fname=str2regexp(value[1]),
                             scripts=value[0].split(","),
                         ),
                     )
-        elif param == "vuln":
+        elif not neg and param == "vuln":
             try:
                 vulnid, status = value.split(":", 1)
             except ValueError:
@@ -431,10 +851,10 @@ def flt_from_query(dbase, query, base_flt=None):
         elif not neg and param == "geovision":
             flt = dbase.flt_and(flt, dbase.searchgeovision())
         elif param == "httptitle":
-            flt = dbase.flt_and(flt, dbase.searchhttptitle(utils.str2regexp(value)))
+            flt = dbase.flt_and(flt, dbase.searchhttptitle(str2regexp(value)))
         elif not neg and param == "nfs":
             flt = dbase.flt_and(flt, dbase.searchnfs())
-        elif not neg and param in ["nis", "yp"]:
+        elif not neg and param in {"nis", "yp"}:
             flt = dbase.flt_and(flt, dbase.searchypserv())
         elif not neg and param == "mssqlemptypwd":
             flt = dbase.flt_and(flt, dbase.searchmssqlemptypwd())
@@ -442,14 +862,12 @@ def flt_from_query(dbase, query, base_flt=None):
             flt = dbase.flt_and(flt, dbase.searchmysqlemptypwd())
         elif not neg and param == "sshkey":
             if value:
-                flt = dbase.flt_and(
-                    flt, dbase.searchsshkey(output=utils.str2regexp(value))
-                )
+                flt = dbase.flt_and(flt, dbase.searchsshkey(output=str2regexp(value)))
             else:
                 flt = dbase.flt_and(flt, dbase.searchsshkey())
         elif not neg and param.startswith("sshkey."):
             subfield = param.split(".", 1)[1]
-            if subfield in ["fingerprint", "key", "type", "bits"]:
+            if subfield in {"fingerprint", "key", "type", "bits"}:
                 if subfield == "type":
                     subfield = "keytype"
                 elif subfield == "bits":
@@ -458,37 +876,52 @@ def flt_from_query(dbase, query, base_flt=None):
                     except (ValueError, TypeError):
                         pass
                 else:
-                    value = utils.str2regexp(value)
+                    value = str2regexp(value)
                 flt = dbase.flt_and(flt, dbase.searchsshkey(**{subfield: value}))
             else:
                 add_unused(neg, param, value)
-        elif not neg and param == "cert":
-            flt = dbase.flt_and(flt, dbase.searchcert())
-        elif param.startswith("cert."):
+        elif param == "cert":
+            flt = dbase.flt_and(flt, dbase.searchcert(neg=neg))
+        elif param == "cacert":
+            flt = dbase.flt_and(flt, dbase.searchcert(neg=neg, cacert=True))
+        elif param.startswith("cert.") or param.startswith("cacert."):
+            cacert = param.split(".", 1)[0] == "cacert"
             subfield = param.split(".", 1)[1]
             if subfield == "self_signed" and value is None:
-                flt = dbase.flt_and(flt, dbase.searchcert(self_signed=not neg))
-            elif not neg:
-                if subfield in ["md5", "sha1", "sha256", "subject", "issuer"]:
-                    flt = dbase.flt_and(
-                        flt,
-                        dbase.searchcert(
-                            **{
-                                subfield: utils.str2regexp(value),
-                            }
-                        ),
-                    )
-                elif subfield in ["pubkey.md5", "pubkey.sha1", "pubkey.sha256"]:
-                    flt = dbase.flt_and(
-                        flt,
-                        dbase.searchcert(
-                            **{
-                                "pk%s" % subfield[7:]: utils.str2regexp(value),
-                            }
-                        ),
-                    )
-                else:
-                    add_unused(neg, param, value)
+                flt = dbase.flt_and(
+                    flt, dbase.searchcert(self_signed=not neg, cacert=cacert)
+                )
+            elif subfield in {
+                "md5",
+                "sha1",
+                "sha256",
+                "subject",
+                "issuer",
+                "pkmd5",
+                "pksha1",
+                "pksha256",
+            }:
+                flt = dbase.flt_and(
+                    flt,
+                    dbase.searchcert(
+                        cacert=cacert,
+                        neg=neg,
+                        **{
+                            subfield: str2regexp(value),
+                        },
+                    ),
+                )
+            elif subfield in {"pubkey.md5", "pubkey.sha1", "pubkey.sha256"}:
+                flt = dbase.flt_and(
+                    flt,
+                    dbase.searchcert(
+                        cacert=cacert,
+                        neg=neg,
+                        **{
+                            f"pk{subfield[7:]}": str2regexp(value),
+                        },
+                    ),
+                )
             else:
                 add_unused(neg, param, value)
         elif not neg and param == "httphdr":
@@ -496,35 +929,29 @@ def flt_from_query(dbase, query, base_flt=None):
                 flt = dbase.flt_and(flt, dbase.searchhttphdr())
             elif ":" in value:
                 name, value = value.split(":", 1)
-                name = utils.str2regexp(name.lower())
-                value = utils.str2regexp(value)
+                name = str2regexp(name.lower())
+                value = str2regexp(value)
                 flt = dbase.flt_and(flt, dbase.searchhttphdr(name=name, value=value))
             else:
                 flt = dbase.flt_and(
-                    flt, dbase.searchhttphdr(name=utils.str2regexp(value.lower()))
+                    flt, dbase.searchhttphdr(name=str2regexp(value.lower()))
                 )
         elif not neg and param == "httpapp":
             if value is None:
                 flt = dbase.flt_and(flt, dbase.searchhttpapp())
             elif ":" in value:
-                name, version = (
-                    utils.str2regexp(string) for string in value.split(":", 1)
-                )
+                name, version = (str2regexp(string) for string in value.split(":", 1))
                 flt = dbase.flt_and(
                     flt, dbase.searchhttpapp(name=name, version=version)
                 )
             else:
-                flt = dbase.flt_and(
-                    flt, dbase.searchhttpapp(name=utils.str2regexp(value))
-                )
+                flt = dbase.flt_and(flt, dbase.searchhttpapp(name=str2regexp(value)))
         elif not neg and param == "owa":
             flt = dbase.flt_and(flt, dbase.searchowa())
         elif param == "phpmyadmin":
             flt = dbase.flt_and(flt, dbase.searchphpmyadmin())
         elif not neg and param.startswith("smb."):
-            flt = dbase.flt_and(
-                flt, dbase.searchsmb(**{param[4:]: utils.str2regexp(value)})
-            )
+            flt = dbase.flt_and(flt, dbase.searchsmb(**{param[4:]: str2regexp(value)}))
         elif not neg and param.startswith("ntlm."):
             key = {
                 "name": "Target_Name",
@@ -539,16 +966,14 @@ def flt_from_query(dbase, query, base_flt=None):
             }
             flt = dbase.flt_and(
                 flt,
-                dbase.searchntlm(
-                    **{key.get(param[5:], param[5:]): utils.str2regexp(value)}
-                ),
+                dbase.searchntlm(**{key.get(param[5:], param[5:]): str2regexp(value)}),
             )
         elif not neg and param == "smbshare":
             flt = dbase.flt_and(
                 flt,
                 dbase.searchsmbshares(access="" if value is None else value),
             )
-        elif param == "torcert":
+        elif not neg and param == "torcert":
             flt = dbase.flt_and(flt, dbase.searchtorcert())
         elif not neg and param == "webfiles":
             flt = dbase.flt_and(flt, dbase.searchwebfiles())
@@ -564,7 +989,15 @@ def flt_from_query(dbase, query, base_flt=None):
             flt = dbase.flt_and(
                 flt,
                 dbase.searchja3client(
-                    value_or_hash=(None if value is None else utils.str2regexp(value)),
+                    value_or_hash=(None if value is None else str2regexp(value)),
+                    neg=neg,
+                ),
+            )
+        elif param == "ssl-ja4-client":
+            flt = dbase.flt_and(
+                flt,
+                dbase.searchja4client(
+                    value=(None if value is None else str2regexp(value)),
                     neg=neg,
                 ),
             )
@@ -573,9 +1006,7 @@ def flt_from_query(dbase, query, base_flt=None):
                 # There are no additional arguments
                 flt = dbase.flt_and(flt, dbase.searchja3server(neg=neg))
             else:
-                split = [
-                    utils.str2regexp(v) if v else None for v in value.split(":", 1)
-                ]
+                split = [str2regexp(v) if v else None for v in value.split(":", 1)]
                 if len(split) == 1:
                     # Only a JA3 server is given
                     flt = dbase.flt_and(
@@ -595,22 +1026,39 @@ def flt_from_query(dbase, query, base_flt=None):
                             neg=neg,
                         ),
                     )
+        elif param == "ssl-jarm":
+            if value is None:
+                flt = dbase.flt_and(flt, dbase.searchjarm(neg=neg))
+            else:
+                flt = dbase.flt_and(
+                    flt, dbase.searchjarm(value=str2regexp(value), neg=neg)
+                )
+        elif not neg and param in {"hassh", "hassh-client", "hassh-server"}:
+            server = {"hassh": None, "hassh-client": False, "hassh-server": True}[param]
+            flt = dbase.flt_and(
+                flt,
+                dbase.searchhassh(
+                    value_or_hash=(None if value is None else str2regexp(value)),
+                    server=server,
+                ),
+            )
         elif param == "useragent":
             if value:
                 flt = dbase.flt_and(
-                    flt, dbase.searchuseragent(useragent=utils.str2regexp(value))
+                    flt,
+                    dbase.searchuseragent(useragent=str2regexp(value), neg=neg),
                 )
             else:
                 flt = dbase.flt_and(flt, dbase.searchuseragent())
         # OS fingerprint
         elif not neg and param == "os":
-            flt = dbase.flt_and(flt, dbase.searchos(utils.str2regexp(value)))
+            flt = dbase.flt_and(flt, dbase.searchos(str2regexp(value)))
         # device types
-        elif param in ["devicetype", "devtype"]:
-            flt = dbase.flt_and(flt, dbase.searchdevicetype(utils.str2regexp(value)))
-        elif param in ["netdev", "networkdevice"]:
+        elif not neg and param in {"devicetype", "devtype"}:
+            flt = dbase.flt_and(flt, dbase.searchdevicetype(str2regexp(value)))
+        elif not neg and param in {"netdev", "networkdevice"}:
             flt = dbase.flt_and(flt, dbase.searchnetdev())
-        elif param == "phonedev":
+        elif not neg and param == "phonedev":
             flt = dbase.flt_and(flt, dbase.searchphonedev())
         # traceroute
         elif param == "hop":
@@ -623,12 +1071,12 @@ def flt_from_query(dbase, query, base_flt=None):
             flt = dbase.flt_and(flt, dbase.searchhopname(value, neg=neg))
         elif param == "hopdomain":
             flt = dbase.flt_and(flt, dbase.searchhopdomain(value, neg=neg))
-        elif not neg and param in ["ike.vendor_id.name", "ike.vendor_id.value"]:
+        elif not neg and param in {"ike.vendor_id.name", "ike.vendor_id.value"}:
             flt = dbase.flt_and(
                 flt,
                 dbase.searchscript(
                     name="ike-info",
-                    values={"vendor_ids.%s" % param[14:]: utils.str2regexp(value)},
+                    values={f"vendor_ids.{param[14:]}": str2regexp(value)},
                 ),
             )
         elif not neg and param == "ike.notification":
@@ -636,7 +1084,7 @@ def flt_from_query(dbase, query, base_flt=None):
                 flt,
                 dbase.searchscript(
                     name="ike-info",
-                    values={"notification_type": utils.str2regexp(value)},
+                    values={"notification_type": str2regexp(value)},
                 ),
             )
         # sort
@@ -645,7 +1093,7 @@ def flt_from_query(dbase, query, base_flt=None):
                 sortby.append((value, -1))
             else:
                 sortby.append((value, 1))
-        elif param in ["open", "filtered", "closed"]:
+        elif not neg and param in {"open", "filtered", "closed"}:
             value = value.replace("_", "/").split(",")
             protos = {}
             for port in value:
@@ -657,11 +1105,13 @@ def flt_from_query(dbase, query, base_flt=None):
             for proto, ports in protos.items():
                 flt = dbase.flt_and(
                     flt,
-                    dbase.searchport(ports[0], protocol=proto, state=param)
-                    if len(ports) == 1
-                    else dbase.searchports(ports, protocol=proto, state=param),
+                    (
+                        dbase.searchport(ports[0], protocol=proto, state=param)
+                        if len(ports) == 1
+                        else dbase.searchports(ports, protocol=proto, state=param)
+                    ),
                 )
-        elif param == "otheropenport":
+        elif not neg and param == "otheropenport":
             flt = dbase.flt_and(
                 flt, dbase.searchportsother([int(val) for val in value.split(",")])
             )
@@ -688,9 +1138,9 @@ def flt_from_query(dbase, query, base_flt=None):
             else:
                 params = value.split(":", 1)
                 words = (
-                    [utils.str2regexp(elt) for elt in params[0].split(",")]
+                    [str2regexp(elt) for elt in params[0].split(",")]
                     if "," in params[0]
-                    else utils.str2regexp(params[0])
+                    else str2regexp(params[0])
                 )
                 if len(params) == 1:
                     flt = dbase.flt_and(
@@ -699,7 +1149,9 @@ def flt_from_query(dbase, query, base_flt=None):
                 elif params[1].isdigit():
                     flt = dbase.flt_and(
                         flt,
-                        dbase.searchscreenshot(port=int(value), neg=neg, words=words),
+                        dbase.searchscreenshot(
+                            port=int(params[1]), neg=neg, words=words
+                        ),
                     )
                 elif params[1].startswith("tcp/") or params[1].startswith("udp/"):
                     params[1] = params[1].split("/", 1)
@@ -714,31 +1166,49 @@ def flt_from_query(dbase, query, base_flt=None):
                     )
                 else:
                     flt = dbase.flt_and(
-                        flt, dbase.searchscreenshot(service=value, neg=neg, words=words)
+                        flt,
+                        dbase.searchscreenshot(service=params[1], neg=neg, words=words),
                     )
-        elif param == "cpe":
+        elif not neg and param == "cpe":
             if value:
                 cpe_kwargs = {}
                 cpe_fields = ["cpe_type", "vendor", "product", "version"]
                 for field, cpe_arg in zip(cpe_fields, value.split(":", 3)):
-                    cpe_kwargs[field] = utils.str2regexp(cpe_arg)
+                    cpe_kwargs[field] = str2regexp(cpe_arg)
                 flt = dbase.flt_and(flt, dbase.searchcpe(**cpe_kwargs))
             else:
                 flt = dbase.flt_and(flt, dbase.searchcpe())
+        elif param == "tag" and hasattr(dbase, "searchtag"):
+            if value:
+                if ":" in value:
+                    tag_val, tag_info = value.split(":", 1)
+                    tag = {}
+                    if tag_val:
+                        tag["value"] = str2regexp(tag_val)
+                    if tag_info:
+                        tag["info"] = str2regexp(tag_info)
+                    flt = dbase.flt_and(flt, dbase.searchtag(tag, neg=neg))
+                else:
+                    flt = dbase.flt_and(
+                        flt,
+                        dbase.searchtag({"value": str2regexp(value)}, neg=neg),
+                    )
+            else:
+                flt = dbase.flt_and(flt, dbase.searchtag(neg=neg))
+        elif not neg and param == "search":
+            # Every :class:`DBActive` backend now ships a
+            # ``searchtext()`` method (Mongo / PG / DuckDB /
+            # Elastic), so the historical
+            # ``try/except AttributeError`` is gone.
+            flt = dbase.flt_and(flt, dbase.searchtext(value))
         elif param == "display":
             # ignore this parameter
             pass
         elif value is None:
-            if (
-                param.startswith("tcp_")
-                or param.startswith("tcp/")
-                or param.startswith("udp_")
-                or param.startswith("udp/")
-            ):
-                proto, port = param.replace("_", "/").split("/", 1)
-                port = int(port)
+            if (match := PORT.search(param)) is not None:
+                proto, port = match.groups()
                 flt = dbase.flt_and(
-                    flt, dbase.searchport(port, protocol=proto, neg=neg)
+                    flt, dbase.searchport(int(port), protocol=proto or "tcp", neg=neg)
                 )
             elif param == "openport":
                 flt = dbase.flt_and(flt, dbase.searchopenport(neg=neg))
@@ -752,13 +1222,24 @@ def flt_from_query(dbase, query, base_flt=None):
                     flt = dbase.flt_and(flt, dbase.searchipv4())
                 else:
                     flt = dbase.flt_and(flt, dbase.searchipv6())
-            elif param.isdigit():
-                flt = dbase.flt_and(flt, dbase.searchport(int(param), neg=neg))
-            elif all(x.isdigit() for x in param.split(",")):
-                flt = dbase.flt_and(
-                    flt,
-                    dbase.searchports([int(val) for val in param.split(",")], neg=neg),
-                )
+            elif all(PORT.search(x) is not None for x in param.split(",")):
+                proto_ports = {}
+                for port in param.split(","):
+                    proto, port = PORT.search(port).groups()
+                    proto_ports.setdefault(proto or "tcp", set()).add(int(port))
+                for proto, ports in proto_ports.items():
+                    if len(ports) > 1:
+                        flt = dbase.flt_and(
+                            flt,
+                            dbase.searchports(list(ports), protocol=proto, neg=neg),
+                        )
+                    else:
+                        flt = dbase.flt_and(
+                            flt,
+                            dbase.searchport(
+                                next(iter(ports)), protocol=proto, neg=neg
+                            ),
+                        )
             elif utils.IPADDR.search(param):
                 flt = dbase.flt_and(flt, dbase.searchhost(param, neg=neg))
             elif utils.NETADDR.search(param):
@@ -799,28 +1280,30 @@ def flt_from_query(dbase, query, base_flt=None):
                 add_unused(neg, param, value)
         else:
             add_unused(neg, param, value)
-    return flt, sortby, unused, skip, limit
+    return flt, sortby, unused, skip, limit, fields
 
 
 def parse_arg(data):
+    if isinstance(data, list):
+        return [parse_arg(item) for item in data]
     if not isinstance(data, dict):
         return data
     if "f" not in data or not isinstance(data["f"], str):
-        return data
+        return {k: parse_arg(v) for k, v in data.items()}
     if "a" not in data or not isinstance(data["a"], list):
-        return data
+        return {k: parse_arg(v) for k, v in data.items()}
     args = data["a"]
     if len(args) != 1:
-        return data
+        return {k: parse_arg(v) for k, v in data.items()}
     if any(k not in "af" for k in data):
-        return data
+        return {k: parse_arg(v) for k, v in data.items()}
     try:
         func = {
-            "regexp": utils.str2regexp,
+            "regexp": str2regexp,
             "datetime": datetime.datetime.fromtimestamp,
         }[data["f"]]
     except KeyError:
-        return data
+        return {k: parse_arg(v) for k, v in data.items()}
     return func(*args)
 
 
@@ -829,7 +1312,13 @@ def parse_filter(dbase, data):
         raise ValueError("Unsupported filter")
     if not data:
         return dbase.flt_empty
-    func = data.pop("f")
+    try:
+        func = data.pop("f")
+    except KeyError as exc:
+        # Missing ``f`` key: surface the same ``ValueError`` as
+        # the other malformed-filter shapes (HTTP 400 via the web
+        # app's bad-input plugin) rather than a ``KeyError`` (500).
+        raise ValueError("Unsupported filter") from exc
     if not isinstance(func, str):
         raise ValueError("Unsupported filter")
     args = data.pop("a", [])
@@ -839,7 +1328,7 @@ def parse_filter(dbase, data):
         pass
     else:
         return func(*(parse_filter(dbase, a) for a in args))
-    func = "search%s" % func
+    func = f"search{func}"
     kargs = data.pop("k", {})
     if data:
         raise ValueError("Unsupported filter")
@@ -848,3 +1337,11 @@ def parse_filter(dbase, data):
     return getattr(dbase, func)(
         *(parse_arg(a) for a in args), **{k: parse_arg(v) for k, v in kargs.items()}
     )
+
+
+# Load ``ivre.plugins.web.filter`` entry-points last, after every
+# public helper is defined, so plugins importing from this module
+# always see a fully-formed surface. Plugins typically call
+# :func:`register_filter_injector` from their
+# ``_install_<name>(scope)`` entry point.
+load_plugins("ivre.plugins.web.filter", globals())

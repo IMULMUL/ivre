@@ -1,7 +1,7 @@
 #! /usr/bin/env python
 
 # This file is part of IVRE.
-# Copyright 2011 - 2021 Pierre LALET <pierre@droids-corp.org>
+# Copyright 2011 - 2024 Pierre LALET <pierre@droids-corp.org>
 #
 # IVRE is free software: you can redistribute it and/or modify it
 # under the terms of the GNU General Public License as published by
@@ -17,30 +17,26 @@
 # along with IVRE. If not, see <http://www.gnu.org/licenses/>.
 
 
-"""This sub-module contains functions to handle JSON output from zgrab.
-
-"""
-
+"""This sub-module contains functions to handle JSON output from zgrab."""
 
 import binascii
 import re
-from typing import Any, Dict, List, Optional, cast
+from typing import Any, cast
 
-
-from ivre.analyzer import ntlm
-from ivre.active.cpe import add_cpe_values
-from ivre.active.data import handle_http_headers
-from ivre.types import NmapServiceMatch
-from ivre.types.active import HttpHeader, NmapHost, NmapPort
 from ivre import utils
-from ivre.xmlnmap import (
+from ivre.active.cpe import add_cpe_values
+from ivre.active.data import (
     add_cert_hostnames,
     add_hostname,
-    create_elasticsearch_service,
-    create_http_ls,
     create_ssl_cert,
+    handle_http_content,
+    handle_http_headers,
 )
-
+from ivre.analyzer import ntlm
+from ivre.data.microsoft.exchange import EXCHANGE_BUILDS
+from ivre.types import NmapServiceMatch
+from ivre.types.active import HttpHeader, NmapHost, NmapPort, NmapScript
+from ivre.xmlnmap import add_service_hostname
 
 _EXPR_TITLE = re.compile("<title[^>]*>([^<]*)</title>", re.I)
 _EXPR_OWA_VERSION = re.compile('"/owa/(?:auth/)?((?:[0-9]+\\.)+[0-9]+)/')
@@ -67,7 +63,7 @@ ntlm_values = [
 
 
 def zgrap_parser_http(
-    data: Dict[str, Any], hostrec: NmapHost, port: Optional[int] = None
+    data: dict[str, Any], hostrec: NmapHost, port: int | None = None
 ) -> NmapPort:
     """This function handles data from `{"data": {"http": [...]}}`
     records. `data` should be the content, i.e. the `[...]`. It should
@@ -121,7 +117,11 @@ def zgrap_parser_http(
         except KeyError:
             pass
         else:
-            output, info_cert = create_ssl_cert(cert.encode(), b64encoded=True)
+            try:
+                output, info_cert = create_ssl_cert(cert.encode(), b64encoded=True)
+            except Exception:
+                utils.LOGGER.warning("Cannot parse certificate %r", cert, exc_info=True)
+                output, info_cert = "", []
             if info_cert:
                 res.setdefault("scripts", []).append(
                     {
@@ -134,7 +134,7 @@ def zgrap_parser_http(
                     add_cert_hostnames(cert, hostrec.setdefault("hostnames", []))
     if url:
         try:
-            _, guessed_port = utils.url2hostport("%(scheme)s://%(host)s" % url)
+            _, guessed_port = utils.url2hostport(f"{url['scheme']}://{url['host']}")
         except ValueError:
             utils.LOGGER.warning("Cannot guess port from url %r", url)
             guessed_port = 80  # because reasons
@@ -151,7 +151,7 @@ def zgrap_parser_http(
         if port is None:
             port = guessed_port
         # Specific paths
-        if url.get("path").endswith("/.git/index"):
+        if url.get("path", "").endswith("/.git/index"):
             if resp.get("status_code") != 200:
                 return {}
             if not resp.get("body", "").startswith("DIRC"):
@@ -159,19 +159,19 @@ def zgrap_parser_http(
             # Due to an issue with ZGrab2 output, we cannot, for now,
             # process the content of the file. See
             # <https://github.com/zmap/zgrab2/issues/263>.
-            repository = "%s:%d%s" % (hostrec["addr"], port, url["path"][:-5])
+            repository = f"{hostrec['addr']}:{int(port)}{url['path'][:-5]}"
             res["port"] = port
             res.setdefault("scripts", []).append(
                 {
                     "id": "http-git",
-                    "output": "\n  %s\n    Git repository found!\n" % repository,
+                    "output": f"\n  {repository}\n    Git repository found!\n",
                     "http-git": [
                         {"repository": repository, "files-found": [".git/index"]},
                     ],
                 }
             )
             return res
-        if url.get("path").endswith("/owa/auth/logon.aspx"):
+        if url.get("path", "").endswith("/owa/auth/logon.aspx"):
             if resp.get("status_code") != 200:
                 return {}
             version_set = set(
@@ -184,24 +184,34 @@ def zgrap_parser_http(
             )
             res["port"] = port
             path = url["path"][:-15]
-            if len(version_set) > 1:
-                output = "OWA: path %s, version %s (multiple versions found!)" % (
-                    path,
-                    " / ".join(version_list),
+            if version_list:
+                parsed_version = EXCHANGE_BUILDS.get(
+                    version_list[0], "unknown build number"
                 )
-            else:
-                output = "OWA: path %s, version %s" % (path, version_list[0])
-            res.setdefault("scripts", []).append(
-                {
-                    "id": "http-app",
-                    "output": output,
-                    "http-app": [
-                        {"path": path, "application": "OWA", "version": version_list[0]}
-                    ],
-                }
-            )
+                if len(version_list) > 1:
+                    version_list = [
+                        f"{vers} ({EXCHANGE_BUILDS.get(vers, 'unknown build number')})"
+                        for vers in version_list
+                    ]
+                    output = f"OWA: path {path}, version {' / '.join(version_list)} (multiple versions found!)"
+                else:
+                    output = f"OWA: path {path}, version {version_list[0]} ({parsed_version})"
+                res.setdefault("scripts", []).append(
+                    {
+                        "id": "http-app",
+                        "output": output,
+                        "http-app": [
+                            {
+                                "path": path,
+                                "application": "OWA",
+                                "version": version_list[0],
+                                "parsed_version": parsed_version,
+                            }
+                        ],
+                    }
+                )
             return res
-        if url.get("path").endswith("/centreon/"):
+        if url.get("path", "").endswith("/centreon/"):
             if resp.get("status_code") != 200:
                 return {}
             if not resp.get("body"):
@@ -215,29 +225,66 @@ def zgrap_parser_http(
             if match.groups()[0] != "Centreon - IT & Network Monitoring":
                 return {}
             match = _EXPR_CENTREON_VERSION.search(body)
-            version: Optional[str]
+            version: str | None
             if match is None:
                 version = None
             else:
                 version = match.group(1) or match.group(2)
+            if version is None:
+                script: NmapScript = {
+                    "id": "http-app",
+                    "output": f"Centreon: path {path}",
+                    "http-app": [{"path": path, "application": "Centreon"}],
+                }
+            else:
+                script = {
+                    "id": "http-app",
+                    "output": f"Centreon: path {path}, version {version}",
+                    "http-app": [
+                        {
+                            "path": path,
+                            "application": "Centreon",
+                            "version": version,
+                        },
+                    ],
+                }
+            res.setdefault("scripts", []).append(script)
+            return res
+        if url.get("path", "").endswith("/.well-known/security.txt"):
+            if resp.get("status_code") != 200:
+                return {}
+            if not resp.get("headers"):
+                return {}
+            if not any(
+                ctype.split(";", 1)[0].lower() == "text/plain"
+                for ctype in resp["headers"].get("content_type", [])
+            ):
+                return {}
+            if not resp.get("body"):
+                return {}
+            body = resp["body"]
+            res["port"] = port
+            parsed: dict[str, list[str]] = {}
+            for line in body.splitlines():
+                line = line.strip().split("#", 1)[0]
+                if not line:
+                    continue
+                if ":" not in line:
+                    utils.LOGGER.warning("Invalid line in security.txt file [%r]", line)
+                    continue
+                key, value = line.split(":", 1)
+                parsed.setdefault(key.strip().lower(), []).append(value.strip())
             res.setdefault("scripts", []).append(
                 {
-                    "id": "http-app",
-                    "output": "Centreon: path %s%s"
-                    % (
-                        path,
-                        "" if version is None else (", version %s" % version),
-                    ),
-                    "http-app": [
-                        dict(
-                            {"path": path, "application": "Centreon"},
-                            **({} if version is None else {"version": version}),
-                        )
-                    ],
+                    "id": "http-securitytxt",
+                    "output": body,
+                    "http-securitytxt": {
+                        key: " / ".join(value) for key, value in parsed.items()
+                    },
                 }
             )
             return res
-        if url.get("path") != "/":
+        if url.get("path", "") != "/":
             utils.LOGGER.warning("URL path not supported yet: %s", url.get("path"))
             return {}
     elif port is None:
@@ -248,12 +295,8 @@ def zgrap_parser_http(
     res["port"] = port
     # Since Zgrab does not preserve the order of the headers, we need
     # to reconstruct a banner to use Nmap fingerprints
-    banner = (
-        utils.nmap_decode_data(resp["protocol"]["name"])
-        + b" "
-        + utils.nmap_decode_data(resp["status_line"])
-        + b"\r\n"
-    )
+    # define empty banner for log in case banner is never set in the following blocks
+    banner = None
     if resp.get("headers"):
         headers = resp["headers"]
         # Check the Authenticate header first: if we requested it with
@@ -271,7 +314,7 @@ def zgrap_parser_http(
                     if not infos:
                         continue
                     keyvals = zip(ntlm_values, [infos.get(k) for k in ntlm_values])
-                    output = "\n".join("{}: {}".format(k, v) for k, v in keyvals if v)
+                    output = "\n".join(f"{k}: {v}" for k, v in keyvals if v)
                     res.setdefault("scripts", []).append(
                         {
                             "id": "ntlm-info",
@@ -290,40 +333,88 @@ def zgrap_parser_http(
             for val in req.get("headers", {}).get("authorization", [])
         ):
             return res
-        # the order will be incorrect!
-        line = "%s %s" % (resp["protocol"]["name"], resp["status_line"])
-        http_hdrs: List[HttpHeader] = [{"name": "_status", "value": line}]
-        output_list = [line]
-        for unk in headers.pop("unknown", []):
-            headers[unk["key"]] = unk["value"]
-        for hdr, values in headers.items():
-            hdr = hdr.replace("_", "-")
-            for val in values:
-                http_hdrs.append({"name": hdr, "value": val})
-                output_list.append("%s: %s" % (hdr, val))
+        # If we have headers_raw value, let's use it. Else, let's fake it as well as we can.
+        http_hdrs: list[HttpHeader] = []
+        output_list: list[str] = []
+        has_raw_value = False
+        if resp.get("headers_raw"):
+            try:
+                banner = utils.decode_b64(resp.get("headers_raw").encode())
+            except Exception:
+                utils.LOGGER.warning("Cannot decode raw headers, using parsed result")
+            else:
+                output_list = [
+                    utils.nmap_encode_data(line) for line in re.split(b"\r?\n", banner)
+                ]
+                banner_split = banner.split(b"\n")
+                http_hdrs = [
+                    {
+                        "name": "_status",
+                        "value": utils.nmap_encode_data(banner_split[0].strip()),
+                    }
+                ]
+                http_hdrs.extend(
+                    {
+                        "name": utils.nmap_encode_data(hdrname).lower(),
+                        "value": utils.nmap_encode_data(hdrval),
+                    }
+                    for hdrname, hdrval in (
+                        m.groups()
+                        for m in (
+                            utils.RAW_HTTP_HEADER.search(part.strip())
+                            for part in banner_split
+                        )
+                        if m
+                    )
+                )
+                has_raw_value = True
+        if not has_raw_value:  # no headers_raw or decoding failed
+            # The order will be incorrect!
+            banner = (
+                utils.nmap_decode_data(resp["protocol"]["name"])
+                + b" "
+                + utils.nmap_decode_data(resp["status_line"])
+                + b"\r\n"
+            )
+            line = f"{resp['protocol']['name']} {resp['status_line']}"
+            http_hdrs = [{"name": "_status", "value": line}]
+            output_list = [line]
+            for unk in headers.pop("unknown", []):
+                headers[unk["key"]] = unk["value"]
+            for hdr, values in headers.items():
+                hdr = hdr.replace("_", "-")
+                for val in values:
+                    http_hdrs.append({"name": hdr, "value": val})
+                    output_list.append(f"{hdr}: {val}")
+            if headers.get("server"):
+                banner += (
+                    b"Server: "
+                    + utils.nmap_decode_data(headers["server"][0])
+                    + b"\r\n\r\n"
+                )
         if http_hdrs:
             method = req.get("method")
             if method:
                 output_list.append("")
-                output_list.append("(Request type: %s)" % method)
-            res.setdefault("scripts", []).append(
-                {
-                    "id": "http-headers",
-                    "output": "\n".join(output_list),
-                    "http-headers": http_hdrs,
-                }
-            )
+                output_list.append(f"(Request type: {method})")
+            script = {
+                "id": "http-headers",
+                "output": "\n".join(output_list),
+                "http-headers": http_hdrs,
+            }
+            if has_raw_value and banner is not None:
+                script["masscan"] = {"raw": utils.encode_b64(banner).decode()}
+            res.setdefault("scripts", []).append(script)
             handle_http_headers(hostrec, res, http_hdrs, path=url.get("path"))
-        if headers.get("server"):
-            banner += (
-                b"Server: " + utils.nmap_decode_data(headers["server"][0]) + b"\r\n\r\n"
-            )
-    info: NmapServiceMatch = utils.match_nmap_svc_fp(
-        banner, proto="tcp", probe="GetRequest"
+    info: NmapServiceMatch = (
+        {}
+        if banner is None
+        else utils.match_nmap_svc_fp(banner, proto="tcp", probe="GetRequest")
     )
     if info:
-        add_cpe_values(hostrec, "ports.port:%s" % port, info.pop("cpe", []))
+        add_cpe_values(hostrec, f"ports.port:{port}", info.pop("cpe", []))
         res.update(cast(NmapPort, info))
+        add_service_hostname(info, hostrec.setdefault("hostnames", []))
     if resp.get("body"):
         body = resp["body"]
         res.setdefault("scripts", []).append(
@@ -332,36 +423,12 @@ def zgrap_parser_http(
                 "output": utils.nmap_encode_data(body.encode()),
             }
         )
-        match = _EXPR_TITLE.search(body)
-        if match is not None:
-            title = match.groups()[0]
-            res["scripts"].append(
-                {
-                    "id": "http-title",
-                    "output": title,
-                    "http-title": {"title": title},
-                }
-            )
-        script_http_ls = create_http_ls(body, url=url)
-        if script_http_ls is not None:
-            res.setdefault("scripts", []).append(script_http_ls)
-        service_elasticsearch = create_elasticsearch_service(body)
-        if service_elasticsearch:
-            if "service_hostname" in service_elasticsearch:
-                add_hostname(
-                    service_elasticsearch["service_hostname"],
-                    "service",
-                    hostrec.setdefault("hostnames", []),
-                )
-            add_cpe_values(
-                hostrec, "ports.port:%s" % port, service_elasticsearch.pop("cpe", [])
-            )
-            res.update(cast(NmapPort, service_elasticsearch))
+        handle_http_content(hostrec, res, body.encode())
     return res
 
 
 def zgrap_parser_jarm(
-    data: Dict[str, Any], hostrec: NmapHost, port: Optional[int] = None
+    data: dict[str, Any], hostrec: NmapHost, port: int | None = None
 ) -> NmapPort:
     """This function handles data from `{"data": {"jarm": [...]}}`
     records. `data` should be the content, i.e. the `[...]`. It should
@@ -391,7 +458,7 @@ def zgrap_parser_jarm(
     if port is None:
         port = 443  # default
         utils.LOGGER.warning(
-            "No port provided; using default %d. " "Use --zgrab-port to change it.",
+            "No port provided; using default %d. Use --zgrab-port to change it.",
             port,
         )
     return {
@@ -400,7 +467,13 @@ def zgrap_parser_jarm(
         "port": port,
         "protocol": "tcp",
         "service_tunnel": "ssl",
-        "scripts": [{"id": "ssl-jarm", "output": data["fingerprint"]}],
+        "scripts": [
+            {
+                "id": "ssl-jarm",
+                "output": data["fingerprint"],
+                "ssl-jarm": data["fingerprint"],
+            }
+        ],
     }
 
 

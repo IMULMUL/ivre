@@ -1,7 +1,7 @@
 #! /usr/bin/env python
 
 # This file is part of IVRE.
-# Copyright 2011 - 2021 Pierre LALET <pierre@droids-corp.org>
+# Copyright 2011 - 2024 Pierre LALET <pierre@droids-corp.org>
 #
 # IVRE is free software: you can redistribute it and/or modify it
 # under the terms of the GNU General Public License as published by
@@ -19,8 +19,7 @@
 """Support for NetFlow files"""
 
 import datetime
-from typing import Any, BinaryIO, Dict, Optional, Union, cast
-
+from typing import Any, BinaryIO, cast
 
 from ivre import utils
 from ivre.parser import CmdParser
@@ -43,8 +42,8 @@ class NetFlow(CmdParser):
         ("bytes2", "%ibyt"),
         ("flags", "%flg"),
     ]
-    field_idx = dict((fld, idx) for idx, (fld, _) in enumerate(fields))
-    fmt = "fmt:" + ",".join(fmt for _, fmt in fields)
+    field_idx = {fld: idx for idx, (fld, _) in enumerate(fields)}
+    fmt = f"fmt:{','.join((fmt for _, fmt in fields))}"
     units = {
         "K": 1000,
         "M": 1000000,
@@ -53,9 +52,7 @@ class NetFlow(CmdParser):
     }
     timefmt = "%Y-%m-%d %H:%M:%S.%f"
 
-    def __init__(
-        self, fdesc: Union[str, BinaryIO], pcap_filter: Optional[str] = None
-    ) -> None:
+    def __init__(self, fdesc: str | BinaryIO, pcap_filter: str | None = None) -> None:
         """Creates the NetFlow object.
 
         fdesc: a file-like object or a filename
@@ -84,11 +81,11 @@ class NetFlow(CmdParser):
             return int(float(val[:-1]) * cls.units[val[-1]])
 
     @classmethod
-    def parse_line(cls, line: bytes) -> Dict[str, Any]:
-        fields: Dict[str, Any] = dict(
-            (name[0], val.strip())
+    def parse_line(cls, line: bytes) -> dict[str, Any]:
+        fields: dict[str, Any] = {
+            name[0]: val.strip()
             for name, val in zip(cls.fields, line.decode().split(","))
-        )
+        }
         fields["proto"] = fields["proto"].lower()
         srv_idx = None
         if fields["proto"] == "icmp":
@@ -100,7 +97,7 @@ class NetFlow(CmdParser):
                 int(x) for x in fields.pop("port2").split(".")
             ]
             # ICMP 0 is an answer to ICMP 8
-            if fields["type"] == 0:
+            if not fields["type"]:
                 fields["type"] = 8
                 srv_idx = 1
             else:
@@ -121,19 +118,19 @@ class NetFlow(CmdParser):
                 else 2
             )
         cli_idx = 1 if srv_idx == 2 else 2
-        fields["src"] = fields.pop("addr%d" % cli_idx)
-        fields["dst"] = fields.pop("addr%d" % srv_idx)
-        if "port%s" % cli_idx in fields:
-            fields["sport"] = fields.pop("port%d" % cli_idx)
-        if "port%s" % srv_idx in fields:
-            fields["dport"] = fields.pop("port%d" % srv_idx)
-            fields["flow_name"] = "%(proto)s %(dport)s" % fields
+        fields["src"] = fields.pop(f"addr{cli_idx}")
+        fields["dst"] = fields.pop(f"addr{srv_idx}")
+        if f"port{cli_idx}" in fields:
+            fields["sport"] = fields.pop(f"port{cli_idx}")
+        if f"port{srv_idx}" in fields:
+            fields["dport"] = fields.pop(f"port{srv_idx}")
+            fields["flow_name"] = f"{fields['proto']} {fields['dport']}"
         elif "type" in fields:
-            fields["flow_name"] = "%(proto)s %(type)s" % fields
+            fields["flow_name"] = f"{fields['proto']} {fields['type']}"
         else:
             fields["flow_name"] = fields["proto"]
-        fields["scbytes"] = cls.str2int(fields.pop("bytes%d" % cli_idx))
-        fields["scpkts"] = cls.str2int(fields.pop("pkts%d" % cli_idx))
-        fields["csbytes"] = cls.str2int(fields.pop("bytes%d" % srv_idx))
-        fields["cspkts"] = cls.str2int(fields.pop("pkts%d" % srv_idx))
+        fields["scbytes"] = cls.str2int(fields.pop(f"bytes{cli_idx}"))
+        fields["scpkts"] = cls.str2int(fields.pop(f"pkts{cli_idx}"))
+        fields["csbytes"] = cls.str2int(fields.pop(f"bytes{srv_idx}"))
+        fields["cspkts"] = cls.str2int(fields.pop(f"pkts{srv_idx}"))
         return fields
